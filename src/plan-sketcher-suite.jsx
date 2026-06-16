@@ -1,0 +1,4036 @@
+import React, { useState, useRef, useMemo, useEffect, useCallback } from "react";
+
+// ── APP DISPLAY VERSION (user-facing build number shown in the top bar) ──────
+// Bump APP_BUILD by 1 on every app update. Rendered as major.minor with a 2-digit minor that
+// rolls over at 99 → next major: 100→"1.00", 101→"1.01", … 199→"1.99", 200→"2.00". Integer math
+// (no float formatting), so the rollover is correct by construction.
+// NOTE — this is ONE OF THREE independent counters; keep them distinct:
+//   • APP_VERSION (here)      — human-facing build number in the UI ("Version 1.00").
+//   • CURRENT_VERSION (~below)— save-file SCHEMA version; drives .wps migrations. Do NOT couple.
+//   • handoff "rev" number    — the dev changelog in PLAN_SKETCHER_SUITE_HANDOFF.md.
+const APP_BUILD = 110;                                                                 // +1 per release
+const APP_VERSION = `${Math.floor(APP_BUILD / 100)}.${String(APP_BUILD % 100).padStart(2, "0")}`;  // "1.00"
+
+// ── geometry space: 1 unit = 1 ft ──────────────────────────────────────────
+const VB_W = 100, VB_H = 75, GRID = 5, PAD = 2;
+const WORLD = 4000;            // plan coords may span -WORLD..+WORLD (origin is arbitrary)
+// pick a "nice" grid step so a plan of any size shows a sensible number of lines
+const niceStep = (span) => {
+  const steps=[1,2,5,10,25,50,100,250,500,1000];
+  const target=span/22;        // aim for ~22 divisions across the view
+  for(const s of steps) if(s>=target) return s;
+  return 1000;
+};
+
+const PRESETS = {
+  Rectangle: [{ x:20,y:18 },{ x:80,y:18 },{ x:80,y:57 },{ x:20,y:57 }],
+  "L-shape":  [{ x:20,y:15 },{ x:60,y:15 },{ x:60,y:38 },{ x:80,y:38 },{ x:80,y:60 },{ x:20,y:60 }],
+  "U-shape":  [{ x:20,y:15 },{ x:40,y:15 },{ x:40,y:45 },{ x:60,y:45 },{ x:60,y:15 },{ x:80,y:15 },{ x:80,y:60 },{ x:20,y:60 }],
+  Triangle:   [{ x:50,y:15 },{ x:80,y:60 },{ x:20,y:60 }],
+};
+
+// ── helpers ────────────────────────────────────────────────────────────────
+const clamp   = (v,lo,hi) => Math.min(hi, Math.max(lo, v));
+const dist    = (a,b)     => Math.hypot(b.x-a.x, b.y-a.y);
+const edgeAxis= (a,b)     => Math.abs(b.x-a.x) >= Math.abs(b.y-a.y) ? "h" : "v";
+const norm    = (a,b)     => a < b ? {a,b} : {a:b,b:a};
+const same    = (e1,e2)   => e1 && e2 && e1.a===e2.a && e1.b===e2.b;
+const keyOf   = (e)       => `${e.a}-${e.b}`;
+const fmt1    = (n)       => Math.round(n*10)/10;
+const fmt2    = (n)       => Math.round(n*100)/100;
+// text rotation that keeps labels parallel to a wall and upright (-90..90]
+const wallAng = (dx,dy)=>{ let a=Math.atan2(dy,dx)*180/Math.PI; a=((a+90)%180+180)%180-90; return a; };
+// a section now stores its own shared values (per wind direction)
+const DEF_SECTION = { H:13, pw:16, qWind:32, qLee:22, par:5, H2:null };  // `par` = this wall's own parapet; `H2` = 2nd-story wall ht (2-story mode), null → equals H
+// Normalize one stored wall-prop entry: migrate the legacy `parW` field, then MERGE ONTO
+// DEF_SECTION so a saved entry that predates a future field still resolves every key (no NaN
+// from an `undefined` pressure term). Behavior-identical for current entries (they override
+// every DEF_SECTION key); the merge only fills keys an OLD file happens to lack. `propsFor`
+// is the sole caller; kept module-scope (pure) so the load-robustness test can exercise it.
+const mergeWallProps = (p) => {
+  if(!p) return { ...DEF_SECTION, H2:DEF_SECTION.H };          // no saved props → H2 defaults to H
+  const base = ("par" in p) ? p : { ...p, par:(p.parW!=null?p.parW:DEF_SECTION.par) };  // legacy parW → par
+  const out  = { ...DEF_SECTION, ...base };
+  if(out.H2==null) out.H2 = out.H;                            // unset 2nd-story ht → equals 1st-story H (old files + new walls)
+  return out;
+};
+
+// segment p1p2 ∩ segment p3p4 → {pt,t} (t = param along p1→p2) or null
+const segInt = (p1,p2,p3,p4) => {
+  const d1x=p2.x-p1.x, d1y=p2.y-p1.y, d2x=p4.x-p3.x, d2y=p4.y-p3.y;
+  const den=d1x*d2y - d1y*d2x;
+  if (Math.abs(den)<1e-9) return null;
+  const t=((p3.x-p1.x)*d2y-(p3.y-p1.y)*d2x)/den;
+  const u=((p3.x-p1.x)*d1y-(p3.y-p1.y)*d1x)/den;
+  if (t<-1e-6||t>1+1e-6||u<-1e-6||u>1+1e-6) return null;
+  return { pt:{x:p1.x+t*d1x, y:p1.y+t*d1y}, t };
+};
+
+// outermost two walls a cut line crosses → {front,back} each {edge,pt} (front = lower t)
+const computeCut = (line, graph) => {
+  const p1={x:line.x1,y:line.y1}, p2={x:line.x2,y:line.y2};
+  const hits=[];
+  for (const e of graph.edges) {
+    const a=graph.nodes.find(n=>n.id===e.a), b=graph.nodes.find(n=>n.id===e.b);
+    if(!a||!b) continue;
+    const r=segInt(p1,p2,a,b);
+    if(r) hits.push({edge:e, t:r.t, pt:r.pt});
+  }
+  if(hits.length<2) return null;
+  hits.sort((x,y)=>x.t-y.t);
+  return { front:hits[0], back:hits[hits.length-1] };
+};
+
+const buildFrom = (pts, startId) => ({
+  graph: {
+    nodes: pts.map((p,i)=>({ id:startId+i, ...p })),
+    edges: pts.map((_,i)=>norm(startId+i, startId+(i+1)%pts.length)),
+  },
+  nextId: startId + pts.length,
+});
+
+const loopInfo = (nodes, edges) => {
+  const n = nodes.length;
+  if (n < 3 || edges.length !== n) return null;
+  const adj = new Map(nodes.map(nd=>[nd.id,[]]));
+  for (const e of edges) {
+    if (!adj.has(e.a)||!adj.has(e.b)) return null;
+    adj.get(e.a).push(e.b); adj.get(e.b).push(e.a);
+  }
+  for (const nd of nodes) if (adj.get(nd.id).length !== 2) return null;
+  const order=[], byId = id => nodes.find(nd=>nd.id===id);
+  let prev=null, cur=nodes[0].id;
+  for (let k=0;k<n;k++) {
+    order.push(cur);
+    const nb=adj.get(cur), nxt=nb[0]!==prev?nb[0]:nb[1];
+    prev=cur; cur=nxt;
+  }
+  if (cur!==nodes[0].id || new Set(order).size!==n) return null;
+  const ring=order.map(byId);
+  let a=0;
+  for (let i=0;i<ring.length;i++) { const p=ring[i],q=ring[(i+1)%ring.length]; a+=p.x*q.y-q.x*p.y; }
+  return { area:Math.abs(a)/2, ring };
+};
+
+const INIT = buildFrom(PRESETS.Rectangle, 0);
+
+// ray-cast point-in-polygon (works for concave rings like U / L shapes)
+const pointInRing = (px,py,ring) => {
+  let inside=false;
+  for(let i=0,j=ring.length-1;i<ring.length;j=i++){
+    const xi=ring[i].x, yi=ring[i].y, xj=ring[j].x, yj=ring[j].y;
+    if(((yi>py)!==(yj>py)) && (px < (xj-xi)*(py-yi)/(yj-yi)+xi)) inside=!inside;
+  }
+  return inside;
+};
+
+// The leeward (back) exterior wall a windward wall looks across to, for the leeward-parapet term:
+// same orientation, downwind, overlapping the lookup position, and the FARTHEST downwind such wall
+// (the exterior back face). The lookup position is `sAt` when given (the across-wind location of
+// the section cut) else the windward wall's center — so when the back is one wall every front
+// segment resolves to it (shared parapet), and when the back is split the specific segment behind
+// THIS cut is returned. Returns an edge key or null.
+const findLeewardPartner = (windKey, axis, sign, graph, sAt) => {
+  if(sign==null) return null;
+  const travel = axis==="v" ? {x:0,y:sign} : {x:sign,y:0};
+  const wEdge = graph.edges.find(e=>keyOf(e)===windKey); if(!wEdge) return null;
+  const wa=graph.nodes.find(n=>n.id===wEdge.a), wb=graph.nodes.find(n=>n.id===wEdge.b); if(!wa||!wb) return null;
+  const sOf  = p=> axis==="v"?p.x:p.y;                 // across-wind position
+  const along= p=> p.x*travel.x + p.y*travel.y;        // downwind depth (bigger = further downwind)
+  const sC = (sAt!=null) ? sAt : (sOf(wa)+sOf(wb))/2;  // lookup at the cut, else the wall's center
+  const dW = (along(wa)+along(wb))/2;
+  const recv = axis==="v" ? "h" : "v";                 // across-wind walls (windward/leeward faces)
+  let best=null, bestAlong=-Infinity;
+  for(const e of graph.edges){
+    if(keyOf(e)===windKey) continue;
+    const a=graph.nodes.find(n=>n.id===e.a), b=graph.nodes.find(n=>n.id===e.b); if(!a||!b) continue;
+    if(edgeAxis(a,b)!==recv) continue;
+    const s0=Math.min(sOf(a),sOf(b)), s1=Math.max(sOf(a),sOf(b));
+    if(sC < s0-0.6 || sC > s1+0.6) continue;           // must sit behind the lookup position
+    const d=(along(a)+along(b))/2;
+    if(d <= dW+0.6) continue;                           // must be downwind
+    if(d > bestAlong){ bestAlong=d; best=keyOf(e); }    // farthest downwind = exterior back
+  }
+  return best;
+};
+
+// Reaction engine — treats a windward wall LINE (all collinear windward segments at one depth)
+// as a beam carried by the walls parallel to the wind. Each segment contributes a distributed
+// load (plf) over its span; the line is split into simply-supported bays between consecutive
+// supports; a load crossing an interior support is split at it; each bay distributes by statics
+// (reference-side support takes W·(TL−X)/TL, far side W·X/TL); load outside the outermost
+// supports cantilevers onto the nearest support. Reactions are independent of how the line is
+// segmented when the segment plf values match — so adding a node never changes the point loads.
+// `line` = { depth, segs:[{s0,s1,plf}], smin, smax }; s is the across-wind coord (ref = min s).
+function lineReactions(line, graph, isSup, travel, sOf, along){
+  const tol=0.8;
+  const sup=[];
+  for(const e of graph.edges){
+    if(!isSup(keyOf(e))) continue;
+    const a=graph.nodes.find(n=>n.id===e.a), b=graph.nodes.find(n=>n.id===e.b);
+    if(!a||!b) continue;
+    const ex=b.x-a.x, ey=b.y-a.y, el=Math.hypot(ex,ey)||1;
+    if(Math.abs((ex*travel.x+ey*travel.y)/el) < 0.5) continue;        // must run PARALLEL to wind
+    const s=(sOf(a)+sOf(b))/2;
+    if(s < line.smin-tol || s > line.smax+tol) continue;             // within the line's span
+    const aMin=Math.min(along(a),along(b)), aMax=Math.max(along(a),along(b));
+    // A parallel wall supports this windward LINE if it lies at or downwind of the windward face.
+    // (It need NOT span all the way back to the windward depth: a re-entrant interior wall — e.g.
+    // the step wall of an L — is tied to the windward face by the diaphragm and acts as an interior
+    // support, just like a full-depth interior wall does. Only walls entirely UPWIND of the windward
+    // face are rejected — those belong to a deeper windward line in a concave footprint.)
+    if(aMax < line.depth - tol) continue;     // support is at or downwind of the windward face
+    const upwind = along(a) <= along(b) ? a : b;                     // toward the windward side
+    const downwind = upwind===a ? b : a;
+    const ax=upwind.x+(downwind.x-upwind.x)/3, ay=upwind.y+(downwind.y-upwind.y)/3;
+    sup.push({ s, key:keyOf(e), ax, ay, alen:el });
+  }
+  if(!sup.length) return { reactions:[], imbalance:true };
+  // cluster collinear supports (a support split by a node is ONE support line); keep the longest
+  sup.sort((u,v)=>u.s-v.s);
+  const cl=[];
+  for(const x of sup){
+    const c=cl[cl.length-1];
+    if(c && Math.abs(x.s-c.s)<0.75){ if(x.alen>c.alen){ c.s=x.s; c.key=x.key; c.ax=x.ax; c.ay=x.ay; c.alen=x.alen; } }
+    else cl.push({...x});
+  }
+  const R={}; cl.forEach(c=>R[c.key]=0);
+  const first=cl[0], last=cl[cl.length-1];
+  for(const seg of line.segs){
+    // left / right cantilever → nearest support
+    if(seg.s0 < first.s-1e-9){ const c1=Math.min(seg.s1,first.s); if(c1>seg.s0) R[first.key]+=seg.plf*(c1-seg.s0); }
+    if(seg.s1 > last.s +1e-9){ const c0=Math.max(seg.s0,last.s ); if(seg.s1>c0) R[last.key ]+=seg.plf*(seg.s1-c0); }
+    // interior bays (simply supported, load split at each interior support)
+    for(let i=0;i<cl.length-1;i++){
+      const sa=cl[i].s, sb=cl[i+1].s, TL=sb-sa; if(TL<=1e-9) continue;
+      const c0=Math.max(seg.s0,sa), c1=Math.min(seg.s1,sb); if(c1<=c0) continue;
+      const W=seg.plf*(c1-c0), X=((c0+c1)/2)-sa;
+      R[cl[i].key]   += W*(TL-X)/TL;
+      R[cl[i+1].key] += W*X/TL;
+    }
+  }
+  const reactions=cl.filter(c=>Math.abs(R[c.key])>1e-9)
+                    .map(c=>({ key:c.key, kips:R[c.key]/1000, ax:c.ax, ay:c.ay }));
+  return { reactions, imbalance:false };
+}
+
+// wind field for one direction: loads EVERY windward-facing wall of that orientation
+function buildSecData(section, graph, loop, isSup, propsFor){
+  if(!section) return null;
+  const { axis, sign } = section;
+  const travel = axis==="v" ? {x:0,y:sign} : {x:sign,y:0};
+  const ring = loop?loop.ring:null;
+  let cx=0,cy=0,cn=0;
+  (ring||graph.nodes).forEach(p=>{cx+=p.x;cy+=p.y;cn++;}); if(cn){cx/=cn;cy/=cn;}
+  const extN=(a,b)=>{                                     // exterior normal (robust for concave)
+    const dx=b.x-a.x, dy=b.y-a.y, len=Math.hypot(dx,dy)||1;
+    let nx=-dy/len, ny=dx/len;
+    const mx=(a.x+b.x)/2, my=(a.y+b.y)/2;
+    if(ring){ if(pointInRing(mx+nx*0.4,my+ny*0.4,ring)){ nx=-nx; ny=-ny; } }
+    else { if((mx-cx)*nx+(my-cy)*ny<0){ nx=-nx; ny=-ny; } }
+    return {nx,ny,len};
+  };
+  const windLoads=[];
+  for(const e of graph.edges){
+    const a=graph.nodes.find(n=>n.id===e.a), b=graph.nodes.find(n=>n.id===e.b);
+    if(!a||!b) continue;
+    // receiving walls run across the wind: axis 'v' (N–S wind) → horizontal walls, etc.
+    const wallAxis=edgeAxis(a,b);
+    if(axis==="v" ? wallAxis!=="h" : wallAxis!=="v") continue;
+    const {nx,ny,len}=extN(a,b);
+    if(nx*travel.x + ny*travel.y >= -1e-6) continue;    // keep only windward (faces the wind)
+    windLoads.push({ wa:a, wb:b, nx, ny, len, key:keyOf(e) });
+  }
+  {
+    // across-wind overlap test: drop a windward wall only when another windward wall
+    // sits directly in front of it (same wind direction) — avoids double-counting.
+    const along=(p)=> p.x*travel.x + p.y*travel.y;        // bigger = further downwind
+    const tran =(p)=> -p.y*travel.x + p.x*travel.y;       // across-wind position
+    const ov=(a0,a1,b0,b1)=> Math.min(Math.max(a0,a1),Math.max(b0,b1)) - Math.max(Math.min(a0,a1),Math.min(b0,b1));
+    const kept = windLoads.filter(w=>{
+      const wa0=tran(w.wa), wa1=tran(w.wb), aw=along({x:(w.wa.x+w.wb.x)/2,y:(w.wa.y+w.wb.y)/2});
+      const overlapShadow = windLoads.some(u=>{
+        if(u===w) return false;
+        const au=along({x:(u.wa.x+u.wb.x)/2,y:(u.wa.y+u.wb.y)/2});
+        return au < aw-0.5 && ov(wa0,wa1,tran(u.wa),tran(u.wb)) > 0.5;
+      });
+      return !overlapShadow;
+    });
+    let anyImbalance=false;
+    const sOf =(p)=> axis==="v" ? p.x : p.y;     // across-wind coord (reference = min: left / top)
+    kept.forEach(w=>{
+      const pr=propsFor(w.key);
+      // representative plf for the on-plan label: leeward parapet from the back wall behind centre
+      const cLee=findLeewardPartner(w.key, axis, sign, graph);
+      const cPar=cLee ? (propsFor(cLee).par||0) : 0;
+      w.total = 0.5*(pr.H||0)*(pr.pw||0) + (pr.par||0)*(pr.qWind||0) + cPar*(pr.qLee||0);
+      w.tdir=travel;
+    });
+    const drawn = kept.filter(w=>w.total>0);
+
+    // Group drawn windward segments into collinear LINES (same along-wind depth). Each windward
+    // wall is subdivided where the back (leeward) wall behind it changes, so the leeward-parapet
+    // term is taken per region from the actual back wall — e.g. a single front wall over a split
+    // back loads with each back segment's own parapet. A wall split into front segments is still
+    // one line, so splitting alone never changes the point loads.
+    const recv = axis==="v" ? "h" : "v";
+    let alMin=Infinity, alMax=-Infinity;
+    graph.nodes.forEach(p=>{ const al=along(p); if(al<alMin)alMin=al; if(al>alMax)alMax=al; });
+    const lines=[];
+    drawn.forEach(w=>{
+      const depth=(along(w.wa)+along(w.wb))/2;
+      let L=lines.find(l=>Math.abs(l.depth-depth)<0.6);
+      if(!L){ L={depth, segs:[], smin:Infinity, smax:-Infinity}; lines.push(L); }
+      const ws0=Math.min(sOf(w.wa),sOf(w.wb)), ws1=Math.max(sOf(w.wa),sOf(w.wb));
+      const pr=propsFor(w.key);
+      const base = 0.5*(pr.H||0)*(pr.pw||0) + (pr.par||0)*(pr.qWind||0);   // uniform over the wall
+      // back walls overlapping this windward wall (downwind), as {lo,hi,d,par}
+      const backs=[];
+      for(const e of graph.edges){
+        if(keyOf(e)===w.key) continue;
+        const a=graph.nodes.find(n=>n.id===e.a), b=graph.nodes.find(n=>n.id===e.b); if(!a||!b) continue;
+        if(edgeAxis(a,b)!==recv) continue;
+        const d=(along(a)+along(b))/2; if(d<=depth+0.6) continue;          // downwind only
+        const lo=Math.max(ws0,Math.min(sOf(a),sOf(b))), hi=Math.min(ws1,Math.max(sOf(a),sOf(b)));
+        if(hi-lo>0.5) backs.push({ lo, hi, d, par:(propsFor(keyOf(e)).par||0) });
+      }
+      // subdivide the windward span at back-wall breakpoints; each sub-span uses the farthest
+      // downwind back covering it (the exterior back face) for its leeward parapet
+      const bps=new Set([ws0,ws1]);
+      backs.forEach(bk=>{ if(bk.lo>ws0+1e-6&&bk.lo<ws1-1e-6)bps.add(bk.lo); if(bk.hi>ws0+1e-6&&bk.hi<ws1-1e-6)bps.add(bk.hi); });
+      const pts=[...bps].sort((p,q)=>p-q);
+      const interp=(s)=>{ const den=(sOf(w.wb)-sOf(w.wa))||1, f=(s-sOf(w.wa))/den;
+        return { x:w.wa.x+(w.wb.x-w.wa.x)*f, y:w.wa.y+(w.wb.y-w.wa.y)*f }; };
+      w.subLoads=[];
+      for(let i=0;i<pts.length-1;i++){
+        const a0=pts[i], a1=pts[i+1]; if(a1-a0<0.5) continue;
+        const mid=(a0+a1)/2; let leePar=0, bestD=-Infinity;
+        backs.forEach(bk=>{ if(mid>=bk.lo-1e-6&&mid<=bk.hi+1e-6&&bk.d>bestD){ bestD=bk.d; leePar=bk.par; } });
+        const plf = base + leePar*(pr.qLee||0);
+        L.segs.push({ s0:a0, s1:a1, plf });
+        w.subLoads.push({ plf, len:a1-a0, a:interp(a0), b:interp(a1) });   // for the on-plan display
+        L.smin=Math.min(L.smin,a0); L.smax=Math.max(L.smax,a1);
+      }
+    });
+
+    // dashed "tributary" lines wherever the load changes along a line (a real front node OR the
+    // projection of a back-wall node), drawn from the windward wall across to the leeward face.
+    const divides=[];
+    lines.forEach(L=>{
+      L.segs.sort((p,q)=>p.s0-q.s0);
+      for(let i=0;i<L.segs.length-1;i++){
+        const cur=L.segs[i], nxt=L.segs[i+1];
+        if(Math.abs(cur.s1-nxt.s0)<0.6 && Math.abs(cur.plf-nxt.plf)>0.5){
+          const a=(cur.s1+nxt.s0)/2;
+          const Pw = axis==="v" ? {x:a, y:L.depth*sign} : {x:L.depth*sign, y:a};
+          divides.push({ x1:Pw.x, y1:Pw.y, x2:Pw.x+travel.x*(alMax-L.depth), y2:Pw.y+travel.y*(alMax-L.depth) });
+        }
+      }
+    });
+
+    // a support shared by several windward lines sums their reactions into ONE arrow
+    const agg={}; let baseShear=0;
+    lines.forEach(L=>{
+      L.segs.forEach(s=> baseShear += s.plf*(s.s1-s.s0)/1000);
+      const r=lineReactions(L, graph, isSup, travel, sOf, along);
+      if(r.imbalance) anyImbalance=true;
+      r.reactions.forEach(rr=>{
+        if(!agg[rr.key]) agg[rr.key]={ key:rr.key, kips:0, ax:rr.ax, ay:rr.ay };
+        agg[rr.key].kips += rr.kips;
+      });
+    });
+    return { axis, sign, tdir:travel, windLoads:drawn, reactions:Object.values(agg),
+             divides, baseShear, imbalance:anyImbalance };
+  }
+}
+
+// ── styles ─────────────────────────────────────────────────────────────────
+const CSS = `
+.r{ --bg:#EFEDE6;--panel:#FFFFFF;--line:#D8D4C8;--ink:#1C2733;--muted:#67737F;--accent:#23577F;--hot:#9A6B1F;--pink:#B23A2A;
+  font-family:'IBM Plex Mono',ui-monospace,'SF Mono',Menlo,Consolas,monospace;color:var(--ink);
+  background-color:var(--bg);
+  background-image:
+    linear-gradient(rgba(35,87,127,.12) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(35,87,127,.12) 1px, transparent 1px),
+    linear-gradient(rgba(35,87,127,.06) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(35,87,127,.06) 1px, transparent 1px);
+  background-size:110px 110px, 110px 110px, 22px 22px, 22px 22px;
+  min-height:100%;box-sizing:border-box;padding:18px; }
+.r *{box-sizing:border-box;}
+.hd{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:14px;}
+.htitle{font-family:'IBM Plex Sans','Helvetica Neue',Arial,sans-serif;font-weight:800;font-size:19px;letter-spacing:.01em;margin:0;color:var(--ink);}
+.htag{font-size:11px;color:var(--muted);}
+.layout{display:grid;grid-template-columns:1fr;gap:14px;}
+@media(min-width:760px){.layout{grid-template-columns:1fr 248px;}}
+.stage{position:relative;border:1.5px solid var(--ink);border-radius:0;overflow:hidden;
+  background:#FFFFFF;
+  box-shadow:0 1px 1px rgba(28,39,51,.04), 0 10px 24px -14px rgba(28,39,51,.30), 4px 4px 0 rgba(28,39,51,.10);
+  animation:rise .5s ease both;}
+@keyframes rise{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+.cvs{display:block;width:100%;height:auto;touch-action:none;cursor:crosshair;background:#FFFFFF;border-radius:0;}
+.panel{display:flex;flex-direction:column;gap:12px;}
+.card{border:1px solid var(--line);border-radius:4px;background:var(--panel);padding:12px 13px;}
+.card h4{margin:0 0 9px;font-size:10.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);font-weight:700;}
+.row{display:flex;justify-content:space-between;align-items:baseline;padding:3px 0;}
+.row span{color:var(--muted);font-size:12px;}
+.row b{font-weight:600;font-size:14px;font-variant-numeric:tabular-nums;}
+.row b small{color:var(--muted);font-weight:400;font-size:11px;margin-left:3px;}
+.brow{display:flex;flex-wrap:wrap;gap:6px;}
+.btn{font-family:inherit;font-size:11.5px;color:var(--ink);cursor:pointer;
+  background:#FFFFFF;border:1px solid var(--line);border-radius:4px;padding:6px 9px;
+  transition:.15s;flex:1 1 auto;min-width:60px;text-align:center;}
+.btn:hover{border-color:var(--accent);color:var(--accent);background:#E8EFF4;}
+.btn:disabled{opacity:.35;cursor:default;}
+.btn.pink:hover{border-color:var(--pink);color:var(--pink);background:#F8E9E5;}
+.tog{display:flex;align-items:center;justify-content:space-between;padding:5px 0;font-size:12px;color:var(--muted);cursor:pointer;user-select:none;}
+.sw{width:34px;height:19px;border-radius:99px;background:#EDEBE3;border:1px solid var(--line);position:relative;transition:.18s;flex:none;}
+.sw.on{background:var(--accent);}
+.sw i{position:absolute;top:1.5px;left:1.5px;width:14px;height:14px;border-radius:50%;background:#FFFFFF;transition:.18s;box-shadow:0 1px 2px rgba(28,39,51,.25);}
+.sw.on i{left:16px;background:#FFFFFF;}
+.hint{font-size:11px;color:var(--muted);line-height:1.6;}
+.hint b{color:var(--accent);font-weight:600;}
+.cmenu{position:absolute;z-index:30;min-width:148px;background:#FFFFFF;
+  border:1px solid var(--line);border-radius:4px;padding:5px;
+  box-shadow:0 12px 32px -8px rgba(28,39,51,.28);display:flex;flex-direction:column;gap:2px;animation:pop .12s ease;}
+@keyframes pop{from{opacity:0;transform:scale(.96)}to{opacity:1;transform:none}}
+.cmh{font-size:10px;letter-spacing:.07em;text-transform:uppercase;color:var(--muted);padding:5px 8px 3px;}
+.cmi{font-family:inherit;font-size:12px;text-align:left;color:var(--ink);background:transparent;
+  border:0;border-radius:3px;padding:7px 8px;cursor:pointer;width:100%;
+  display:flex;align-items:center;gap:8px;justify-content:space-between;}
+.cmi:hover{background:#E8EFF4;color:var(--accent);}
+.cmi.del:hover{background:#F8E9E5;color:var(--pink);}
+.cmi.act{background:#E8EFF4;color:var(--accent);font-weight:600;}
+.cmlbl{flex:1 1 auto;}
+.cmck{flex:0 0 auto;color:var(--accent);font-weight:700;}
+.cmzoom:hover{background:#E8EFF4;color:var(--accent);}
+.cmlight{flex:0 0 auto;width:9px;height:9px;border-radius:50%;background:#C9D2DA;
+  box-shadow:inset 0 0 0 1px rgba(28,39,51,.18);transition:background .15s ease,box-shadow .15s ease;}
+.cmlight.on{background:#34C759;box-shadow:0 0 0 1px rgba(52,199,89,.30),0 0 6px rgba(52,199,89,.65);}
+.ribbon{display:flex;align-items:stretch;gap:10px;padding:6px 10px;margin:0 0 10px;border:1px solid var(--line);
+  border-radius:4px;background:var(--panel);overflow-x:auto;
+  position:sticky;top:var(--tabbar-h,42px);z-index:30;box-shadow:0 2px 10px -7px rgba(28,39,51,.35);}
+.rgroup{display:flex;flex-direction:column;gap:3px;}
+.rlabel{font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);padding-left:2px;}
+@media print{ .r{background-image:none;background-color:#FFF;} .ribbon{box-shadow:none;} }
+.rbtns{display:flex;gap:4px;}
+.rbtn{border:1px solid var(--line);background:#FFFFFF;color:var(--ink);font-size:11.5px;font-weight:600;
+  padding:5px 9px;border-radius:4px;cursor:pointer;white-space:nowrap;
+  transition:border-color .14s ease,color .14s ease,background .14s ease,box-shadow .14s ease;}
+.rbtn:hover{border-color:var(--accent);color:var(--accent);background:#F6F9FB;}
+.rbtn:active{box-shadow:inset 0 1px 3px rgba(28,39,51,.18);}
+.rbtn.ron{background:#E8EFF4;border-color:var(--accent);color:var(--accent);}
+.rbtn.raccent{border-color:var(--accent);color:var(--accent);}
+.rbtn:disabled{opacity:.35;cursor:default;border-color:var(--line);color:var(--muted);}
+.rsep{width:1px;background:linear-gradient(180deg,transparent,var(--line) 22%,var(--line) 78%,transparent);margin:0;}
+.statusbar{display:flex;align-items:center;gap:14px;margin-top:8px;padding:5px 12px;border:1px solid var(--line);
+  border-radius:4px;background:var(--panel);font-size:11px;color:var(--muted);
+  font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;}
+.stcoord{min-width:150px;color:var(--ink);}
+.stmode{font-weight:700;color:var(--muted);}
+.stmode.draw{color:var(--accent);}
+.stmode.pan{color:var(--accent);}
+.stflag{cursor:pointer;letter-spacing:.08em;opacity:.45;}
+.stflag.on{opacity:1;color:var(--accent);font-weight:700;}
+.stright{margin-left:auto;}
+/* Sliding 1-Story / 2-Story pill (ribbon) — segmented control with a white thumb that slides. */
+.storypill{position:relative;display:grid;grid-template-columns:1fr 1fr;background:var(--accent);
+  border-radius:99px;cursor:pointer;user-select:none;box-shadow:inset 0 1px 3px rgba(28,39,51,.25);}
+.storythumb{position:absolute;top:3px;bottom:3px;left:3px;width:calc(50% - 3px);
+  background:#FFFFFF;border-radius:99px;box-shadow:0 1px 2px rgba(28,39,51,.3);
+  transition:transform .22s cubic-bezier(.4,0,.2,1);}
+.storypill.two .storythumb{transform:translateX(100%);}
+.storyopt{position:relative;z-index:1;border:0;background:transparent;font-family:inherit;
+  font-size:11px;font-weight:700;letter-spacing:.02em;padding:5px 14px;cursor:pointer;
+  color:#FFFFFF;transition:color .2s ease;white-space:nowrap;text-align:center;}
+.storyopt.on{color:var(--accent);}
+/* Floor selector — its own bar directly BELOW the drawing area (never over the canvas, so clicks land). */
+.canvascol{display:flex;flex-direction:column;min-width:0;}
+.floorbar{display:flex;justify-content:center;margin-top:8px;}
+.floorsel{display:inline-flex;border:1.5px solid var(--ink);border-radius:4px;overflow:hidden;background:#FFFFFF;
+  box-shadow:4px 4px 0 rgba(28,39,51,.10);font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;}
+.floorbar.off .floorsel{opacity:.5;border-color:var(--line);box-shadow:none;}
+.floortab{border:0;background:#FFFFFF;color:var(--muted);font-size:11px;font-weight:600;letter-spacing:.03em;
+  padding:5px 14px;cursor:pointer;transition:background .14s ease,color .14s ease;}
+.floortab+.floortab{border-left:1px solid var(--line);}
+.floortab:hover:not(:disabled){background:#F6F9FB;color:var(--accent);}
+.floortab.act{background:var(--accent);color:#FFFFFF;}
+.floortab:disabled{cursor:default;}
+.floorbar.off .floortab.act{background:#EDEBE3;color:var(--muted);}
+/* Floor badge — top-left of the canvas (2-story mode); pointer-events:none so it never blocks the SVG. */
+.floorbadge{position:absolute;top:8px;left:8px;z-index:4;pointer-events:none;
+  background:rgba(35,87,127,.92);color:#FFFFFF;font-family:'IBM Plex Sans','Helvetica Neue',Arial,sans-serif;
+  font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;
+  padding:4px 9px;border-radius:3px;box-shadow:0 2px 6px -2px rgba(28,39,51,.4);}
+.floorbadge span{font-weight:500;opacity:.78;}
+/* 2nd-story height field in the wind window (2-story mode). */
+.h2row{border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:4px;padding:9px 11px;margin-bottom:12px;background:#F6F9FB;}
+.h2top{display:flex;align-items:center;justify-content:space-between;gap:10px;}
+.h2top label{font-size:12px;font-weight:600;color:var(--ink);}
+.h2inp{display:flex;align-items:center;gap:4px;background:#FFFFFF;border:1.5px solid var(--accent);border-radius:4px;padding:3px 8px;}
+.h2inp input{font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;font-size:14px;font-weight:700;color:var(--accent);
+  background:transparent;border:0;outline:none;width:56px;text-align:right;}
+.h2inp span{font-size:11px;color:var(--muted);}
+.h2hint{font-size:10.5px;color:var(--muted);line-height:1.5;margin-top:6px;}
+.dim-input-wrap{position:absolute;transform:translate(-50%,-50%);z-index:25;display:flex;align-items:center;gap:3px;
+  background:#FFFFFF;border:1.5px solid var(--hot);border-radius:4px;padding:4px 7px;box-shadow:0 8px 24px -6px rgba(28,39,51,.3);animation:pop .1s ease;}
+.dim-inp{font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;font-size:13px;color:var(--hot);background:transparent;border:0;outline:none;width:52px;text-align:right;font-weight:700;}
+.dim-unit{font-size:11px;color:var(--muted);}
+/* wind window modal */
+.ovl{position:fixed;inset:0;z-index:60;background:rgba(28,39,51,.35);display:flex;align-items:center;justify-content:center;padding:14px;animation:pop .14s ease;}
+.win{width:min(580px,97vw);max-height:94vh;overflow:auto;background:#FFFFFF;border:1.5px solid var(--ink);border-radius:0;box-shadow:6px 6px 0 rgba(28,39,51,.15);}
+.win-h{display:flex;align-items:center;justify-content:space-between;padding:13px 16px;border-bottom:1.5px solid var(--ink);position:sticky;top:0;background:#FFFFFF;z-index:2;}
+.win-t{font-family:'IBM Plex Sans','Helvetica Neue',Arial,sans-serif;font-weight:800;font-size:15px;color:var(--ink);}
+.win-x{background:#FFFFFF;border:1px solid var(--line);color:var(--ink);border-radius:4px;width:30px;height:30px;cursor:pointer;font-size:16px;line-height:1;}
+.win-x:hover{border-color:var(--pink);color:var(--pink);}
+.win-b{padding:14px 16px;}
+.seg{border:1px solid var(--line);border-radius:4px;padding:11px 12px;margin-bottom:10px;background:#FFFFFF;}
+.seg h5{margin:0 0 9px;font-size:10px;letter-spacing:.14em;text-transform:uppercase;font-weight:700;}
+.seg.wall h5{color:var(--accent);} .seg.par h5{color:var(--hot);}
+.fgrid{display:grid;grid-template-columns:1fr 1fr;gap:9px;}
+.fld{display:flex;flex-direction:column;gap:3px;}
+.fld label{font-size:10.5px;color:var(--muted);letter-spacing:.06em;text-transform:uppercase;}
+.fld input{font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;font-size:13px;color:var(--accent);font-weight:600;background:#FDFDFB;border:1px solid var(--line);border-radius:4px;padding:7px 9px;outline:none;}
+.fld input:focus{border-color:var(--accent);}
+.rev{font-family:inherit;font-size:12px;color:var(--ink);background:#FFFFFF;border:1px solid var(--line);border-radius:4px;padding:9px 12px;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px;width:100%;}
+.rev:hover{border-color:var(--pink);color:var(--pink);background:#F8E9E5;}
+.tot{margin-top:4px;background:#E8EFF4;border:1px solid var(--line);border-radius:4px;padding:14px 16px;}
+.tot .lbl{font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);}
+.tot .v{font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;font-size:30px;font-weight:600;line-height:1.1;margin-top:3px;color:var(--accent);}
+.tot .v small{font-size:15px;color:var(--muted);font-weight:400;}
+.brk{display:flex;justify-content:space-between;font-size:11.5px;color:var(--muted);padding:2px 0;font-variant-numeric:tabular-nums;}
+.brk b{color:var(--ink);font-weight:500;}
+`;
+
+/* ═══════════════ SECTION ELEVATION DIAGRAM ═══════════════ */
+function SecDiagram({ v, upd }) {
+  const [edit,setEdit]=useState(null);   // {field,prop,l,t}
+  const num=s=>Math.max(0,parseFloat(s)||0);
+  const HL=num(v.H), HR=num(v.leeH), pw=num(v.pw), parW=num(v.wH), qW=num(v.wQ), parL=num(v.lH), qL=num(v.lQ);
+  const VBW=330, VBH=250, padTop=18, padBot=20, availH=VBH-padTop-padBot;
+  // scale to the taller side-stack (wall + its own parapet) so a sloping roof + both parapets fit;
+  // identical to the old flat-roof scaling when HL===HR.
+  const maxFt=Math.max(HL+parW, HR+parL, 1), pxPerFt=availH/maxFt;
+  const wallBot=padTop+availH;                          // common foundation baseline (both walls)
+  const wallLX=95, wallRX=250;
+  const roofYL=wallBot - HL*pxPerFt;                    // windward roof point (left,  height HL)
+  const roofYR=wallBot - HR*pxPerFt;                    // leeward  roof point (right, height HR)
+  const parWTop=roofYL - parW*pxPerFt, parLTop=roofYR - parL*pxPerFt;
+  const maxPsf=Math.max(pw,qW,qL,1), aS=42/maxPsf;
+  const aWall=pw>0?Math.max(pw*aS,6):0, aWind=qW>0?Math.max(qW*aS,6):0, aLee=qL>0?Math.max(qL*aS,6):0;
+  const rows=(yTop,yBot)=>{ const n=Math.max(1,Math.round((yBot-yTop)/8)); return Array.from({length:n+1},(_,i)=>yTop+(yBot-yTop)*i/n); };
+  const CY="#23577F", YEL="#1C2733";
+  const open=(field,prop,cx,cy)=>setEdit({field,prop,l:cx/VBW*100,t:cy/VBH*100});
+  const Box=({cx,cy,text,color,field,prop,rot=0})=>{
+    const w=text.length*4.1+6, h=11;
+    return (
+      <g style={{cursor:"pointer"}} onClick={()=>open(field,prop,cx,cy)} transform={rot?`rotate(${rot},${cx},${cy})`:undefined}>
+        <rect x={cx-w/2} y={cy-h/2} width={w} height={h} rx={1.5} fill={color}/>
+        <text x={cx} y={cy+0.4} fill="#fff" fontSize={7} fontWeight={700} textAnchor="middle" dominantBaseline="middle" style={{userSelect:"none"}}>{text}</text>
+      </g>
+    );
+  };
+  const wMid=(parWTop+roofYL)/2, hMidL=(roofYL+wallBot)/2, hMidR=(roofYR+wallBot)/2, lMid=(parLTop+roofYR)/2;
+  const roofMidX=(wallLX+wallRX)/2, roofMidY=(roofYL+roofYR)/2;
+  const roofAng=Math.atan2(roofYR-roofYL, wallRX-wallLX)*180/Math.PI;   // 0 when flat
+  return (
+    <div style={{position:"relative"}}>
+      <svg viewBox={`0 0 ${VBW} ${VBH}`} style={{width:"100%",height:"auto",display:"block"}}>
+        <defs>
+          <marker id="dArr" markerWidth="6" markerHeight="6" refX="4.6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill={CY}/></marker>
+        </defs>
+        <rect x="0" y="0" width={VBW} height={VBH} fill={C_BG} rx="6"/>
+
+        {/* WALL SECTION — trapezoid: left edge = windward height, right edge = leeward height, top = roof line (slopes when heights differ) */}
+        <polygon points={`${wallLX},${roofYL} ${wallRX},${roofYR} ${wallRX},${wallBot} ${wallLX},${wallBot}`} fill="none" stroke={YEL} strokeWidth="1.4"/>
+        <text x={roofMidX} y={roofMidY-3} fill="#6B7684" fontSize="7" letterSpacing=".25em" textAnchor="middle"
+              transform={`rotate(${roofAng},${roofMidX},${roofMidY})`}>ROOF LINE</text>
+
+        {/* parapet walls — a single line rising from each side's own roof point (continues the wall face up) */}
+        {parW>0 && <line x1={wallLX} y1={roofYL} x2={wallLX} y2={parWTop} stroke={YEL} strokeWidth="1.4"/>}
+        {parL>0 && <line x1={wallRX} y1={roofYR} x2={wallRX} y2={parLTop} stroke={YEL} strokeWidth="1.4"/>}
+        {/* node where each parapet starts (top of wall / roof point) — repositions live as heights are typed */}
+        {parW>0 && <circle cx={wallLX} cy={roofYL} r="2.4" fill={C_NODE} stroke="#FFFFFF" strokeWidth="1"/>}
+        {parL>0 && <circle cx={wallRX} cy={roofYR} r="2.4" fill={C_NODE} stroke="#FFFFFF" strokeWidth="1"/>}
+
+        {/* windward WALL pressure — left edge, arrows point right */}
+        {HL>0&&pw>0&&<g>
+          <line x1={wallLX-aWall} y1={roofYL} x2={wallLX-aWall} y2={wallBot} stroke={CY} strokeWidth="1"/>
+          {rows(roofYL,wallBot).map((y,i)=><line key={i} x1={wallLX-aWall} y1={y} x2={wallLX} y2={y} stroke={CY} strokeWidth=".7" markerEnd="url(#dArr)"/>)}
+        </g>}
+        {/* windward PARAPET pressure — left, arrows point right */}
+        {parW>0&&qW>0&&<g>
+          <line x1={wallLX-aWind} y1={parWTop} x2={wallLX-aWind} y2={roofYL} stroke={CY} strokeWidth="1"/>
+          {rows(parWTop,roofYL).map((y,i)=><line key={i} x1={wallLX-aWind} y1={y} x2={wallLX} y2={y} stroke={CY} strokeWidth=".7" markerEnd="url(#dArr)"/>)}
+        </g>}
+        {/* leeward PARAPET pressure — right edge, arrows point right (left→right, with the wind) */}
+        {parL>0&&qL>0&&<g>
+          <line x1={wallRX} y1={parLTop} x2={wallRX} y2={roofYR} stroke={CY} strokeWidth="1"/>
+          {rows(parLTop,roofYR).map((y,i)=><line key={i} x1={wallRX} y1={y} x2={wallRX+aLee} y2={y} stroke={CY} strokeWidth=".7" markerEnd="url(#dArr)"/>)}
+        </g>}
+
+        {/* WINDWARD / LEEWARD labels — vertical, beside each parapet line */}
+        {parW>0&&<text x={wallLX+8} y={wMid} fill="#6B7684" fontSize="6" letterSpacing=".12em"
+              textAnchor="middle" transform={`rotate(-90,${wallLX+8},${wMid})`}>WINDWARD</text>}
+        {parL>0&&<text x={wallRX-8} y={lMid} fill="#6B7684" fontSize="6" letterSpacing=".12em"
+              textAnchor="middle" transform={`rotate(-90,${wallRX-8},${lMid})`}>LEEWARD</text>}
+
+        {/* pressure boxes (blue, vertical, over the arrows) */}
+        <Box cx={wallLX-aWind/2} cy={wMid} text={`${fmt1(qW)} psf`} color={C_DIMBOX} field="wQ" prop="qWind" rot={-90}/>
+        <Box cx={wallLX-aWall/2} cy={hMidL} text={`${fmt1(pw)} psf`} color={C_DIMBOX} field="pw" prop="pw"   rot={-90}/>
+        <Box cx={wallRX+aLee/2} cy={lMid} text={`${fmt1(qL)} psf`} color={C_DIMBOX} field="lQ" prop="qLee" rot={-90}/>
+        {/* height boxes (red, horizontal, beside each element) — windward wall HL, leeward wall HR, both parapets */}
+        <Box cx={wallLX+30} cy={wMid} text={`${fmt1(parW)} ft`} color={C_REACTBOX} field="wH"   prop="parW"/>
+        <Box cx={wallLX+22}      cy={hMidL} text={`${fmt1(HL)} ft`}  color={C_REACTBOX} field="H"    prop="H"/>
+        <Box cx={wallRX-22}      cy={hMidR} text={`${fmt1(HR)} ft`}  color={C_REACTBOX} field="leeH" prop="leeH"/>
+        <Box cx={wallRX-30} cy={lMid} text={`${fmt1(parL)} ft`} color={C_REACTBOX} field="lH"   prop="parL"/>
+      </svg>
+
+      {edit && (
+        <input autoFocus type="number" inputMode="decimal" value={v[edit.field] ?? ""}
+          onChange={upd(edit.field, edit.prop)} onBlur={()=>setEdit(null)}
+          onKeyDown={e=>{ if(e.key==="Enter"||e.key==="Escape") setEdit(null); }}
+          style={{ position:"absolute", left:`${edit.l}%`, top:`${edit.t}%`, transform:"translate(-50%,-50%)",
+                   width:58, padding:"4px 6px", textAlign:"center", border:"1.5px solid #2ad4e8", borderRadius:5,
+                   background:"#FFFFFF", color:"#9A6B1F", border:"1.5px solid #9A6B1F", borderRadius:3, font:"700 13px ui-monospace,Menlo,monospace", outline:"none", zIndex:6 }}/>
+      )}
+    </div>
+  );
+}
+
+/* ═══════════════ TWO-STORY SECTION ELEVATION (Step 4) ═══════════════
+   Stacked flat-roof elevation: 1st story (H) + 2nd story (H₂) split by the 2nd-floor diaphragm,
+   parapets on top, windward wall pressure over both stories, and both diaphragm line-load callouts.
+   SecDiagram (1-story) is left untouched; the wind window picks this variant in 2-story mode. */
+function SecDiagram2({ v, upd, roofLL, floorLL }) {
+  const [edit,setEdit]=useState(null);
+  const num=s=>Math.max(0,parseFloat(s)||0);
+  const H1=num(v.H),   H2=num(v.H2),   pw=num(v.pw), parW=num(v.wH), qW=num(v.wQ);   // windward 1st/2nd-story + parapet
+  const LH1=num(v.leeH), LH2=num(v.leeH2),            parL=num(v.lH), qL=num(v.lQ);   // leeward  1st/2nd-story + parapet
+  const VBW=362, VBH=300, padTop=22, padBot=26, availH=VBH-padTop-padBot;
+  const maxFt=Math.max(H1+H2+parW, LH1+LH2+parL, 1), pxPerFt=availH/maxFt;
+  const wallBot=padTop+availH;                          // 1st floor / foundation baseline (shared)
+  const wallLX=106, wallRX=236;
+  const yF2L=wallBot - H1*pxPerFt,  yRoofL=yF2L - H2*pxPerFt;    // windward 2nd-floor + roof points
+  const yF2R=wallBot - LH1*pxPerFt, yRoofR=yF2R - LH2*pxPerFt;   // leeward  2nd-floor + roof points (may differ → sloped)
+  const parWTop=yRoofL - parW*pxPerFt, parLTop=yRoofR - parL*pxPerFt;
+  const maxPsf=Math.max(pw,qW,qL,1), aS=40/maxPsf;
+  const aWall=pw>0?Math.max(pw*aS,6):0, aWind=qW>0?Math.max(qW*aS,6):0, aLee=qL>0?Math.max(qL*aS,6):0;
+  const rows=(yTop,yBot)=>{ const n=Math.max(1,Math.round((yBot-yTop)/8)); return Array.from({length:n+1},(_,i)=>yTop+(yBot-yTop)*i/n); };
+  const CY="#23577F", YEL="#1C2733", GOLD="#9A6B1F";
+  const open=(field,prop,cx,cy)=>setEdit({field,prop,l:cx/VBW*100,t:cy/VBH*100});
+  const Box=({cx,cy,text,color,field,prop,rot=0})=>{
+    const w=text.length*4.1+6, h=11;
+    return (
+      <g style={{cursor:"pointer"}} onClick={()=>open(field,prop,cx,cy)} transform={rot?`rotate(${rot},${cx},${cy})`:undefined}>
+        <rect x={cx-w/2} y={cy-h/2} width={w} height={h} rx={1.5} fill={color}/>
+        <text x={cx} y={cy+0.4} fill="#fff" fontSize={7} fontWeight={700} textAnchor="middle" dominantBaseline="middle" style={{userSelect:"none"}}>{text}</text>
+      </g>
+    );
+  };
+  const mid2L=(yRoofL+yF2L)/2, mid1L=(yF2L+wallBot)/2;          // windward story mids (left height boxes)
+  const mid2R=(yRoofR+yF2R)/2, mid1R=(yF2R+wallBot)/2;          // leeward  story mids (right height boxes)
+  const wMid=(parWTop+yRoofL)/2, lMid=(parLTop+yRoofR)/2;
+  const cx=(wallLX+wallRX)/2, calloutX=VBW-90;
+  const lblY2=(mid2L+mid2R)/2, lblY1=(mid1L+mid1R)/2;          // story labels centered between the (possibly sloped) lines
+  return (
+    <div style={{position:"relative"}}>
+      <svg viewBox={`0 0 ${VBW} ${VBH}`} style={{width:"100%",height:"auto",display:"block"}}>
+        <defs>
+          <marker id="dArr2" markerWidth="6" markerHeight="6" refX="4.6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill={CY}/></marker>
+        </defs>
+        <rect x="0" y="0" width={VBW} height={VBH} fill={C_BG} rx="6"/>
+
+        {/* building outline — two stories; roof & 2nd-floor lines slope if windward/leeward heights differ */}
+        <line x1={wallLX} y1={yRoofL} x2={wallLX} y2={wallBot} stroke={YEL} strokeWidth="1.4"/>
+        <line x1={wallRX} y1={yRoofR} x2={wallRX} y2={wallBot} stroke={YEL} strokeWidth="1.4"/>
+        <line x1={wallLX} y1={wallBot} x2={wallRX} y2={wallBot} stroke={YEL} strokeWidth="1.4"/>
+        <line x1={wallLX} y1={yRoofL} x2={wallRX} y2={yRoofR} stroke={YEL} strokeWidth="1.4"/>{/* roof diaphragm */}
+        <line x1={wallLX} y1={yF2L}   x2={wallRX} y2={yF2R}   stroke={YEL} strokeWidth="1.1" strokeDasharray="4 3"/>{/* 2nd-floor diaphragm */}
+
+        {/* parapets */}
+        {parW>0 && <line x1={wallLX} y1={yRoofL} x2={wallLX} y2={parWTop} stroke={YEL} strokeWidth="1.4"/>}
+        {parL>0 && <line x1={wallRX} y1={yRoofR} x2={wallRX} y2={parLTop} stroke={YEL} strokeWidth="1.4"/>}
+        {parW>0 && <circle cx={wallLX} cy={yRoofL} r="2.2" fill={C_NODE} stroke="#FFFFFF" strokeWidth="1"/>}
+        {parL>0 && <circle cx={wallRX} cy={yRoofR} r="2.2" fill={C_NODE} stroke="#FFFFFF" strokeWidth="1"/>}
+
+        {/* windward WALL pressure — both stories, arrows point right */}
+        {pw>0&&(H1+H2)>0&&<g>
+          <line x1={wallLX-aWall} y1={yRoofL} x2={wallLX-aWall} y2={wallBot} stroke={CY} strokeWidth="1"/>
+          {rows(yRoofL,wallBot).map((y,i)=><line key={i} x1={wallLX-aWall} y1={y} x2={wallLX} y2={y} stroke={CY} strokeWidth=".7" markerEnd="url(#dArr2)"/>)}
+        </g>}
+        {/* windward PARAPET pressure */}
+        {parW>0&&qW>0&&<g>
+          <line x1={wallLX-aWind} y1={parWTop} x2={wallLX-aWind} y2={yRoofL} stroke={CY} strokeWidth="1"/>
+          {rows(parWTop,yRoofL).map((y,i)=><line key={i} x1={wallLX-aWind} y1={y} x2={wallLX} y2={y} stroke={CY} strokeWidth=".7" markerEnd="url(#dArr2)"/>)}
+        </g>}
+        {/* leeward PARAPET pressure — right side */}
+        {parL>0&&qL>0&&<g>
+          <line x1={wallRX} y1={parLTop} x2={wallRX} y2={yRoofR} stroke={CY} strokeWidth="1"/>
+          {rows(parLTop,yRoofR).map((y,i)=><line key={i} x1={wallRX} y1={y} x2={wallRX+aLee} y2={y} stroke={CY} strokeWidth=".7" markerEnd="url(#dArr2)"/>)}
+        </g>}
+
+        {/* WINDWARD / LEEWARD vertical labels beside each parapet */}
+        {parW>0 && <text x={wallLX+9} y={wMid} fill="#6B7684" fontSize="6" letterSpacing=".12em" textAnchor="middle" transform={`rotate(-90,${wallLX+9},${wMid})`}>WINDWARD</text>}
+        {parL>0 && <text x={wallRX-9} y={lMid} fill="#6B7684" fontSize="6" letterSpacing=".12em" textAnchor="middle" transform={`rotate(-90,${wallRX-9},${lMid})`}>LEEWARD</text>}
+
+        {/* story + floor labels */}
+        <text x={cx} y={lblY2+2} fill="#6B7684" fontSize="8" letterSpacing=".14em" textAnchor="middle">2ND STORY</text>
+        <text x={cx} y={lblY1+2} fill="#6B7684" fontSize="8" letterSpacing=".14em" textAnchor="middle">1ST STORY</text>
+        <text x={cx} y={wallBot+13} fill="#6B7684" fontSize="6.5" letterSpacing=".1em" textAnchor="middle">1ST FLOOR · FOUNDATION</text>
+
+        {/* diaphragm load callouts (gold leaders to the right, anchored at the leeward points) */}
+        <line x1={wallRX} y1={yRoofR} x2={calloutX-2} y2={yRoofR} stroke={GOLD} strokeWidth=".7" strokeDasharray="2 2"/>
+        <text x={calloutX} y={yRoofR-2.5} fill={GOLD} fontSize="7" fontWeight="700">Roof diaphragm</text>
+        <text x={calloutX} y={yRoofR+7}  fill={GOLD} fontSize="9" fontWeight="700">{fmt1(roofLL)} plf</text>
+        <line x1={wallRX} y1={yF2R} x2={calloutX-2} y2={yF2R} stroke={GOLD} strokeWidth=".7" strokeDasharray="2 2"/>
+        <text x={calloutX} y={yF2R-2.5} fill={GOLD} fontSize="7" fontWeight="700">2nd-flr diaphragm</text>
+        <text x={calloutX} y={yF2R+7}  fill={GOLD} fontSize="9" fontWeight="700">{fmt1(floorLL)} plf</text>
+
+        {/* pressure boxes (blue) */}
+        <Box cx={wallLX-aWall/2} cy={(yRoofL+wallBot)/2} text={`${fmt1(pw)} psf`} color={C_DIMBOX} field="pw" prop="pw" rot={-90}/>
+        {parW>0&&<Box cx={wallLX-aWind/2} cy={wMid} text={`${fmt1(qW)} psf`} color={C_DIMBOX} field="wQ" prop="qWind" rot={-90}/>}
+        {parL>0&&<Box cx={wallRX+aLee/2} cy={lMid} text={`${fmt1(qL)} psf`} color={C_DIMBOX} field="lQ" prop="qLee" rot={-90}/>}
+        {/* height boxes (red) — windward H₂/H (left), leeward H₂/H (right), parapets */}
+        <Box cx={wallLX+20} cy={mid2L} text={`${fmt1(H2)} ft`}  color={C_REACTBOX} field="H2"    prop="H2"/>
+        <Box cx={wallLX+20} cy={mid1L} text={`${fmt1(H1)} ft`}  color={C_REACTBOX} field="H"     prop="H"/>
+        <Box cx={wallRX-20} cy={mid2R} text={`${fmt1(LH2)} ft`} color={C_REACTBOX} field="leeH2" prop="leeH2"/>
+        <Box cx={wallRX-20} cy={mid1R} text={`${fmt1(LH1)} ft`} color={C_REACTBOX} field="leeH"  prop="leeH"/>
+        {parW>0&&<Box cx={wallLX+22} cy={wMid} text={`${fmt1(parW)} ft`} color={C_REACTBOX} field="wH" prop="parW"/>}
+        {parL>0&&<Box cx={wallRX-22} cy={lMid} text={`${fmt1(parL)} ft`} color={C_REACTBOX} field="lH" prop="parL"/>}
+      </svg>
+
+      {edit && (
+        <input autoFocus type="number" inputMode="decimal" value={v[edit.field] ?? ""}
+          onChange={upd(edit.field, edit.prop)} onBlur={()=>setEdit(null)}
+          onKeyDown={e=>{ if(e.key==="Enter"||e.key==="Escape") setEdit(null); }}
+          style={{ position:"absolute", left:`${edit.l}%`, top:`${edit.t}%`, transform:"translate(-50%,-50%)",
+                   width:58, padding:"4px 6px", textAlign:"center",
+                   background:"#FFFFFF", color:"#9A6B1F", border:"1.5px solid #9A6B1F", borderRadius:3, font:"700 13px ui-monospace,Menlo,monospace", outline:"none", zIndex:6 }}/>
+      )}
+    </div>
+  );
+}
+
+/* ── CAD palette ── */
+const C_BG="#FFFFFF", C_GRID="#E9E7DE", C_WALL="#1C2733", C_NODE="#23577F",
+      C_LOAD="#23577F", C_REACT="#B23A2A", C_DIMBOX="#23577F", C_REACTBOX="#B23A2A", C_DRAFT="#9A6B1F";
+
+/* masked label box (blue for dimensions, red for reactions) — readable over any line */
+function Tag({ x, y, text, box, S, rot=0 }) {
+  const fs=1.35*S, w=text.length*fs*0.64+0.9*S, h=fs*1.35;
+  return (
+    <g transform={rot?`rotate(${rot},${x},${y})`:undefined}>
+      <rect x={x-w/2} y={y-h/2} width={w} height={h} rx={0.3*S} fill={box}/>
+      <text x={x} y={y+0.15*S} fill="#fff" fontSize={fs} fontWeight="700"
+            textAnchor="middle" dominantBaseline="middle">{text}</text>
+    </g>
+  );
+}
+
+/* stable field — defined at module scope so it never remounts (keeps focus) */
+function Field({ label, unit, value, onChange }) {
+  return (
+    <div className="fld">
+      <label>{label}</label>
+      <div style={{ position:"relative" }}>
+        <input type="number" min="0" step="0.1" value={value ?? ""} onChange={onChange}
+               style={{ width:"100%", paddingRight:36 }}/>
+        <span style={{ position:"absolute", right:9, top:"50%", transform:"translateY(-50%)", fontSize:10, color:"#7e8db5" }}>{unit}</span>
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════ WINDWARD LINE-LOAD (static, CAD style) ═══════════════ */
+function WindLoad({ load, onOpen, S=1 }) {
+  const { nx, ny } = load;
+  // one group per leeward sub-region (split where the back wall's parapet changes). Adjacent
+  // sub-regions that resolve to the SAME plf are merged into one span here so the wall shows a
+  // single load label — two labels appear ONLY where the line load actually changes along the wall
+  // (matching the dashed tributary divide, which is likewise drawn only where plf differs).
+  const raw = (load.subLoads && load.subLoads.length)
+    ? load.subLoads
+    : [{ a:load.wa, b:load.wb, plf:load.total }];
+  const segs = [];
+  for(const sg of raw){
+    const prev = segs[segs.length-1];
+    if(prev && Math.abs(prev.plf - sg.plf) < 0.5) prev.b = sg.b;   // same plf → extend the span
+    else segs.push({ a:sg.a, b:sg.b, plf:sg.plf });
+  }
+  return (
+    <g style={{cursor:"pointer"}} onPointerDown={e=>e.stopPropagation()} onClick={onOpen}>
+      {segs.map((sg,si)=>{
+        const wa=sg.a, wb=sg.b, total=sg.plf;
+        const len=Math.hypot(wb.x-wa.x, wb.y-wa.y);
+        const aLen = clamp(total/55, 3, 8) * 0.5 * S;
+        const n = Math.max(2, Math.round(len/(5.5*S)));
+        const tip = 0.3*S;
+        const b1={x:wa.x+nx*aLen, y:wa.y+ny*aLen}, b2={x:wb.x+nx*aLen, y:wb.y+ny*aLen};
+        const arrows=[];
+        for(let i=0;i<=n;i++){
+          const f=i/n, px=wa.x+(wb.x-wa.x)*f, py=wa.y+(wb.y-wa.y)*f;
+          arrows.push({k:i, x1:px+nx*aLen, y1:py+ny*aLen, x2:px+nx*tip, y2:py+ny*tip});
+        }
+        const wallVert = Math.abs(wb.y-wa.y) > Math.abs(wb.x-wa.x);
+        const mx=(wa.x+wb.x)/2, my=(wa.y+wb.y)/2;
+        const lx=mx+nx*(aLen+2.2*S), ly=my+ny*(aLen+2.2*S);
+        return (
+          <g key={si}>
+            <line x1={b1.x} y1={b1.y} x2={b2.x} y2={b2.y} stroke={C_LOAD} strokeWidth={0.2*S}/>
+            {arrows.map(a=>(
+              <line key={a.k} x1={a.x1} y1={a.y1} x2={a.x2} y2={a.y2} stroke={C_LOAD} strokeWidth={0.16*S} markerEnd="url(#loadArr)"/>
+            ))}
+            <text x={lx} y={ly} fill={C_LOAD} fontSize={1.35*S} fontWeight="600" textAnchor="middle" dominantBaseline="central"
+                  transform={wallVert?`rotate(-90,${lx},${ly})`:undefined}>{fmt1(total)} plf</text>
+          </g>
+        );
+      })}
+    </g>
+  );
+}
+
+/* aggregated reaction on a (possibly shared) support — drawn as a compact "rocket": the bold
+   arrowhead (nose) terminates AT the support node and the label box is the body, trailing to the
+   windward side along the load direction (tdir). On vertical walls the load runs down the wall, so
+   the label is rotated to lie ALONG the shaft — text + arrowhead read as one rocket (matching the
+   horizontal case) instead of a horizontal chip with an arrow poking out of it. */
+function Reaction({ r, tdir, S }) {
+  const dx=tdir.x, dy=tdir.y;
+  const vert = Math.abs(dy) > Math.abs(dx);               // vertical rocket → rotate label to lie along the shaft
+  const shaft=2.1*S;
+  const hx=r.ax, hy=r.ay;                                  // nose tip at the support node
+  const tx=r.ax-dx*shaft, ty=r.ay-dy*shaft;                // shaft tail (windward side)
+  const lx=r.ax-dx*(shaft+1.55*S), ly=r.ay-dy*(shaft+1.55*S); // label body behind the shaft
+  return (
+    <g>
+      <line x1={tx} y1={ty} x2={hx} y2={hy} stroke={C_REACT} strokeWidth={0.42*S} strokeLinecap="round" markerEnd="url(#reactArr)"/>
+      <Tag x={lx} y={ly} text={`${fmt2(r.kips)}k`} box={C_REACTBOX} S={S} rot={vert ? -90 : 0}/>
+    </g>
+  );
+}
+
+/* ═══════════════ WIND INPUT WINDOW ═══════════════ */
+function WindWindow({ section, setVals, onReverse, onClose, onRemove, twoStory }) {
+  const [v, setV] = useState({});
+  // seed once per open (key carries section + leeward-partner identity) → decimals survive typing
+  useEffect(() => {
+    const s = section || {};
+    setV({ H:String(s.H||0), pw:String(s.pw||0), leeH:String(s.leeH||0),  // leeH = leeward (back) wall height
+           H2:String(s.H2||0), leeH2:String(s.leeH2||0),                  // 2nd-story heights (windward / leeward)
+           wH:String(s.par||0),    wQ:String(s.qWind||0),   // windward parapet = THIS wall's own
+           lH:String(s.leePar||0), lQ:String(s.qLee||0) }); // leeward parapet = BACK wall's own
+  }, []); // eslint-disable-line
+  const num = (s) => Math.max(0, parseFloat(s) || 0);
+  const upd = (field, prop) => (e) => {
+    const raw = e.target.value;
+    setV((p) => ({ ...p, [field]: raw }));
+    // route each value to the wall it physically belongs to:
+    if(prop==="parL")      setVals("lee",  { par:num(raw) });   // leeward parapet ht → back wall
+    else if(prop==="parW") setVals("self", { par:num(raw) });   // windward parapet ht → this wall
+    else if(prop==="leeH") setVals("lee",  { H:num(raw) });     // leeward WALL ht → back wall (sloping roof)
+    else if(prop==="leeH2")setVals("lee",  { H2:num(raw) });    // leeward 2nd-story ht → back wall (2-story)
+    else                   setVals("self", { [prop]:num(raw) });// H, pw, qWind, qLee → this wall
+  };
+  const wallRes = 0.5 * num(v.H) * num(v.pw);
+  const windPar = num(v.wH) * num(v.wQ);
+  const leePar  = num(v.lH) * num(v.lQ);
+  const total = wallRes + windPar + leePar;
+  // ── two-story diaphragm line loads (Step 3) — derived here in the UI, outside the frozen engine ──
+  // The 2nd-story wall (H₂) splits: upper ½ → roof diaphragm, lower ½ → 2nd-floor diaphragm.
+  const wallRes2 = 0.5 * num(v.H2) * num(v.pw);        // ½·H₂·pw
+  const roofLL   = wallRes2 + windPar + leePar;        // roof diaphragm = ½·H₂·pw + parapets  → designs 2nd-floor walls
+  const floorLL  = wallRes + wallRes2 + roofLL;        // 2nd-floor diaphragm = ½·H·pw + ½·H₂·pw + transferred roof load → designs 1st-floor walls
+  // Reverse flips the plan's wind direction; the window re-points to the new windward wall. With
+  // one parapet stored per physical wall, each wall keeps its own height — so the values simply
+  // swap windward/leeward roles, no copying needed, and they survive on split walls too.
+  const reverse = () => { onReverse(); };
+  return (
+    <div className="ovl" onPointerDown={(e)=>{ if(e.target.classList.contains("ovl")) onClose(); }}>
+      <div className="win">
+        <div className="win-h">
+          <div className="win-t">Wind Line Load — {section&&section.axis==="v"?"N–S":"E–W"}</div>
+          <button className="win-x" onClick={onClose} title="Close">×</button>
+        </div>
+        <div className="win-b">
+          <div style={{ marginBottom:12 }}>{twoStory ? <SecDiagram2 v={v} upd={upd} roofLL={roofLL} floorLL={floorLL}/> : <SecDiagram v={v} upd={upd} />}</div>
+
+          <button className="rev" onClick={reverse} style={{ marginBottom:12 }}>
+            ⇄ Reverse wind direction
+          </button>
+
+          {twoStory ? (
+            <div className="tot">
+              <div className="lbl">Roof diaphragm line load <small>→ designs 2nd-floor shear walls</small></div>
+              <div className="v">{fmt1(roofLL)} <small>plf</small></div>
+              <div style={{ marginTop:8, paddingTop:8, borderTop:"1px solid rgba(255,255,255,.08)" }}>
+                <div className="brk"><span>½·H₂·pw — 2nd-story wall (upper ½)</span><b>{fmt1(wallRes2)} plf</b></div>
+                <div className="brk"><span>windward + leeward parapet</span><b>{fmt1(windPar+leePar)} plf</b></div>
+              </div>
+              <div className="lbl" style={{ marginTop:14 }}>2nd-floor diaphragm line load <small>→ designs 1st-floor shear walls</small></div>
+              <div className="v">{fmt1(floorLL)} <small>plf</small></div>
+              <div style={{ marginTop:8, paddingTop:8, borderTop:"1px solid rgba(255,255,255,.08)" }}>
+                <div className="brk"><span>½·H₂·pw — 2nd-story wall (lower ½)</span><b>{fmt1(wallRes2)} plf</b></div>
+                <div className="brk"><span>½·H·pw — 1st-story wall (upper ½)</span><b>{fmt1(wallRes)} plf</b></div>
+                <div className="brk"><span>roof load transferred ↓</span><b>{fmt1(roofLL)} plf</b></div>
+              </div>
+            </div>
+          ) : (
+            <div className="tot">
+              <div className="lbl">Total wall line load</div>
+              <div className="v">{fmt1(total)} <small>plf</small></div>
+              <div style={{ marginTop:10, borderTop:"1px solid rgba(255,255,255,.08)", paddingTop:8 }}>
+                <div className="brk"><span>Wall (H/2·pw)</span><b>{fmt1(wallRes)} plf</b></div>
+                <div className="brk"><span>Windward parapet (hₗ·qₗ)</span><b>{fmt1(windPar)} plf</b></div>
+                <div className="brk"><span>Leeward parapet (hᵣ·qᵣ)</span><b>{fmt1(leePar)} plf</b></div>
+              </div>
+            </div>
+          )}
+
+          <button className="btn pink" onClick={onRemove} style={{ marginTop:12, width:"100%" }}>
+            Remove section cut
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, setTwoStory, activeFloor, setActiveFloor }) {
+  const [graph,    setGraph]    = useState(INIT.graph);
+  const [selected, setSelected] = useState(null);
+  const [menu,     setMenu]     = useState(null);
+  const [dimEdit,  setDimEdit]  = useState(null);
+  const [sections, setSections] = useState({h:null, v:null}); // {axis,sign} per orientation
+  const [wallProps,setWallProps]= useState({});      // edge key -> {H,pw,qWind,qLee,parW,parL}
+  const [activeWall,setActiveWall]=useState(null);   // {axis,key} | null — wall being edited
+  const [draft,    setDraft]    = useState(null);    // live cut line being drawn
+  const [noSupport,setNoSupport]= useState(()=>new Set()); // edge keys NOT taking point load
+  const [snapOn,   setSnapOn]   = useState(true);
+  const [ortho,    setOrtho]    = useState(true);
+  const [dims,     setDims]     = useState(true);
+  const [panMode,  setPanMode]  = useState(false);   // left-drag "hand" pan tool (from canvas menu)
+  const [zoomEnabled,setZoomEnabled]=useState(true); // wheel-zoom master switch (canvas-menu light)
+  const [panCursor,setPanCursor]=useState(false);    // true while a pan gesture is live (grab cursor)
+
+  const svgRef   = useRef(null);
+  const stageRef = useRef(null);
+  const menuRef  = useRef(null);
+  const idc      = useRef(INIT.nextId);
+  const history  = useRef([]);
+  const future   = useRef([]);   // redo stack
+
+  const nodeDrag = useRef(null);
+  const wallDrag = useRef(null);
+  const secDraw  = useRef(null);   // {sx,sy,su,moved}
+  const panRef   = useRef(null);   // middle-button pan gesture {sx,sy,view}
+  const panModeRef = useRef(panMode);
+  const zoomEnabledRef = useRef(zoomEnabled);
+  const dimWrapRef = useRef(null);
+  const pendingOpen = useRef(null); // axis to open after a fresh cut
+  const activeWin = activeWall ? activeWall.axis : null;
+
+  const graphRef = useRef(graph);
+  const selRef   = useRef(selected);
+  const sectionsRef = useRef(sections);
+  useEffect(()=>{graphRef.current=graph;},[graph]);
+  useEffect(()=>{selRef.current=selected;},[selected]);
+  useEffect(()=>{sectionsRef.current=sections;},[sections]);
+  useEffect(()=>{panModeRef.current=panMode;},[panMode]);
+  useEffect(()=>{zoomEnabledRef.current=zoomEnabled;},[zoomEnabled]);
+
+  const nodeById  = useCallback(id => graphRef.current.nodes.find(n=>n.id===id), []);
+  const snapshot  = useCallback(()=>{
+    history.current.push({graph:graphRef.current, sel:selRef.current});
+    if (history.current.length>60) history.current.shift();
+    future.current=[];                                   // a new action invalidates redo
+  },[]);
+  const undo = useCallback(()=>{
+    const h=history.current.pop();
+    if(h){ future.current.push({graph:graphRef.current, sel:selRef.current});
+           setGraph(h.graph);setSelected(h.sel);setDimEdit(null); }
+  },[]);
+  const redo = useCallback(()=>{
+    const f=future.current.pop();
+    if(f){ history.current.push({graph:graphRef.current, sel:selRef.current});
+           setGraph(f.graph);setSelected(f.sel);setDimEdit(null); }
+  },[]);
+  const toUser = useCallback(e=>{
+    const svg=svgRef.current, pt=svg.createSVGPoint();
+    pt.x=e.clientX; pt.y=e.clientY;
+    return pt.matrixTransform(svg.getScreenCTM().inverse());
+  },[]);
+  // ── dynamic drawing space: viewBox auto-fits the plan; sizes scale with it ──
+  const fit = useMemo(()=>{
+    const ns=graph.nodes;
+    let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
+    ns.forEach(p=>{minX=Math.min(minX,p.x);minY=Math.min(minY,p.y);maxX=Math.max(maxX,p.x);maxY=Math.max(maxY,p.y);});
+    if(draft){ minX=Math.min(minX,draft.x1,draft.x2); minY=Math.min(minY,draft.y1,draft.y2);
+               maxX=Math.max(maxX,draft.x1,draft.x2); maxY=Math.max(maxY,draft.y1,draft.y2); }
+    if(!isFinite(minX)) return {x:0,y:0,w:VB_W,h:VB_H};
+    const span=Math.max(maxX-minX, maxY-minY, 20);
+    const pad=Math.max(span*0.32, 10);   // margin leaves room for load arrows + labels
+    return {x:minX-pad, y:minY-pad, w:(maxX-minX)+2*pad, h:(maxY-minY)+2*pad};
+  },[graph,draft]);
+  const draggingRef = useRef(false);
+  const SRef = useRef(1);   // graphic scale, kept fresh each render (used by draw-mode hit radius)
+  const [frozenView, setFrozenView] = useState(null);   // held steady during a drag
+  // userView = an explicit, persistent viewBox the user has set (wheel-zoom, middle-drag pan, or by
+  // drawing). null ⇒ auto-fit to the plan. While idle it takes precedence over auto-fit, so adding
+  // nodes no longer re-frames/zooms the canvas on every click. The "Fit" button clears it (auto-fit).
+  const [userView, setUserView] = useState(null);
+  const fitRef = useRef(fit);
+  useEffect(()=>{ fitRef.current=fit; if(!draggingRef.current) setFrozenView(null); },[fit]);
+  const view = frozenView || userView || fit;
+  const viewRef = useRef(view); viewRef.current = view;             // current viewBox, fresh each render
+  const userViewRef = useRef(userView); useEffect(()=>{userViewRef.current=userView;},[userView]);
+  // freeze the CURRENT view (including any manual zoom/pan) for the duration of a drag gesture
+  const freezeView = useCallback(()=>{ draggingRef.current=true; setFrozenView(viewRef.current); },[]);
+  const thawView   = useCallback(()=>{ draggingRef.current=false; setFrozenView(null); },[]);
+  // While dragging, if the pointer nears/passes the frozen view's edge, grow the view to keep it
+  // in frame (live zoom-out). Without this the viewport caps how far one gesture can reach —
+  // e.g. a wall couldn't be drawn past ~80 ft from the default preset. Self-stabilizing: each
+  // event expands only enough to contain the pointer + margin.
+  const expandViewTo = useCallback((u)=>{
+    if(!draggingRef.current) return;
+    setFrozenView(v=>{
+      const cur = v || viewRef.current;
+      const m = Math.max(cur.w, cur.h) * 0.05;
+      const x0=Math.min(cur.x, u.x-m),       y0=Math.min(cur.y, u.y-m);
+      const x1=Math.max(cur.x+cur.w, u.x+m), y1=Math.max(cur.y+cur.h, u.y+m);
+      if(x0===cur.x && y0===cur.y && x1===cur.x+cur.w && y1===cur.y+cur.h) return v;
+      return { x:x0, y:y0, w:x1-x0, h:y1-y0 };
+    });
+  },[]);
+  const S = Math.max(view.w, view.h)/110;            // 1 ⇒ original feel; grows with plan
+  SRef.current = S;                                   // draw-mode hit radius tracks zoom
+  const gridStep = useMemo(()=>niceStep(Math.max(view.w,view.h)),[view]);
+  const gridStepRef = useRef(gridStep);
+  useEffect(()=>{gridStepRef.current=gridStep;},[gridStep]);
+
+  // ── CAD-style navigation: wheel = zoom toward the cursor, "Fit" = zoom-to-extents ──
+  // Both write to userView (the persistent manual view). Zoom limits keep the plan from
+  // collapsing to a point or vanishing into the distance.
+  const VMIN = 6, VMAX = WORLD * 3;                   // smallest / largest viewBox span (ft)
+  const zoomAt = useCallback((cx, cy, factor)=>{
+    const svg = svgRef.current; if(!svg) return;
+    const pt = svg.createSVGPoint(); pt.x=cx; pt.y=cy;
+    const u = pt.matrixTransform(svg.getScreenCTM().inverse());   // world point under the cursor
+    const cur = viewRef.current;
+    const aspect = cur.h / cur.w;
+    let w = clamp(cur.w * factor, VMIN, VMAX);
+    let h = w * aspect;                                            // preserve aspect exactly
+    const fx = (u.x - cur.x) / cur.w, fy = (u.y - cur.y) / cur.h;  // cursor's fractional position
+    setUserView({ x: u.x - fx*w, y: u.y - fy*h, w, h });          // keep that world point fixed
+  },[]);
+  // native non-passive wheel listener (React's onWheel is passive → can't preventDefault page scroll);
+  // also swallow the middle-button mousedown so the browser's autoscroll puck doesn't appear on pan.
+  useEffect(()=>{
+    const svg = svgRef.current; if(!svg) return;
+    const onWheel = (e)=>{ if(!zoomEnabledRef.current) return; e.preventDefault(); zoomAt(e.clientX, e.clientY, e.deltaY>0 ? 1.12 : 1/1.12); };
+    const onMid   = (e)=>{ if(e.button===1) e.preventDefault(); };
+    svg.addEventListener("wheel", onWheel, { passive:false });
+    svg.addEventListener("mousedown", onMid);
+    return ()=>{ svg.removeEventListener("wheel", onWheel); svg.removeEventListener("mousedown", onMid); };
+  },[zoomAt]);
+  const zoomToFit = useCallback(()=>{ setUserView(null); },[]);   // back to auto-fit (zoom extents)
+  // grow the persistent view just enough to contain a point (grow only — never recenters or zooms
+  // in), so a node placed/dragged toward the edge while drawing stays visible without a jump.
+  const growUserViewTo = useCallback((px,py)=>{
+    setUserView(v=>{
+      const cur = v || viewRef.current;
+      const m = Math.max(cur.w, cur.h) * 0.06;
+      const x0=Math.min(cur.x, px-m),       y0=Math.min(cur.y, py-m);
+      const x1=Math.max(cur.x+cur.w, px+m), y1=Math.max(cur.y+cur.h, py+m);
+      if(x0===cur.x && y0===cur.y && x1===cur.x+cur.w && y1===cur.y+cur.h) return v;
+      return { x:x0, y:y0, w:x1-x0, h:y1-y0 };
+    });
+  },[]);
+
+  const snap = useCallback(v=>{ const g=gridStepRef.current; return snapOn?Math.round(v/g)*g:Math.round(v*10)/10; },[snapOn]);
+  const closeMenu = useCallback(()=>setMenu(null),[]);
+
+  // Write values to the wall they physically belong to. target "self" = the active windward wall;
+  // target "lee" = its back (leeward) wall, resolved live so a split back wall takes the segment
+  // sitting behind this cut. One parapet per wall means no cross-syncing is needed.
+  const setVals = useCallback((target, patch)=>{
+    if(!activeWall) return;
+    let key = activeWall.key;
+    if(target==="lee"){
+      const sign = sectionsRef.current[activeWall.axis] && sectionsRef.current[activeWall.axis].sign;
+      key = findLeewardPartner(activeWall.key, activeWall.axis, sign, graphRef.current, activeWall.sAcross);
+    }
+    if(!key) return;
+    setWallProps(m=>({ ...m, [key]:{ ...(m[key]||DEF_SECTION), ...patch } }));
+  },[activeWall]);
+
+  // ── set wall length (LENGTHEN semantics) ──
+  // moveEnd "a"|"b": which endpoint moves; the other anchors. Chosen by which side of the
+  // dimension the user clicked (nearest end moves, like AutoCAD's LENGTHEN); ties broken by
+  // anchoring the better-connected end so the rest of the plan stays put.
+  const applyWallLength = useCallback((edge, newLen, moveEnd="b")=>{
+    if(!(newLen>0)) return;
+    const g=graphRef.current;
+    const a=g.nodes.find(n=>n.id===edge.a), b=g.nodes.find(n=>n.id===edge.b);
+    if(!a||!b) return;
+    const fixed = moveEnd==="a" ? b : a;          // anchored end
+    const moved = moveEnd==="a" ? a : b;          // end that slides along the wall direction
+    let dx=moved.x-fixed.x, dy=moved.y-fixed.y, L=Math.hypot(dx,dy);
+    if(L<1e-6){dx=1;dy=0;L=1;}
+    const nx=clamp(fixed.x+(dx/L)*newLen,-WORLD,WORLD);
+    const ny=clamp(fixed.y+(dy/L)*newLen,-WORLD,WORLD);
+    const movedId = moved.id;
+    snapshot();
+    setGraph(g=>{
+      const nodes=g.nodes.map(n=>n.id===movedId?{...n,x:nx,y:ny}:n);
+      if(ortho){
+        for(const ed of g.edges){
+          if(same(ed,edge)) continue;
+          if(ed.a!==movedId&&ed.b!==movedId) continue;
+          const othId=ed.a===movedId?ed.b:ed.a;
+          const oth=g.nodes.find(n=>n.id===othId);
+          const axis=edgeAxis(moved,oth);
+          const i=nodes.findIndex(n=>n.id===othId);
+          if(i>=0){nodes[i]={...nodes[i]};if(axis==="h")nodes[i].y=ny;else nodes[i].x=nx;}
+        }
+      }
+      return{...g,nodes};
+    });
+    setDimEdit(null);
+  },[snapshot,ortho]);
+
+  // ── DRAW MODE — click to place straight wall segments (no curves) ──
+  // First click anchors a node; each next click adds a node + wall, chaining like a polyline.
+  // Clicking an existing node snaps to it (node snap beats ortho, CAD-style) so loops close
+  // exactly. Ortho constrains each segment to H/V from the anchor; grid snap applies as usual.
+  // Right-click ends the chain (stays in draw mode); Esc ends the chain, then exits the mode.
+  const [drawMode, setDrawMode] = useState(false);
+  const [drawAnchor, setDrawAnchor] = useState(null);   // node id the next wall starts from
+  const [drawPrev, setDrawPrev] = useState(null);       // rubber-band preview point
+  const [cursorFt, setCursorFt] = useState(null);       // status-bar coordinates (ft)
+  const cursorRef = useRef(null);
+  const drawModeRef = useRef(drawMode);   useEffect(()=>{drawModeRef.current=drawMode;},[drawMode]);
+  const drawAnchorRef = useRef(drawAnchor); useEffect(()=>{drawAnchorRef.current=drawAnchor;},[drawAnchor]);
+
+  // resolve a pointer event to a draw target: an existing node (snap) or a new snapped point
+  const resolveDrawPoint = useCallback((e)=>{
+    const u=toUser(e), g=graphRef.current;
+    const R=2.4*SRef.current;
+    let nearest=null, best=R*R;
+    g.nodes.forEach(n=>{ const d=(n.x-u.x)**2+(n.y-u.y)**2; if(d<best){best=d; nearest=n;} });
+    if(nearest) return { node:nearest, x:nearest.x, y:nearest.y, snapped:true };
+    let x=u.x, y=u.y;
+    const anchor = drawAnchorRef.current!==null ? g.nodes.find(n=>n.id===drawAnchorRef.current) : null;
+    if(ortho && anchor){ if(Math.abs(u.x-anchor.x)>=Math.abs(u.y-anchor.y)) y=anchor.y; else x=anchor.x; }
+    x=clamp(snap(x),-WORLD,WORLD); y=clamp(snap(y),-WORLD,WORLD);
+    return { node:null, x, y, snapped:false };
+  },[toUser,ortho,snap]);
+
+  const placeDrawPoint = useCallback((e)=>{
+    const pt=resolveDrawPoint(e);
+    const anchorId=drawAnchorRef.current;
+    growUserViewTo(pt.x, pt.y);          // keep the placed node in frame (grow only, never recenter)
+    snapshot();
+    setGraph(g=>{
+      let nodes=g.nodes, edges=g.edges, targetId;
+      if(pt.node) targetId=pt.node.id;
+      else { targetId=idc.current++; nodes=[...nodes,{id:targetId,x:pt.x,y:pt.y}]; }
+      if(anchorId!==null && anchorId!==targetId){
+        const ne=norm(anchorId,targetId);
+        if(!edges.some(ed=>same(ed,ne))) edges=[...edges,ne];
+      }
+      setDrawAnchor(targetId);
+      return { nodes, edges };
+    });
+  },[resolveDrawPoint,snapshot,growUserViewTo]);
+
+  const endDrawChain = useCallback(()=>setDrawAnchor(null),[]);
+
+  // ── PROJECT SERIALIZATION — the shell saves/loads the whole suite; we expose our slice ──
+  useEffect(()=>{
+    if(!registerProject) return;
+    registerProject({
+      get: ()=>({ graph:graphRef.current,
+                  wallProps, noSupport:[...noSupport], sections, nextId:idc.current,
+                  // v2: the camera + working state, so a reopened file looks like where you left it
+                  view:viewRef.current, selected:selRef.current,
+                  drawMode:drawModeRef.current, panMode:panModeRef.current,
+                  zoomEnabled:zoomEnabledRef.current, snapOn, ortho, dims }),
+      set: (s)=>{
+        if(!s||!s.graph) return;
+        setGraph(s.graph);
+        setWallProps(s.wallProps||{});
+        setNoSupport(new Set(s.noSupport||[]));
+        setSections(s.sections||{h:null,v:null});
+        idc.current = s.nextId || (Math.max(0,...s.graph.nodes.map(n=>n.id))+1);
+        // transient editors never auto-reopen (modal wind window + inline dim editor)
+        setActiveWall(null); setDimEdit(null); setMenu(null); setDrawPrev(null); setDrawAnchor(null);
+        // v2 restores the saved camera + toggles + selection; v1/New (no view) reverts to auto-fit + defaults
+        setUserView(s.view || null); setFrozenView(null);
+        setSelected("selected" in s ? s.selected : null);
+        setDrawMode(!!s.drawMode);
+        setPanMode(!!s.panMode);
+        setZoomEnabled("zoomEnabled" in s ? !!s.zoomEnabled : true);
+        if("snapOn" in s) setSnapOn(!!s.snapOn);
+        if("ortho" in s) setOrtho(!!s.ortho);
+        if("dims" in s) setDims(!!s.dims);
+        history.current=[]; future.current=[];
+      },
+      // rev 24: let the Design tab rebuild geometry-less (stale) lines straight from the restored
+      // plan. `rerun` is runDesignHandoff (regenerates geometry-complete lines from the live graph);
+      // `hasReactions` says whether a rerun would actually produce any (a cut must exist). Both are
+      // captured fresh because this effect has no dep array and re-registers on every render.
+      rerun: runDesignHandoff,
+      hasReactions: !!((secH && secH.reactions && secH.reactions.length) || (secV && secV.reactions && secV.reactions.length)),
+    });
+  });
+  const toggleDrawMode = useCallback(()=>{
+    const turningOn = !drawModeRef.current;
+    // entering Draw freezes the current framing (seed userView) so each click stops re-fitting the
+    // canvas; the view then only grows when you draw past its edge, or when you wheel-zoom / pan.
+    if(turningOn && userViewRef.current==null) setUserView(viewRef.current);
+    if(turningOn) setPanMode(false);                 // Draw and Pan are mutually exclusive
+    setDrawMode(turningOn); setDrawAnchor(null); setDrawPrev(null); setMenu(null); setDimEdit(null);
+  },[]);
+  // PAN tool: a left-drag hand tool (complements middle-drag pan, for trackpad/no-middle-button
+  // users). Mutually exclusive with Draw. Reached from the empty-area right-click "Canvas" menu.
+  const togglePanMode = useCallback(()=>{
+    const turningOn = !panModeRef.current;
+    if(turningOn){ setDrawMode(false); setDrawAnchor(null); setDrawPrev(null); }
+    setPanMode(turningOn); setMenu(null); setDimEdit(null);
+  },[]);
+
+  // ── DELETE ── (sections recompute from geometry; nothing to unbind)
+  const deleteNode = useCallback(id=>{
+    snapshot();
+    setGraph(g=>({ nodes:g.nodes.filter(n=>n.id!==id), edges:g.edges.filter(e=>e.a!==id&&e.b!==id) }));
+    setSelected(s=>s===id?null:s);
+    setDimEdit(null);
+  },[snapshot]);
+
+  const deleteEdge = useCallback(edge=>{
+    snapshot();
+    setGraph(g=>({...g, edges:g.edges.filter(e=>!same(e,edge))}));
+    setDimEdit(null);
+  },[snapshot]);
+
+  // ── SPLIT a wall ──
+  const splitWall = useCallback((edge, u)=>{
+    const g=graphRef.current;
+    const a=g.nodes.find(n=>n.id===edge.a), b=g.nodes.find(n=>n.id===edge.b);
+    if(!a||!b) return;
+    let x=clamp(snap(u.x),-WORLD,WORLD), y=clamp(snap(u.y),-WORLD,WORLD);
+    if(edgeAxis(a,b)==="h") y=a.y; else x=a.x;
+    const id=idc.current++;
+    const e1=norm(edge.a,id), e2=norm(id,edge.b);
+    const newGraph={ nodes:[...g.nodes,{id,x,y}], edges:g.edges.filter(e=>!same(e,edge)).concat([e1,e2]) };
+    snapshot();
+    setGraph(newGraph);
+    setNoSupport(s=>{ const pk=keyOf(edge); if(!s.has(pk)) return s; const n=new Set(s); n.delete(pk); n.add(keyOf(e1)); n.add(keyOf(e2)); return n; });
+    setWallProps(m=>{ const pk=keyOf(edge); if(!m[pk]) return m; const v=m[pk]; const n={...m}; n[keyOf(e1)]={...v}; n[keyOf(e2)]={...v}; delete n[pk]; return n; });
+    setSelected(id);
+  },[snap,snapshot]);
+
+  const connectTo = useCallback((fromId, toId)=>{
+    if(graphRef.current.edges.some(e=>same(e,norm(fromId,toId)))) return;
+    snapshot();
+    setGraph(g=>({...g, edges:[...g.edges, norm(fromId,toId)]}));
+  },[snapshot]);
+
+  const loadPreset = name=>{
+    snapshot();
+    const r=buildFrom(PRESETS[name],idc.current);
+    idc.current=r.nextId;
+    setGraph(r.graph); setSelected(null); setDimEdit(null); setSections({h:null,v:null}); setActiveWall(null); setWallProps({});
+    setUserView(null);   // frame the new preset (zoom-to-extents)
+  };
+  const clearAll=()=>{ snapshot(); setGraph({nodes:[],edges:[]}); setSelected(null); setDimEdit(null); setSections({h:null,v:null}); setActiveWall(null); setWallProps({}); setUserView(null); };
+
+  const removeSection = ()=>{ if(activeWin){ setSections(s=>({...s,[activeWin]:null})); setActiveWall(null); } };
+  // reverse wind: flip the section's travel direction and re-point the elevation window to the
+  // NEW windward wall — identical to dragging a fresh cut the other way. Each wall owns its own
+  // parapet height, so values persist and simply swap windward/leeward roles (no copying).
+  const reverseWind = ()=>{
+    if(!activeWin) return;
+    // remember the across-wind position of the current cut so the flip re-opens the segment that
+    // sits at that same position on the new windward side (the old leeward, which may be split).
+    let sAcross=null;
+    if(activeWall){
+      const e=graphRef.current.edges.find(x=>keyOf(x)===activeWall.key);
+      if(e){ const a=graphRef.current.nodes.find(n=>n.id===e.a), b=graphRef.current.nodes.find(n=>n.id===e.b);
+        if(a&&b) sAcross = activeWin==="v" ? (a.x+b.x)/2 : (a.y+b.y)/2; }
+    }
+    setSections(s=> s[activeWin]?{...s,[activeWin]:{...s[activeWin],sign:-s[activeWin].sign}}:s);
+    pendingOpen.current = { axis:activeWin, sAcross };   // re-open matching segment after recompute
+  };
+
+  // ── CONTEXT MENU ──
+  const openMenu = useCallback((e, payload)=>{
+    e.preventDefault(); e.stopPropagation();
+    setDimEdit(null);
+    const r=stageRef.current.getBoundingClientRect();
+    let x=e.clientX-r.left, y=e.clientY-r.top;
+    x=Math.min(x, r.width-160); y=Math.min(y, r.height-100);
+    const u=toUser(e);
+    setMenu({...payload, x:Math.max(4,x), y:Math.max(4,y), u});
+  },[toUser]);
+
+  useEffect(()=>{
+    if(!dimEdit) return;
+    const h=e=>{
+      if(dimWrapRef.current&&dimWrapRef.current.contains(e.target)) return;
+      if(e.button===2){ setDimEdit(null); return; }
+      const v=parseFloat(dimEdit.val);
+      if(v>0) applyWallLength(dimEdit.edge,v,dimEdit.moveEnd); else setDimEdit(null);
+    };
+    window.addEventListener("pointerdown",h,true);
+    return()=>window.removeEventListener("pointerdown",h,true);
+  },[dimEdit, applyWallLength]);
+
+  useEffect(()=>{
+    if(!menu) return;
+    const h=e=>{ if(menuRef.current&&menuRef.current.contains(e.target)) return; setMenu(null); };
+    window.addEventListener("pointerdown",h);
+    return()=>window.removeEventListener("pointerdown",h);
+  },[menu]);
+
+  useEffect(()=>{
+    const h=e=>{
+      if(e.key==="Escape"){
+        if(drawModeRef.current){
+          if(drawAnchorRef.current!==null) setDrawAnchor(null);
+          else { setDrawMode(false); setDrawPrev(null); }
+          return;
+        }
+        setSelected(null);setMenu(null);setDimEdit(null);setActiveWall(null);setPanMode(false);
+      }
+      else if((e.key==="Delete"||e.key==="Backspace")&&selRef.current!==null){ e.preventDefault(); deleteNode(selRef.current); }
+      else if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==="z"&&e.shiftKey){e.preventDefault();redo();}
+      else if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==="z"){e.preventDefault();undo();}
+      else if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==="y"){e.preventDefault();redo();}
+      else if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==="s"){e.preventDefault();fileOps&&fileOps.onSave();}
+      else if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==="o"){e.preventDefault();fileOps&&fileOps.onOpen();}
+    };
+    window.addEventListener("keydown",h);
+    return()=>window.removeEventListener("keydown",h);
+  },[deleteNode,undo,redo,fileOps]);
+
+  // ── POINTER handlers ──
+  // start a left-drag pan gesture (hand tool / pan mode). Reuses panRef (same path as middle-drag).
+  const beginPan = useCallback(e=>{
+    e.preventDefault(); e.stopPropagation();
+    svgRef.current.setPointerCapture(e.pointerId);
+    panRef.current={ sx:e.clientX, sy:e.clientY, view:viewRef.current };
+    setPanCursor(true);
+  },[]);
+  const onNodeLDown = useCallback((id,e)=>{
+    if(e.button!==0) return;
+    e.stopPropagation(); closeMenu();
+    if(panModeRef.current){ beginPan(e); return; }          // pan tool: drag anywhere pans the view
+    if(drawModeRef.current){ placeDrawPoint(e); return; }   // node snap: connect to this node
+    svgRef.current.setPointerCapture(e.pointerId);
+    const me=graphRef.current.nodes.find(n=>n.id===id);
+    const meta=ortho
+      ? graphRef.current.edges.filter(ed=>ed.a===id||ed.b===id).map(ed=>{
+          const oth=graphRef.current.nodes.find(n=>n.id===(ed.a===id?ed.b:ed.a));
+          return{id:oth.id, axis:edgeAxis(me,oth)};
+        })
+      : [];
+    nodeDrag.current={id, moved:false, sx:e.clientX, sy:e.clientY, meta};
+    freezeView();
+  },[closeMenu,ortho,freezeView,placeDrawPoint,beginPan]);
+
+  const onWallLDown = useCallback((edge,e)=>{
+    if(e.button!==0) return;
+    e.stopPropagation(); closeMenu();
+    if(panModeRef.current){ beginPan(e); return; }          // pan tool: drag anywhere pans the view
+    if(drawModeRef.current){ placeDrawPoint(e); return; }   // place a point even over a wall
+    svgRef.current.setPointerCapture(e.pointerId);
+    const g=graphRef.current;
+    const a=g.nodes.find(n=>n.id===edge.a), b=g.nodes.find(n=>n.id===edge.b);
+    const u=toUser(e);
+    wallDrag.current={aId:edge.a,bId:edge.b,ax:a.x,ay:a.y,bx:b.x,by:b.y, axis:edgeAxis(a,b), sux:u.x,suy:u.y, moved:false};
+    freezeView();
+  },[closeMenu,toUser,freezeView,placeDrawPoint,beginPan]);
+
+  // background drag = draw a section cut; middle-button drag (or pan tool) = pan (CAD-style)
+  const onBgLDown = useCallback(e=>{
+    if(e.button===1){                                       // middle button → pan the view
+      e.preventDefault(); closeMenu();
+      svgRef.current.setPointerCapture(e.pointerId);
+      panRef.current={ sx:e.clientX, sy:e.clientY, view:viewRef.current };
+      setPanCursor(true);
+      return;
+    }
+    if(e.button!==0) return;
+    closeMenu();
+    if(panModeRef.current){ beginPan(e); return; }          // pan tool: left-drag pans the view
+    if(drawModeRef.current){ placeDrawPoint(e); return; }   // draw mode: click places a node
+    svgRef.current.setPointerCapture(e.pointerId);
+    secDraw.current={ su:toUser(e), sx:e.clientX, sy:e.clientY, moved:false };
+    freezeView();
+  },[closeMenu,toUser,freezeView,placeDrawPoint,beginPan]);
+
+  const onBgContextMenu = useCallback(e=>{
+    e.preventDefault();
+    if(drawModeRef.current){
+      // Mid-draw: a first right-click still ends the active chain (unchanged muscle memory). Once
+      // the chain is ended — or before one is started — right-click opens the Canvas menu, so
+      // Draw / Pan / Zoom are reachable without leaving Draw mode.
+      if(drawAnchorRef.current!==null){ endDrawChain(); return; }
+      openMenu(e, { kind:"canvas" });
+      return;
+    }
+    setSelected(null); setDimEdit(null);                    // right-click clears the selection (as before)
+    openMenu(e, { kind:"canvas" });                         // …and opens the canvas tool menu
+  },[endDrawChain,openMenu]);
+
+  const onMove = useCallback(e=>{
+    if(panRef.current){                                   // middle-button pan: translate the view
+      const p=panRef.current, svg=svgRef.current; if(!svg) return;
+      const r=svg.getBoundingClientRect();
+      const dx=(e.clientX-p.sx)/r.width  * p.view.w;
+      const dy=(e.clientY-p.sy)/r.height * p.view.h;
+      setUserView({ x:p.view.x-dx, y:p.view.y-dy, w:p.view.w, h:p.view.h });
+      return;
+    }
+    { const u=toUser(e);                                 // status-bar cursor readout
+      const cx=Math.round(u.x*10)/10, cy=Math.round(u.y*10)/10;
+      if(!cursorRef.current||cursorRef.current.x!==cx||cursorRef.current.y!==cy){
+        cursorRef.current={x:cx,y:cy}; setCursorFt({x:cx,y:cy});
+      } }
+    if(drawModeRef.current && !nodeDrag.current && !wallDrag.current && !secDraw.current){
+      setDrawPrev(resolveDrawPoint(e));                     // rubber-band / snap preview
+      return;
+    }
+    if(nodeDrag.current||wallDrag.current||secDraw.current) expandViewTo(toUser(e));
+    if(nodeDrag.current){
+      const nd=nodeDrag.current;
+      if(!nd.moved){ const dx=e.clientX-nd.sx, dy=e.clientY-nd.sy; if(dx*dx+dy*dy>36){nd.moved=true; snapshot();} }
+      if(nd.moved){
+        const u=toUser(e);
+        const nx=clamp(snap(u.x),-WORLD,WORLD), ny=clamp(snap(u.y),-WORLD,WORLD);
+        setGraph(g=>{
+          const nodes=g.nodes.map(n=>n.id===nd.id?{...n,x:nx,y:ny}:n);
+          if(ortho) for(const m of nd.meta){ const i=nodes.findIndex(n=>n.id===m.id); if(i>=0){nodes[i]={...nodes[i]};if(m.axis==="h")nodes[i].y=ny;else nodes[i].x=nx;} }
+          return{...g,nodes};
+        });
+      }
+      return;
+    }
+    if(wallDrag.current){
+      const w=wallDrag.current, u=toUser(e);
+      let dx=u.x-w.sux, dy=u.y-w.suy;
+      if(ortho){if(w.axis==="h") dx=0; else dy=0;}
+      if(snapOn){const g=gridStepRef.current; dx=Math.round(dx/g)*g; dy=Math.round(dy/g)*g;}
+      dx=clamp(dx, -WORLD-Math.min(w.ax,w.bx), WORLD-Math.max(w.ax,w.bx));
+      dy=clamp(dy, -WORLD-Math.min(w.ay,w.by), WORLD-Math.max(w.ay,w.by));
+      if(!w.moved&&(dx||dy)){w.moved=true; snapshot();}
+      if(w.moved) setGraph(g=>({...g, nodes:g.nodes.map(n=>
+        n.id===w.aId?{...n,x:w.ax+dx,y:w.ay+dy}: n.id===w.bId?{...n,x:w.bx+dx,y:w.by+dy}:n)}));
+      return;
+    }
+    if(secDraw.current){
+      const sd=secDraw.current;
+      if(!sd.moved){ const dx=e.clientX-sd.sx, dy=e.clientY-sd.sy; if(dx*dx+dy*dy>20) sd.moved=true; }
+      if(sd.moved){ const u=toUser(e); setDraft({x1:sd.su.x,y1:sd.su.y,x2:u.x,y2:u.y}); }
+    }
+  },[snapshot,toUser,snap,ortho,snapOn,expandViewTo,resolveDrawPoint]);
+
+  const onUp = useCallback(e=>{
+    svgRef.current?.releasePointerCapture?.(e.pointerId);
+    if(panRef.current){ panRef.current=null; setPanCursor(false); return; }    // end pan (no thaw — pan doesn't freeze)
+    thawView();
+    if(nodeDrag.current){ nodeDrag.current=null; return; }
+    if(wallDrag.current){ wallDrag.current=null; return; }
+    if(secDraw.current){
+      const sd=secDraw.current; secDraw.current=null; setDraft(null);
+      if(sd.moved){
+        const u=toUser(e);
+        const line={x1:sd.su.x,y1:sd.su.y,x2:u.x,y2:u.y};
+        if(dist({x:line.x1,y:line.y1},{x:line.x2,y:line.y2})>4){
+          const axis = Math.abs(line.x2-line.x1) >= Math.abs(line.y2-line.y1) ? "h" : "v";
+          // wind travels in the drag direction (drag down = N→S, drag right = W→E)
+          const sign = axis==="v" ? (line.y2>=line.y1?1:-1) : (line.x2>=line.x1?1:-1);
+          // A valid section must pass through ≥2 across-wind (exterior) walls. The FIRST one the
+          // cut crosses (lowest t — the drag starts on the windward side) is the EXACT windward
+          // segment to open, so a cut through a split wall opens the segment it actually passes
+          // through instead of always defaulting to the first segment of the line.
+          const g=graphRef.current, p1={x:line.x1,y:line.y1}, p2={x:line.x2,y:line.y2};
+          const recv = axis==="v" ? "h" : "v";          // across-wind walls = windward/leeward faces
+          const hits=[];
+          for(const ed of g.edges){
+            const a=g.nodes.find(n=>n.id===ed.a), b=g.nodes.find(n=>n.id===ed.b);
+            if(!a||!b||edgeAxis(a,b)!==recv) continue;
+            const r=segInt(p1,p2,a,b);
+            if(r) hits.push({ key:keyOf(ed), t:r.t, pt:r.pt });
+          }
+          if(hits.length>=2){                            // crossed windward + leeward → valid cut
+            hits.sort((x,y)=>x.t-y.t);
+            const sAcross = axis==="v" ? hits[0].pt.x : hits[0].pt.y;  // where the cut meets windward
+            setSections(s=>({...s, [axis]:{ axis, sign }}));
+            pendingOpen.current = { axis, key:hits[0].key, sAcross };
+          }
+          // fewer than 2 exterior walls crossed → not a section; do nothing
+        }
+      }
+    }
+  },[toUser,thawView]);
+
+  const onLeave = useCallback(e=>{ onUp(e); },[onUp]);
+
+  const onDimClick = useCallback((edge,e)=>{
+    e.stopPropagation();
+    if(panModeRef.current) return;                          // pan tool active → don't open dim editor
+    if(drawModeRef.current){ placeDrawPoint(e); return; }
+    const g=graphRef.current;
+    const a=g.nodes.find(n=>n.id===edge.a), b=g.nodes.find(n=>n.id===edge.b);
+    if(!a||!b) return;
+    // LENGTHEN semantics: the end nearest the click is the one that moves; when the click is
+    // ambiguous (near the middle), anchor the better-connected end so the plan stays put.
+    const u=toUser(e);
+    const L2=(b.x-a.x)**2+(b.y-a.y)**2 || 1;
+    const t=((u.x-a.x)*(b.x-a.x)+(u.y-a.y)*(b.y-a.y))/L2;     // 0 at a, 1 at b
+    let moveEnd;
+    if(Math.abs(t-0.5) >= 0.10) moveEnd = t<0.5 ? "a" : "b";
+    else{
+      const deg=(id)=>g.edges.reduce((c,ed)=>c+(ed.a===id||ed.b===id?1:0),0);
+      moveEnd = deg(edge.a) <= deg(edge.b) ? "a" : "b";       // move the less-connected end
+    }
+    const r=stageRef.current.getBoundingClientRect();
+    const m=svgRef.current.getScreenCTM();
+    const mx=(a.x+b.x)/2, my=(a.y+b.y)/2;
+    const sx=m.a*mx+m.c*my+m.e, sy=m.b*mx+m.d*my+m.f;
+    setDimEdit({edge, moveEnd, px:sx-r.left, py:sy-r.top-18, val:String(Math.round(dist(a,b)))});
+    setMenu(null);
+  },[toUser,placeDrawPoint]);
+
+  // ── DERIVED ──
+  const loop = useMemo(()=>loopInfo(graph.nodes,graph.edges),[graph]);
+  const totalLen = useMemo(()=>graph.edges.reduce((s,e)=>{
+    const a=graph.nodes.find(n=>n.id===e.a), b=graph.nodes.find(n=>n.id===e.b);
+    return a&&b ? s+dist(a,b) : s;
+  },0),[graph]);
+
+  const gridLines=[];
+  { const x0=Math.floor(view.x/gridStep)*gridStep, xe=view.x+view.w;
+    const y0=Math.floor(view.y/gridStep)*gridStep, ye=view.y+view.h;
+    for(let x=x0;x<=xe;x+=gridStep) gridLines.push({x1:x,y1:view.y,x2:x,y2:ye});
+    for(let y=y0;y<=ye;y+=gridStep) gridLines.push({x1:view.x,y1:y,x2:xe,y2:y}); }
+
+  const selNode = selected!==null ? graph.nodes.find(n=>n.id===selected) : null;
+
+  // per-orientation section render data + line load
+  const isSup = useCallback((key)=>!noSupport.has(key),[noSupport]);
+  const propsFor = useCallback((key)=> mergeWallProps(wallProps[key]), [wallProps]);
+  // In 2-story mode the on-plan loads/reactions reflect the SELECTED floor, by feeding buildSecData a
+  // floor-specific EFFECTIVE wall height (engine untouched — it reads pr.H only in the line-load term):
+  //   2nd-floor plan → roof diaphragm:  H_eff = H₂            → ½·H₂·pw + parapets               (designs 2nd-floor walls)
+  //   1st-floor plan → 2nd-floor diaph.: H_eff = H + 2·H₂     → ½·H·pw + H₂·pw + parapets         (designs 1st-floor walls)
+  // 1-story mode passes props through unchanged (byte-identical to before).
+  const propsForActive = useCallback((key)=>{
+    const p = propsFor(key);
+    if(!twoStory) return p;
+    const H=p.H||0, H2=p.H2||0;
+    return { ...p, H: activeFloor===2 ? H2 : H + 2*H2 };
+  },[propsFor, twoStory, activeFloor]);
+  const toggleSupport = useCallback((edge)=>{
+    const k=keyOf(edge);
+    setNoSupport(s=>{ const n=new Set(s); n.has(k)?n.delete(k):n.add(k); return n; });
+  },[]);
+  const secH = useMemo(()=>buildSecData(sections.h, graph, loop, isSup, propsForActive),[sections.h,graph,loop,isSup,propsForActive]);
+  const secV = useMemo(()=>buildSecData(sections.v, graph, loop, isSup, propsForActive),[sections.v,graph,loop,isSup,propsForActive]);
+  useEffect(()=>{
+    const po=pendingOpen.current; if(!po) return; pendingOpen.current=null;
+    const ax=po.axis; const sc=ax==="h"?secH:secV;
+    if(!sc||!sc.windLoads.length) return;
+    let target=null;
+    if(po.key) target=sc.windLoads.find(w=>w.key===po.key);   // exact segment the cut crossed
+    if(!target && po.sAcross!=null){                           // reverse: same cut position
+      const sOf=p=> ax==="v"?p.x:p.y;
+      let bestD=Infinity;
+      sc.windLoads.forEach(w=>{
+        const s0=Math.min(sOf(w.wa),sOf(w.wb)), s1=Math.max(sOf(w.wa),sOf(w.wb));
+        const inside = po.sAcross>=s0-0.6 && po.sAcross<=s1+0.6;
+        const d=Math.abs((s0+s1)/2-po.sAcross) - (inside?1e6:0);
+        if(d<bestD){ bestD=d; target=w; }
+      });
+    }
+    setActiveWall({axis:ax, key:(target?target.key:sc.windLoads[0].key), sAcross:po.sAcross});
+  },[secH,secV]);
+
+  // The active windward wall's leeward (back) partner — resolves the specific back segment behind
+  // this cut, so the leeward parapet shown is that wall's own height (shared when the back is one
+  // wall, distinct when it's split).
+  const activeLeeKey = useMemo(()=> activeWall
+      ? findLeewardPartner(activeWall.key, activeWall.axis, sections[activeWall.axis]&&sections[activeWall.axis].sign, graph, activeWall.sAcross)
+      : null,
+    [activeWall, sections, graph]);
+
+  const activeSection = activeWall ? (()=>{
+    const self = propsFor(activeWall.key);
+    const lee  = activeLeeKey ? propsFor(activeLeeKey) : null;
+    return { H:self.H, pw:self.pw, qWind:self.qWind, qLee:self.qLee,
+             par:self.par,                       // windward parapet = this wall's own
+             H2:self.H2,                          // 2nd-story wall height (resolves to H when unset)
+             leePar: lee ? lee.par : 0,          // leeward parapet  = back wall's own
+             leeH:  lee ? lee.H   : 0,           // leeward wall height = back wall's own H (sloping roof)
+             leeH2: lee ? lee.H2  : 0,           // leeward 2nd-story height = back wall's own H2 (2-story)
+             axis:activeWall.axis,
+             sign:(sections[activeWall.axis]&&sections[activeWall.axis].sign) };
+  })() : null;
+
+  // Build one shear-wall design line per point-load support wall and hand off to the Design tab:
+  // full collinear extent (even when the support is split), max wall height H along it, and the
+  // reaction kips it carries. Parapets are irrelevant to the shear-wall calc and are not sent.
+  const runDesignHandoff = useCallback(()=>{
+    if(!onDesignShearWalls) return;
+    // Build the design lines for ONE floor: re-run the frozen wind engine with that floor's effective
+    // wall height (same substitution as propsForActive), and tag each line with the floor's DESIGN
+    // height (floor 2 walls are H₂ tall, floor 1 walls are H tall) and its reaction.
+    const buildFloor=(floor)=>{
+      const pf=(key)=>{ const p=propsFor(key); if(!twoStory) return p; const H=p.H||0,H2=p.H2||0; return {...p, H: floor===2 ? H2 : H+2*H2}; };
+      const scH=buildSecData(sections.h, graph, loop, isSup, pf);
+      const scV=buildSecData(sections.v, graph, loop, isSup, pf);
+      const lines=[];
+      [["h",scH],["v",scV]].forEach(([ax,sc])=>{
+        if(!sc) return;
+        sc.reactions.forEach(r=>{
+          if(!(r.kips>0)) return;
+          const e=graph.edges.find(x=>keyOf(x)===r.key); if(!e) return;
+          const ea=graph.nodes.find(n=>n.id===e.a), eb=graph.nodes.find(n=>n.id===e.b); if(!ea||!eb) return;
+          const o=edgeAxis(ea,eb);
+          const fixed = o==="h" ? ea.y : ea.x;
+          let lo=Infinity, hi=-Infinity, Hmax=0;
+          graph.edges.forEach(e2=>{
+            if(!isSup(keyOf(e2))) return;
+            const a2=graph.nodes.find(n=>n.id===e2.a), b2=graph.nodes.find(n=>n.id===e2.b); if(!a2||!b2) return;
+            if(edgeAxis(a2,b2)!==o) return;
+            const f2 = o==="h" ? (a2.y+b2.y)/2 : (a2.x+b2.x)/2;
+            if(Math.abs(f2-fixed)>0.75) return;
+            const v0 = o==="h" ? Math.min(a2.x,b2.x) : Math.min(a2.y,b2.y);
+            const v1 = o==="h" ? Math.max(a2.x,b2.x) : Math.max(a2.y,b2.y);
+            lo=Math.min(lo,v0); hi=Math.max(hi,v1);
+            const pp=propsFor(keyOf(e2));
+            Hmax=Math.max(Hmax, (twoStory && floor===2 ? (pp.H2||0) : (pp.H||0)));   // design height per floor
+          });
+          if(!(hi>lo)) return;
+          const a = o==="h" ? {x:lo,y:fixed} : {x:fixed,y:lo};
+          const b = o==="h" ? {x:hi,y:fixed} : {x:fixed,y:hi};
+          lines.push({ id:ax+"|"+r.key, key:r.key, windAxis:ax, o, a, b,
+                       lengthFt:hi-lo, heightFt:Hmax||13, forceLbs:r.kips*1000 });
+        });
+      });
+      return lines;
+    };
+    const floors = twoStory ? [2,1] : [1];          // 2nd floor (roof load) + 1st floor (2nd-floor load)
+    const byFloor={}; floors.forEach(f=> byFloor[f]=buildFloor(f));
+    onDesignShearWalls(byFloor, {nodes:graph.nodes.map(n=>({...n})), edges:graph.edges.map(e=>({...e}))});
+  },[onDesignShearWalls, sections, graph, loop, isSup, propsFor, twoStory]);
+
+  return (
+    <div className="r">
+      <style>{CSS}</style>
+
+      <div className="hd">
+        <h1 className="htitle">Plan Sketcher</h1>
+        <span className="htag">
+          Left-drag nodes &amp; walls · Drag across empty space to cut a section · Right-click for actions
+        </span>
+      </div>
+
+      {/* ── COMMAND BAR (mini-ribbon, pinned below the suite tab bar) ──
+          Draft toggles (Draw/Snap/Ortho/Dims) live here ONLY; Presets live in the side panel ONLY. ── */}
+      <div className="ribbon">
+        <div className="rgroup">
+          <div className="rlabel">File</div>
+          <div className="rbtns">
+            <button className="rbtn" title="New project" onClick={()=>fileOps&&fileOps.onNew()}>🗋 New</button>
+            <button className="rbtn" title="Open project (Ctrl+O)" onClick={()=>fileOps&&fileOps.onOpen()}>📂 Open</button>
+            <button className="rbtn" title="Save project (Ctrl+S)" onClick={()=>fileOps&&fileOps.onSave()}>💾 Save</button>
+          </div>
+        </div>
+        <div className="rsep"/>
+        <div className="rgroup">
+          <div className="rlabel">Edit</div>
+          <div className="rbtns">
+            <button className="rbtn" title="Undo (Ctrl+Z)" onClick={undo}>↶ Undo</button>
+            <button className="rbtn" title="Redo (Ctrl+Y / Ctrl+Shift+Z)" onClick={redo}>↷ Redo</button>
+            <button className="rbtn" title="Clear the plan" onClick={clearAll}>🗑 Clear</button>
+          </div>
+        </div>
+        <div className="rsep"/>
+        <div className="rgroup">
+          <div className="rlabel">Draft</div>
+          <div className="rbtns">
+            <button className={"rbtn"+(drawMode?" ron":"")} title="Draw walls — click to chain segments" onClick={toggleDrawMode}>✏ Draw</button>
+            <button className={"rbtn"+(snapOn?" ron":"")} title="Snap to grid" onClick={()=>setSnapOn(v=>!v)}>⌗ Snap</button>
+            <button className={"rbtn"+(ortho?" ron":"")} title="Orthogonal (90°)" onClick={()=>setOrtho(v=>!v)}>∟ Ortho</button>
+            <button className={"rbtn"+(dims?" ron":"")} title="Show dimensions" onClick={()=>setDims(v=>!v)}>⟷ Dims</button>
+          </div>
+        </div>
+        <div className="rsep"/>
+        <div className="rgroup">
+          <div className="rlabel">View</div>
+          <div className="rbtns">
+            <button className="rbtn" title="Zoom to fit the whole plan (resets manual zoom)" onClick={zoomToFit}>⊡ Fit</button>
+            <button className="rbtn" title="Zoom in" onClick={()=>{ const r=svgRef.current?.getBoundingClientRect(); if(r) zoomAt(r.left+r.width/2, r.top+r.height/2, 1/1.25); }}>+ In</button>
+            <button className="rbtn" title="Zoom out — or scroll the mouse wheel over the canvas; middle-drag to pan" onClick={()=>{ const r=svgRef.current?.getBoundingClientRect(); if(r) zoomAt(r.left+r.width/2, r.top+r.height/2, 1.25); }}>− Out</button>
+          </div>
+        </div>
+        <div className="rsep"/>
+        <div className="rgroup">
+          <div className="rlabel">Stories</div>
+          <div className="rbtns">
+            <div className={"storypill"+(twoStory?" two":"")}
+                 title="Switch between single-story and two-story design">
+              <span className="storythumb"/>
+              <button className={"storyopt"+(!twoStory?" on":"")} onClick={()=>setTwoStory(false)}>1 Story</button>
+              <button className={"storyopt"+(twoStory?" on":"")} onClick={()=>setTwoStory(true)}>2 Story</button>
+            </div>
+          </div>
+        </div>
+        <div className="rsep"/>
+        <div className="rgroup">
+          <div className="rlabel">Analyze</div>
+          <div className="rbtns">
+            <button className="rbtn raccent" title="Send point-load walls to the shear-wall designer"
+              disabled={!((secH&&secH.reactions.length)||(secV&&secV.reactions.length))}
+              onClick={runDesignHandoff}>
+              ⚡ Design shear walls
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div className="layout">
+        <div className="canvascol">
+        <div className="stage" ref={stageRef}>
+          {twoStory && (<div className="floorbadge">Floor {activeFloor} <span>plan</span></div>)}
+          <svg ref={svgRef} className="cvs" style={drawMode?{cursor:"crosshair"}:(panMode||panCursor)?{cursor:panCursor?"grabbing":"grab"}:undefined}
+               viewBox={`${view.x} ${view.y} ${view.w} ${view.h}`}
+               onPointerDown={onBgLDown} onPointerMove={onMove} onPointerUp={onUp}
+               onPointerLeave={onLeave} onContextMenu={onBgContextMenu}>
+            <defs>
+              <marker id="loadArr" markerWidth="6" markerHeight="6" refX="4.6" refY="3" orient="auto">
+                <path d="M0,0 L6,3 L0,6 Z" fill={C_LOAD}/>
+              </marker>
+              <marker id="reactArr" markerWidth="6.5" markerHeight="6.5" refX="5" refY="3.25" orient="auto">
+                <path d="M0,0 L6.5,3.25 L0,6.5 Z" fill={C_REACT}/>
+              </marker>
+            </defs>
+
+            <rect x={view.x} y={view.y} width={view.w} height={view.h} fill={C_BG}/>
+            {gridLines.map((l,i)=>(<line key={i} {...l} stroke={C_GRID} strokeWidth={0.2*S} opacity=".55"/>))}
+
+            {/* walls */}
+            {graph.edges.map(ed=>{
+              const a=graph.nodes.find(n=>n.id===ed.a), b=graph.nodes.find(n=>n.id===ed.b);
+              if(!a||!b) return null;
+              const L=dist(a,b), mx=(a.x+b.x)/2, my=(a.y+b.y)/2;
+              const editing=dimEdit&&same(dimEdit.edge,ed);
+              const noPL=!isSup(keyOf(ed));
+              return(
+                <g key={`e${ed.a}-${ed.b}`}>
+                  <line x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke={C_WALL} strokeWidth={0.55*S} strokeLinecap="round"
+                        strokeDasharray={noPL?`${1.6*S} ${1.4*S}`:undefined} opacity={noPL?0.55:1}/>
+                  <line x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke="transparent" strokeWidth={4*S} style={{cursor:"grab"}}
+                        onPointerDown={e=>onWallLDown(ed,e)} onContextMenu={e=>openMenu(e,{kind:"wall",edge:ed})}/>
+                </g>
+              );
+            })}
+
+            {/* draw-mode rubber band: anchor → preview, ghost node, node-snap ring */}
+            {drawMode && drawPrev && (()=>{
+              const anchor = drawAnchor!==null ? graph.nodes.find(n=>n.id===drawAnchor) : null;
+              return (
+                <g pointerEvents="none">
+                  {anchor && <line x1={anchor.x} y1={anchor.y} x2={drawPrev.x} y2={drawPrev.y}
+                                   stroke={C_WALL} strokeWidth={0.45*S} strokeDasharray={`${1.6*S} ${1.2*S}`} opacity="0.85"/>}
+                  {anchor && (()=>{ const L=dist(anchor,drawPrev); if(L<0.5) return null;
+                    const mx=(anchor.x+drawPrev.x)/2, my=(anchor.y+drawPrev.y)/2;
+                    const vert=Math.abs(drawPrev.y-anchor.y)>Math.abs(drawPrev.x-anchor.x);
+                    return <text x={mx} y={my-1.6*S} textAnchor="middle" fontSize={1.35*S} fontWeight="700"
+                                 fill={C_NODE} fontFamily="ui-monospace,Menlo,monospace"
+                                 transform={vert?`rotate(-90,${mx},${my-1.6*S})`:undefined}>{fmt1(L)}′</text>; })()}
+                  {drawPrev.snapped
+                    ? <circle cx={drawPrev.x} cy={drawPrev.y} r={1.5*S} fill="none" stroke={C_LOAD} strokeWidth={0.3*S}/>
+                    : <circle cx={drawPrev.x} cy={drawPrev.y} r={0.8*S} fill={C_NODE} opacity="0.55"/>}
+                </g>
+              );
+            })()}
+
+            {/* live draft cut */}
+            {draft&&(<line x1={draft.x1} y1={draft.y1} x2={draft.x2} y2={draft.y2} stroke={C_DRAFT} strokeWidth={0.5*S} strokeDasharray={`${2*S} ${1.5*S}`} opacity=".7"/>)}
+
+            {/* dashed tributary divides — where the line load changes (front node or projected
+                back-wall node) — drawn from the windward face across to the leeward face */}
+            {[secH,secV].filter(Boolean).flatMap(sc=>(sc.divides||[]).map((d,i)=>(
+              <line key={(sc.axis)+"div"+i} x1={d.x1} y1={d.y1} x2={d.x2} y2={d.y2}
+                    stroke={C_LOAD} strokeWidth={0.18*S} strokeDasharray={`${1.4*S} ${1.4*S}`} opacity=".55"/>
+            )))}
+
+            {/* windward line-load graphics — one per windward wall (all legs) */}
+            {secH&&secH.windLoads.map((wl,i)=><WindLoad key={"hL"+wl.key} load={wl} S={S} onOpen={()=>setActiveWall({axis:"h",key:wl.key})}/>)}
+            {secV&&secV.windLoads.map((wl,i)=><WindLoad key={"vL"+wl.key} load={wl} S={S} onOpen={()=>setActiveWall({axis:"v",key:wl.key})}/>)}
+
+            {/* aggregated reactions (a shared support wall sums contributions into one arrow) */}
+            {secH&&secH.reactions.map((r,i)=><Reaction key={"hR"+i} r={r} tdir={secH.tdir} S={S}/>)}
+            {secV&&secV.reactions.map((r,i)=><Reaction key={"vR"+i} r={r} tdir={secV.tdir} S={S}/>)}
+
+            {/* load-imbalance flags */}
+            {[secH,secV].filter(Boolean).flatMap(sc=>(sc.windLoads||[]).filter(w=>w.imbalance).map((w,i)=>{
+              const mx=(w.wa.x+w.wb.x)/2, my=(w.wa.y+w.wb.y)/2;
+              return <text key={(sc.axis)+i} x={mx+w.nx*4*S} y={my+w.ny*4*S} fill="#B23A2A" fontSize={1.35*S}
+                           fontWeight="700" textAnchor="middle" dominantBaseline="middle">⚠ imbalance</text>;
+            }))}
+
+            {/* nodes */}
+            {graph.nodes.map(p=>{
+              const isSel=p.id===selected;
+              return(
+                <g key={p.id} style={{cursor:"grab"}} onPointerDown={e=>onNodeLDown(p.id,e)} onContextMenu={e=>openMenu(e,{kind:"node",id:p.id})}>
+                  <circle cx={p.x} cy={p.y} r={3.5*S} fill="transparent"/>
+                  {isSel&&<circle cx={p.x} cy={p.y} r={1.8*S} fill="rgba(35,87,127,.18)"/>}
+                  <circle cx={p.x} cy={p.y} r={(isSel?1.05:0.85)*S} fill={C_NODE} stroke={C_BG} strokeWidth={0.25*S}/>
+                </g>
+              );
+            })}
+
+            {/* dimension labels — drawn last so the masked boxes read over any line */}
+            {dims&&graph.edges.map(ed=>{
+              const a=graph.nodes.find(n=>n.id===ed.a), b=graph.nodes.find(n=>n.id===ed.b);
+              if(!a||!b) return null;
+              const L=dist(a,b); if(L<4) return null;
+              const mx=(a.x+b.x)/2, my=(a.y+b.y)/2, isV=edgeAxis(a,b)==="v";
+              const editing=dimEdit&&same(dimEdit.edge,ed);
+              return(
+                <g key={`d${ed.a}-${ed.b}`} style={{cursor:panMode?"grab":"text"}} onPointerDown={e=>{ if(panMode&&e.button===0){ beginPan(e); return; } e.stopPropagation(); }} onClick={e=>onDimClick(ed,e)}>
+                  <Tag x={mx} y={my} text={`${Math.round(L)}'`} box={editing?"#9A6B1F":C_DIMBOX} S={S} rot={isV?-90:0}/>
+                </g>
+              );
+            })}
+          </svg>
+
+          {menu&&(
+            <div ref={menuRef} className="cmenu" style={{left:menu.x,top:menu.y}}>
+              {menu.kind==="canvas"?(
+                <>
+                  <div className="cmh">Canvas</div>
+                  <button className={"cmi"+(drawMode?" act":"")} onClick={()=>{ toggleDrawMode(); closeMenu(); }}>
+                    <span className="cmlbl">✏ Draw</span>{drawMode&&<span className="cmck">✓</span>}
+                  </button>
+                  <button className={"cmi"+(panMode?" act":"")} onClick={()=>{ togglePanMode(); closeMenu(); }}>
+                    <span className="cmlbl">✋ Pan</span>{panMode&&<span className="cmck">✓</span>}
+                  </button>
+                  <button className="cmi cmzoom" onClick={()=>setZoomEnabled(v=>!v)}
+                          title={zoomEnabled?"Mouse-wheel zoom is ON — click to turn off":"Mouse-wheel zoom is OFF — click to turn on"}>
+                    <span className="cmlbl">🔍 Zoom (wheel)</span>
+                    <span className={"cmlight"+(zoomEnabled?" on":"")}/>
+                  </button>
+                </>
+              ):menu.kind==="node"?(
+                <>
+                  <div className="cmh">Node</div>
+                  <button className="cmi" onClick={()=>{
+                    const isSel=selRef.current===menu.id;
+                    if(isSel) setSelected(null);
+                    else { if(selRef.current!==null) connectTo(selRef.current,menu.id); setSelected(menu.id); }
+                    closeMenu();
+                  }}>{selected===menu.id?"Deselect":"Select"+(selected!==null?" & connect":"")}</button>
+                  <button className="cmi del" onClick={()=>{deleteNode(menu.id);closeMenu();}}>Delete node</button>
+                </>
+              ):(
+                <>
+                  <div className="cmh">Wall</div>
+                  <button className="cmi" onClick={()=>{toggleSupport(menu.edge);closeMenu();}}>
+                    {isSup(keyOf(menu.edge)) ? "✓ Takes point load" : "✕ No point load"}
+                  </button>
+                  <button className="cmi" onClick={()=>{splitWall(menu.edge,menu.u);closeMenu();}}>Add node here</button>
+                  <button className="cmi del" onClick={()=>{deleteEdge(menu.edge);closeMenu();}}>Delete wall</button>
+                </>
+              )}
+            </div>
+          )}
+
+          {dimEdit&&(
+            <div ref={dimWrapRef} className="dim-input-wrap" style={{left:dimEdit.px,top:dimEdit.py}}>
+              <input className="dim-inp" type="number" min="1" value={dimEdit.val} autoFocus
+                     onChange={e=>setDimEdit(d=>({...d,val:e.target.value}))}
+                     onKeyDown={e=>{ if(e.key==="Enter"){applyWallLength(dimEdit.edge,parseFloat(dimEdit.val),dimEdit.moveEnd);} if(e.key==="Escape"){setDimEdit(null);} }}/>
+              <span className="dim-unit">ft</span>
+            </div>
+          )}
+        </div>{/* /stage */}
+
+        {/* ── FLOOR SELECTOR — directly BELOW the drawing area (outside the canvas, so clicks never hit the SVG). Greyed/disabled until 2-Story is on. ── */}
+        <div className={"floorbar"+(twoStory?"":" off")}>
+          <div className="floorsel"
+               title={twoStory?"Choose which floor to view":"Turn on 2 Story (top toolbar) to enable floor switching"}>
+            <button className={"floortab"+(activeFloor===1?" act":"")} disabled={!twoStory}
+                    onClick={()=>twoStory&&setActiveFloor(1)}>1st Floor</button>
+            <button className={"floortab"+(activeFloor===2?" act":"")} disabled={!twoStory}
+                    onClick={()=>twoStory&&setActiveFloor(2)}>2nd Floor</button>
+          </div>
+        </div>
+        </div>{/* /canvascol */}
+
+        {/* side panel */}
+        <div className="panel">
+          <div className="card">
+            <h4>Live Metrics</h4>
+            <div className="row"><span>Nodes</span><b>{graph.nodes.length}</b></div>
+            <div className="row"><span>Walls</span><b>{graph.edges.length}</b></div>
+            <div className="row"><span>Total wall</span><b>{Math.round(totalLen)}<small>ft</small></b></div>
+            <div className="row"><span>Enclosed area</span><b>{loop?Math.round(loop.area):"—"}{loop&&<small>ft²</small>}</b></div>
+          </div>
+
+          {(secH||secV)&&(
+            <div className="card">
+              <h4>Wind Line Loads</h4>
+              {[["h","E–W",secH],["v","N–S",secV]].map(([o,lbl,sc])=> sc&&sc.windLoads.length?(
+                <div key={o} style={{marginBottom:8}}>
+                  <div className="row">
+                    <span>{lbl} wind</span>
+                    <b style={{color:"#9A6B1F"}}>{fmt2(sc.baseShear||0)}<small>k base shear</small></b>
+                  </div>
+                  <div className="row" style={{fontSize:11,color:"#6B7684"}}>
+                    <span>{sc.windLoads.length} windward wall{sc.windLoads.length===1?"":"s"} · tap a load to edit</span>
+                  </div>
+                  {sc.imbalance && (
+                    <div style={{fontSize:11,color:"#B23A2A",fontWeight:600,padding:"2px 0"}}>⚠ Load imbalance — no point-load walls</div>
+                  )}
+                  <div className="brow" style={{marginTop:4}}>
+                    <button className="btn" onClick={()=>{ if(sc.windLoads[0]) setActiveWall({axis:o,key:sc.windLoads[0].key}); }}>Edit</button>
+                    <button className="btn pink" onClick={()=>{ setSections(s=>({...s,[o]:null})); setActiveWall(a=>a&&a.axis===o?null:a); }}>Remove</button>
+                  </div>
+                </div>
+              ):null)}
+              {onDesignShearWalls && (secH&&secH.reactions.length || secV&&secV.reactions.length) ? (
+                <button className="btn" style={{width:"100%",marginTop:6,background:"#23577F",borderColor:"#23577F",color:"#FFFFFF",fontWeight:700}}
+                  onClick={runDesignHandoff}>
+                  Design shear walls →
+                </button>
+              ):null}
+            </div>
+          )}
+
+          <div className="card">
+            <h4>Presets</h4>
+            <div className="brow">{Object.keys(PRESETS).map(k=>(<button key={k} className="btn" onClick={()=>loadPreset(k)}>{k}</button>))}</div>
+            <div className="brow" style={{marginTop:6}}>
+              <button className="btn" onClick={undo}>Undo</button>
+            </div>
+          </div>
+
+          <div className="card">
+            <p className="hint">
+              <b>✏ Draw walls</b>: click to chain straight walls; click an existing node to connect/close; right-click ends the chain, then right-click again opens the Canvas menu; Esc exits.<br/>
+              <b>Left-drag</b> nodes/walls to move.<br/>
+              <b>Drag across empty space</b> in a direction to set the wind — it loads every windward wall in that direction.<br/>
+              <b>Right-click</b> a node (select/connect/delete) or wall (add node/delete); <b>right-click empty space</b> for the Canvas menu — Draw, Pan (left-drag hand tool), and a Zoom toggle (green light = wheel-zoom on).<br/>
+              <b>Click a dimension</b> to edit length.<br/>
+              <b>Navigate</b>: scroll the mouse wheel to zoom toward the cursor (toggle in the Canvas menu), middle-drag <i>or</i> the Pan tool to pan, <b>⊡ Fit</b> to frame the whole plan.
+            </p>
+          </div>
+        </div>
+      </div>
+
+      {/* ── STATUS BAR — coordinates, mode, toggles, plan stats ── */}
+      <div className="statusbar">
+        <span className="stcoord">{cursorFt ? `X ${cursorFt.x.toFixed(1)}′  Y ${cursorFt.y.toFixed(1)}′` : "X —  Y —"}</span>
+        <span className={"stmode"+(drawMode?" draw":panMode?" pan":"")}>{drawMode ? (drawAnchor!==null?"DRAW · chaining":"DRAW") : panMode ? "PAN" : "SELECT"}</span>
+        <span className={"stflag"+(snapOn?" on":"")} onClick={()=>setSnapOn(v=>!v)}>SNAP</span>
+        <span className={"stflag"+(ortho?" on":"")} onClick={()=>setOrtho(v=>!v)}>ORTHO</span>
+        <span className="stright">
+          {graph.edges.length} walls · {Math.round(totalLen)}′
+          {secH&&secH.windLoads.length?` · E–W ${fmt2(secH.baseShear||0)}k`:""}
+          {secV&&secV.windLoads.length?` · N–S ${fmt2(secV.baseShear||0)}k`:""}
+        </span>
+      </div>
+
+      {activeWall&&activeSection&&(
+        <WindWindow key={activeWall.key+"|"+(activeLeeKey||"")} section={activeSection}
+                    setVals={setVals} onReverse={reverseWind}
+                    onClose={()=>setActiveWall(null)} onRemove={removeSection} twoStory={twoStory}/>
+      )}
+    </div>
+  );
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   PLYWOOD SHEAR WALL MODULE (merged from shear-wall-calculator)
+   Engine is a verbatim port of "Plywood Shear Wall - Wood Studs.xlsx".
+   Calculation Sheet tab: unchanged logic, restyled to the sketcher theme.
+   Design tab: rebuilt around the sketcher plan — per-line optimization,
+   drag-in-plan shear walls, right-click overrides (holdown/nailing/post).
+   ════════════════════════════════════════════════════════════════════════ */
+
+// Sheathing-grade schedules. SCHEDULE (rated) = original "Plywood Shear Wall - Wood Studs.xlsx";
+// SCHEDULE_STR1 extracted verbatim from "shear_walls_-_Structural_1.xlsx" (formula-identical workbook,
+// only Shearwall Schedule capacities + Ga differ). Nailing/anchorage callouts identical between grades.
+const SCHEDULE = [
+  { mark: 1, sheathing: '1/2" WOOD STR. PANELS — ONE SIDE OF WALL', edge: '10d COMMON AT 6" O.C.', field: '10d COMMON AT 12" O.C.', concrete: '1/2" DIA. A.B. AT 36" O.C.', wood: '16d STAGGERED AT 6" O.C.', wind: 435, seismic: 310, ga: 14 * 1.2 },
+  { mark: 2, sheathing: '1/2" WOOD STR. PANELS — ONE SIDE OF WALL', edge: '10d COMMON AT 4" O.C.', field: '10d COMMON AT 12" O.C.', concrete: '1/2" DIA. A.B. AT 24" O.C.', wood: '16d STAGGERED AT 4" O.C.', wind: 645, seismic: 460, ga: 17 * 1.2 },
+  { mark: 3, sheathing: '1/2" WOOD STR. PANELS — ONE SIDE OF WALL', edge: '10d COMMON AT 3" O.C.', field: '10d COMMON AT 12" O.C.', concrete: '1/2" DIA. A.B. AT 18" O.C.', wood: '16d STAGGERED AT 3" O.C.', wind: 840, seismic: 600, ga: 19 * 1.2 },
+];
+const SCHEDULE_STR1 = [
+  { mark: 1, sheathing: '1/2" WOOD STR. PANELS-STR. 1 — ONE SIDE OF WALL', edge: '10d COMMON AT 6" O.C.', field: '10d COMMON AT 12" O.C.', concrete: '1/2" DIA. A.B. AT 36" O.C.', wood: '16d STAGGERED AT 6" O.C.', wind: 475, seismic: 340, ga: 16 * 1.2 },
+  { mark: 2, sheathing: '1/2" WOOD STR. PANELS-STR. 1 — ONE SIDE OF WALL', edge: '10d COMMON AT 4" O.C.', field: '10d COMMON AT 12" O.C.', concrete: '1/2" DIA. A.B. AT 24" O.C.', wood: '16d STAGGERED AT 4" O.C.', wind: 715, seismic: 510, ga: 20 * 1.2 },
+  { mark: 3, sheathing: '1/2" WOOD STR. PANELS-STR. 1 — ONE SIDE OF WALL', edge: '10d COMMON AT 3" O.C.', field: '10d COMMON AT 12" O.C.', concrete: '1/2" DIA. A.B. AT 18" O.C.', wood: '16d STAGGERED AT 3" O.C.', wind: 930, seismic: 665, ga: 22 * 1.2 },
+];
+// grade ∈ {"rated","str1"}; absent/unknown → rated (backward-compatible with v1 .wps files)
+const schedFor = (grade) => (grade === "str1" ? SCHEDULE_STR1 : SCHEDULE);
+// compact edge-nailing callouts per schedule mark (keep in sync with SCHEDULE above)
+const NAIL_EDGE = { 1: '10d-6" o.c. @ edges', 2: '10d-4" o.c. @ edges', 3: '10d-3" o.c. @ edges' };
+const CODES = { 1:"2006 INTERNATIONAL BUILDING CODE (IBC)", 2:"2009 INTERNATIONAL BUILDING CODE (IBC)", 3:"2012 INTERNATIONAL BUILDING CODE (IBC)", 4:"2015 INTERNATIONAL BUILDING CODE (IBC)" };
+const HD_TABLE = [
+  { name:"HDU2", cap:3075 }, { name:"HDU4", cap:4565 }, { name:"HDU5", cap:5645 },
+  { name:"HDU8", cap:7870 }, { name:"HDU11", cap:9335 }, { name:"HDU14", cap:14445 },
+];
+
+const isNum = (v) => typeof v === "number" && isFinite(v);
+const xMax = (...vals) => { const n = vals.filter(isNum); return n.length ? Math.max(...n) : 0; };
+const numOr0 = (v) => (isNum(v) ? v : 0);
+const CP = (FcE, Fc) => { const r = FcE/Fc; const phi=(1+r)/2/0.8; return phi - Math.sqrt(phi*phi - r/0.8); };
+
+// ---------- Core calculation (one segment) — verbatim port ----------
+function calcSegment(seg, g, totalL) {
+  const SCHED = schedFor(g.grade); // sheathing grade: rated (default) or Structural I — values only, formulas identical
+  const L = seg.length, h = seg.height;
+  if (!(L > 0)) return { active: false };
+  const sp = g.species === 1;
+  const E_seis = (0.7 * g.vSeismic) / g.R;
+  const F_wind = g.code >= 3 ? 0.6 * g.wWind : g.wWind;
+  const aspect = h / L;
+  const aspectNG = aspect > 3.5;
+  const wdl = seg.roofTrib * g.roofDL + seg.floorTrib * g.floorDL + g.wallDL * h;
+  // SEISMIC
+  const Fs = (E_seis * L) / totalL;
+  const vS = Fs / L;
+  const factor = aspectNG || aspect >= 2 ? (2 * L) / h : 1;
+  const [s1, s2, s3] = SCHED.map((t) => t.seismic);
+  const allowS = vS <= factor*s1 ? factor*s1 : vS <= factor*s2 ? factor*s2 : vS <= factor*s3 ? factor*s3 : "FAILED!!!";
+  const sugS = aspectNG ? "None" : vS <= factor*s1 ? 1 : vS <= factor*s2 ? 2 : vS <= factor*s3 ? 3 : "FAILED!!!";
+  const MotS = Fs * h;
+  const A = 1 + 0.14 * g.sds;
+  const AwDL = A * wdl;
+  const compS = (MotS + AwDL * L * Math.min(3, L / 2)) / (L - (1.5 + seg.hdDist) / 12);
+  const B = 0.6 - 0.14 * g.sds;
+  const BwDL = B * wdl;
+  const upliftFn = (Mot, w, denomIn) => { const u = (Mot - w*L*(L/2 - 1.5/12)) / (L - denomIn/12); return u < 0 ? 0 : u < 625 ? "neglect" : u; };
+  const upHD_S = upliftFn(MotS, BwDL, 1.5 + seg.hdDist);
+  const upStrap_S = upliftFn(MotS, BwDL, 3);
+  // WIND
+  const Fw = (F_wind * L) / totalL;
+  const vW = Fw / L;
+  const [w1, w2, w3] = SCHED.map((t) => t.wind);
+  const sugW = aspectNG ? "None" : vW <= w1 ? 1 : vW <= w2 ? 2 : vW <= w3 ? 3 : "FAILED!!!";
+  const MotW = Fw * h;
+  const compW = (MotW + wdl * L * Math.min(3, L / 2)) / (L - (1.5 + seg.hdDist / 12) / 12); // E42 quirk preserved
+  const Cfac = 0.6;
+  const CwDL = Cfac * wdl;
+  const upHD_W = upliftFn(MotW, CwDL, 1.5 + seg.hdDist);
+  const upStrap_W = upliftFn(MotW, CwDL, 3);
+  // END POSTS
+  const maxComp = xMax(compS, compW);
+  const t = seg.thickness;
+  const Cf = t === 3.5 ? 1.15 : t === 5.5 ? 1.1 : t === 7.25 ? 1.05 : 1;
+  const FcE1 = (0.822 * (sp ? 510000 : 580000)) / Math.pow((h * 12) / t, 2);
+  const Fc1 = (sp ? 1400 : 1350) * 1.6 * Cf;
+  const cp1 = CP(FcE1, Fc1);
+  const Pa224 = 2 * 1.5 * 3.5 * Fc1 * cp1;
+  const Pa44 = 3.5 * 3.5 * Fc1 * cp1;
+  const Pa226 = 2 * 1.5 * 5.5 * Fc1 * cp1;
+  const Pa46 = 3.5 * 5.5 * Fc1 * cp1;
+  const FcE2 = (0.822 * (sp ? 550000 : 470000)) / Math.pow((h * 12) / t, 2);
+  const Fc2 = (sp ? 825 : 700) * 1.6;
+  const cp2 = CP(FcE2, Fc2);
+  const Pa66 = 5.5 * 5.5 * Fc2 * cp2;
+  const Pa68 = 5.5 * 7.5 * Fc2 * cp2;
+  const post =
+    t <= 4
+      ? maxComp <= Pa224 ? "(2) 2x4" : maxComp <= Pa44 ? "4x4" : maxComp <= (Pa46*3.5)/5.5 ? "4x6" : "NG!"
+      : maxComp <= Pa226 ? "(2) 2x6" : maxComp <= Pa46 ? "4x6" : maxComp <= Pa66 ? "6x6" : maxComp <= Pa68 ? "6x8" : "NG!";
+  // HOLDOWNS
+  const maxUplift = xMax(upHD_S, upHD_W);
+  const isWood = seg.anchor === "Wood";
+  let hd;
+  if (maxUplift === 0) hd = "None";
+  else { const found = HD_TABLE.find((x) => maxUplift < x.cap); hd = found ? (isWood ? `(2) ${found.name}` : found.name) : "NG!"; }
+  const anchorFor = (variant) => {
+    if (maxUplift === 0 || hd === "None") return "None";
+    if (seg.anchor === "Concrete") {
+      if (hd === "HDU2") return maxUplift < 4780 ? "SSTB16" : "5/8'' A.B.";
+      if (hd === "HDU4") return maxUplift < 4780 ? "SSTB16" : "5/8'' A.B.";
+      if (hd === "HDU5") return maxUplift < 5175 ? "SSTB24" : "5/8'' A.B.";
+      if (hd === "HDU8") return maxUplift < 10100 ? "SSTB28" : "7/8'' A.B.";
+      return "1'' A.B.";
+    }
+    if (seg.anchor === "Masonry") {
+      const lim = variant === "interior" ? { a:4780, b:4780, c:6385 } : { a:1850, b:1850, c:4815 };
+      if (hd === "HDU2" || hd === "HDU4") return maxUplift < lim.a ? "SSTB16" : "5/8'' A.B.";
+      if (hd === "HDU5") return maxUplift < lim.b ? "SSTB24" : "5/8'' A.B.";
+      if (hd === "HDU8") return maxUplift < lim.c ? "SSTB28" : "7/8'' A.B.";
+      return "1'' A.B.";
+    }
+    if (["(2) HDU2", "(2) HDU4", "(2) HDU5"].includes(hd)) return "5/8'' Rod";
+    if (hd === "(2) HDU8") return "7/8'' Rod";
+    if (hd === "(2) HHDQ11" || hd === "(2) HHDQ14") return "1'' Rod";
+    return "NG!!";
+  };
+  const anchorSel = anchorFor("interior");
+  const anchorEnd = seg.anchor === "Masonry" ? anchorFor("end") : anchorFor("interior");
+  const embedFor = (anchorName, atEnd) => {
+    if (anchorName === "None") return "None";
+    if (["SSTB16","SSTB24","SSTB28"].includes(anchorName)) return "Simpson";
+    if (seg.anchor === "Concrete") return Math.max(16, Math.floor(maxUplift / (atEnd ? 876 : 1752) + 5));
+    if (seg.anchor === "Masonry") return Math.max(16, Math.floor(maxUplift / (atEnd ? 254 : 508) + 5));
+    return "Threaded";
+  };
+  const embed = embedFor(anchorSel, false);
+  const embedEnd = embedFor(anchorEnd, true);
+  // STRAPS
+  const maxStrap = xMax(upStrap_S, upStrap_W);
+  const strapFor = (lims) => {
+    if (maxUplift === 0) return "None";
+    if (seg.anchor === "Concrete") { for (const [lim, name] of lims) if (maxStrap < lim) return name; return "None"; }
+    if (seg.anchor === "Wood") {
+      const woodLims = [[2010,"MST37"],[3105,"MST48"],[4800,"MST60"],[5660,"MSTC78"],[9235,"CMST12"]];
+      for (const [lim, name] of woodLims) if (maxStrap < lim) return name; return "None";
+    }
+    return "None";
+  };
+  const altStrap = strapFor([[3195,"STHD8"],[3730,"STHD10"],[5785,"STHD14"]]);
+  const strapCorner = strapFor([[2370,"STHD8"],[3730,"STHD10"],[5025,"STHD14"]]);
+  const sugMax = xMax(sugS, sugW);
+  const status = sugS === "FAILED!!!" || sugW === "FAILED!!!" ? "FAILED!!!" : seg.selType < sugMax ? "FAILED!!!" : "OK";
+  // DEFLECTION
+  const Epost = ["(2) 2x4","4x4","(2) 2x6","4x6"].includes(post) ? (sp ? 1400000 : 1600000) : (sp ? 1500000 : 1300000);
+  const Apost = post === "(2) 2x4" ? 10.5 : post === "4x4" ? 12.25 : post === "(2) 2x6" ? 16.5 : post === "4x6" ? 19.25 : post === "6x6" ? 30.25 : 39.875;
+  const Ga = seg.selType === 1 ? SCHED[0].ga : seg.selType === 2 ? SCHED[1].ga : SCHED[2].ga;
+  const defl = (v) => (8*(v/0.7)*Math.pow(h,3))/(Epost*Apost*L) + ((v/0.7)*h)/(1000*Ga) + (h/L)*0.125;
+  const deflS = defl(vS);
+  const deflW = defl(vW);
+  // FOOTING
+  const ftgW = seg.ftgWidth, ftgT = seg.ftgThick;
+  const quad = (a, b, c) => { const disc = b*b - 4*a*c; if (disc < 0 || a === 0) return NaN; return (-b + Math.sqrt(disc)) / (2*a); };
+  const a = (Math.min(0.6, B) * 150 * ftgW * ftgT) / 24;
+  const P65 = (MotS + BwDL*L*(L/2 - seg.hdDist/12)) / (L - (1.5 + seg.hdDist)/12);
+  const uS = numOr0(upHD_S);
+  const LminS = quad(a, (P65-uS)/2, uS*(seg.hdDist/12 - L/2) + P65*(1.5/12 - L/2) - (Fs*ftgT)/12);
+  const P70 = (MotW + CwDL*L*(L/2 - seg.hdDist/12)) / (L - (1.5 + seg.hdDist/12)/12);
+  const uW = numOr0(upHD_W);
+  const LminW = quad(a, (P70-uW)/2, uW*(seg.hdDist/12 - L/2) + P70*(1.5/12 - L/2) - (Fw*ftgT)/12);
+  const reqFtgLen = xMax(L + 1, LminS, LminW);
+  return {
+    active:true, aspect, aspectNG, wdl,
+    Fs, vS, factor, allowS, sugS, MotS, A, AwDL, compS, B, BwDL, upHD_S, upStrap_S,
+    Fw, vW, sugW, MotW, compW, C:Cfac, CwDL, upHD_W, upStrap_W,
+    maxComp, post, Pa:{Pa224,Pa44,Pa226,Pa46,Pa66,Pa68},
+    maxUplift, hd, anchorSel, anchorEnd, embed, embedEnd,
+    maxStrap, altStrap, strapCorner,
+    status, deflS, deflW, LminS, LminW, reqFtgLen,
+  };
+}
+
+// ---------- Design engine (verbatim search; per-line g) ----------
+function baseDesignSeg(d) {
+  return { height:d.height, roofTrib:d.roofTrib, floorTrib:d.floorTrib, hdDist:d.hdDist,
+           thickness:d.thickness, anchor:d.anchor, selType:1, ftgWidth:d.ftgWidth, ftgThick:d.ftgThick };
+}
+function evaluateCandidate(Ls, totalL, g, d) {
+  const seg = { ...baseDesignSeg(d), length: Ls };
+  const r1 = calcSegment({ ...seg, selType: 1 }, g, totalL);
+  if (!r1.active || r1.aspectNG) return null;
+  if (!isNum(r1.sugS) || !isNum(r1.sugW)) return null;
+  const type = Math.max(r1.sugS, r1.sugW);
+  const r = calcSegment({ ...seg, selType: type }, g, totalL);
+  if (r.post === "NG!" || r.hd === "NG!" || r.hd === "NG!!" || r.status !== "OK") return null;
+  if (r.anchorSel === "NG!!") return null;
+  return { type, r };
+}
+function generateDesign(g, d) {
+  const snap = Math.max(0.25, d.snap || 0.5);
+  const maxN = Math.max(1, Math.min(6, Math.floor(d.maxSegments)));
+  const solutions = [];
+  for (let T = 1; T <= d.maxType; T++) {
+    for (let N = 1; N <= maxN; N++) {
+      const maxLs = Math.min(d.maxSegLen, d.lineLength / N);
+      if (maxLs < d.minSegLen - 1e-9) continue;
+      const start = Math.ceil(d.minSegLen / snap) * snap;
+      for (let Ls = start; Ls <= maxLs + 1e-9; Ls = +(Ls + snap).toFixed(4)) {
+        const ev = evaluateCandidate(Ls, N * Ls, g, d);
+        if (ev && ev.type <= T) { solutions.push({ T: ev.type, N, Ls, total: N * Ls, r: ev.r }); break; }
+      }
+    }
+    if (d.objective === "nailing" && solutions.some((s) => s.T <= T)) break;
+  }
+  if (!solutions.length) return null;
+  solutions.sort((a, b) => d.objective === "nailing"
+    ? a.T - b.T || a.total - b.total || a.N - b.N
+    : a.total - b.total || a.N - b.N || a.T - b.T);
+  const best = solutions[0];
+  const gap = (d.lineLength - best.N * best.Ls) / (best.N + 1);
+  const rnd = (x) => Math.round(x * 4) / 4;
+  const segs = Array.from({ length: best.N }, (_, i) => ({ start: rnd(gap + i * (best.Ls + gap)), length: best.Ls }));
+  return { segs, meta: { type: best.T, N: best.N, Ls: best.Ls, total: best.total } };
+}
+
+// ---------- Formatting + dark theme (sketcher palette first) ----------
+const fmt = (v, d = 0) => {
+  if (v === "neglect") return "neglect";
+  if (!isNum(v)) return typeof v === "string" ? v : "—";
+  return v.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
+};
+const SW = {  // light drafting palette — matches the Calculation Sheet (LT) scheme
+  page:"#EFEDE6", sheet:"#FFFFFF", panel:"#FFFFFF", ink:"#1C2733", faint:"#67737F",
+  rule:"#D8D4C8", accent:"#23577F", accentSoft:"#E8EFF4",
+  red:"#B23A2A", redSoft:"#F8E9E5", green:"#2E6B4F", greenSoft:"#E7F1EB",
+  amber:"#9A6B1F", amberSoft:"#F7EEDC", wall:"#1C2733", input:"#FDFDFB",
+};
+const MONO = "'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace";
+
+function Chip({ v, d = 0, suffix = "" }) {
+  let bg = "transparent", color = SW.ink, text = fmt(v, d);
+  if (v === "FAILED!!!" || v === "NG!" || v === "NG!!") { bg = SW.redSoft; color = SW.red; }
+  else if (v === "neglect") { bg = SW.amberSoft; color = SW.amber; }
+  else if (v === "None" || v === "—" || v === "Simpson" || v === "Threaded") { color = SW.faint; }
+  else if (v === "OK") { bg = SW.greenSoft; color = SW.green; }
+  return (
+    <span style={{ background:bg, color, fontFamily:MONO, fontSize:12, padding:bg==="transparent"?0:"1px 6px", borderRadius:3, whiteSpace:"nowrap", fontWeight:bg!=="transparent"?600:400 }}>
+      {text}{suffix && isNum(v) ? suffix : ""}
+    </span>
+  );
+}
+function Row({ label, unit, cells, render }) {
+  return (
+    <tr style={{ borderBottom: `1px solid ${SW.rule}` }}>
+      <td style={{ padding:"5px 10px", fontSize:12, color:SW.ink, whiteSpace:"nowrap" }}>
+        {label} {unit && <span style={{ color:SW.faint, fontSize:11 }}>({unit})</span>}
+      </td>
+      {cells.map((r, i) => (
+        <td key={i} style={{ padding:"5px 8px", textAlign:"right" }}>
+          {r.active ? render(r, i) : <span style={{ color:SW.rule }}>·</span>}
+        </td>
+      ))}
+    </tr>
+  );
+}
+function SectionTitle({ children, right }) {
+  return (
+    <div style={{ display:"flex", alignItems:"center", gap:10, margin:"26px 0 8px" }}>
+      <span style={{ width:6, height:6, background:SW.accent, display:"inline-block", flex:"none" }} aria-hidden="true"/>
+      <div style={{ fontSize:11, fontWeight:700, letterSpacing:"0.14em", textTransform:"uppercase", color:SW.accent }}>{children}</div>
+      <div style={{ flex:1, height:1, background:SW.rule }} />
+      {right}
+    </div>
+  );
+}
+function NumInput({ value, onChange, step = 1, width = 64, style }) {
+  return (
+    <input type="number" step={step} value={value}
+      onChange={(e) => onChange(parseFloat(e.target.value) || 0)}
+      style={{ width, padding:"3px 6px", border:`1px solid ${SW.rule}`, borderRadius:4, fontFamily:MONO, fontSize:12,
+               textAlign:"right", color:SW.accent, fontWeight:600, background:SW.input, outline:"none", ...style }} />
+  );
+}
+// Grouped constraint card — visual twin of the calc sheet's "Design loads" cards (LtCollapse flex cards)
+function ConGroup({ title, children }) {
+  return (
+    <div style={{ flex:"1 1 200px", border:`1px solid ${SW.rule}`, borderRadius:6, padding:"6px 10px 8px", background:SW.panel }}>
+      <div style={{ fontSize:10, fontWeight:700, letterSpacing:"0.08em", textTransform:"uppercase", marginBottom:4, color:SW.ink }}>{title}</div>
+      <div style={{ display:"flex", flexWrap:"wrap", gap:"6px 12px", alignItems:"flex-end" }}>{children}</div>
+    </div>
+  );
+}
+function SwField({ label, children }) {
+  return (
+    <label style={{ display:"flex", flexDirection:"column", gap:3 }}>
+      <span style={{ fontSize:10, letterSpacing:"0.1em", textTransform:"uppercase", color:SW.faint }}>{label}</span>
+      {children}
+    </label>
+  );
+}
+const selStyle = { padding:"3px 4px", border:`1px solid ${SW.rule}`, borderRadius:4, fontSize:11, fontFamily:MONO,
+                   color:SW.accent, fontWeight:600, background:SW.input, outline:"none" };
+// Pinned-constraints panel: every control shares one height + font so the rows line up (rev 8)
+const CON_H = 24;
+const conNum = { height:CON_H, boxSizing:"border-box" };
+const conSel = { ...selStyle, fontSize:12, padding:"2px 4px", height:CON_H, boxSizing:"border-box", minWidth:56, maxWidth:158 };
+
+// ── Pinned-panel field system (rev 11) ──────────────────────────────────────
+// Inline label-left / control-right rows inside a CSS grid. One line per field
+// (half the height of stacked label-on-top), controls share a column edge so
+// everything aligns, and a fixed unit gutter keeps numbers and units tidy.
+const PIN_H = 22;
+const pinCard = { border:`1px solid ${SW.rule}`, borderRadius:6, padding:"5px 9px 6px", background:SW.panel, minWidth:0 };
+const pinTitle = { fontSize:9, fontWeight:700, letterSpacing:"0.1em", textTransform:"uppercase", marginBottom:4, color:SW.ink };
+const pinNumS = { width:46, height:PIN_H, boxSizing:"border-box", padding:"0 5px", border:`1px solid ${SW.rule}`, borderRadius:4,
+                  fontFamily:MONO, fontSize:11, textAlign:"right", color:SW.accent, fontWeight:600, background:SW.input, outline:"none" };
+const pinSelS = { height:PIN_H, boxSizing:"border-box", padding:"0 2px", border:`1px solid ${SW.rule}`, borderRadius:4,
+                  fontFamily:MONO, fontSize:11, color:SW.accent, fontWeight:600, background:SW.input, outline:"none", minWidth:46 };
+function PinCard({ title, cols = 2, grow, children }) {
+  return (
+    <div style={pinCard}>
+      <div style={pinTitle}>{title}</div>
+      <div style={{ display:"grid", gridTemplateColumns:`repeat(${cols}, minmax(0,1fr))`, columnGap:12, rowGap:5 }}>{children}</div>
+    </div>
+  );
+}
+// label truncates with ellipsis (full text in title) so no label can ever break the row; unit sits in a fixed right gutter.
+function PinRow({ label, unit = "", full, grow, children }) {
+  return (
+    <label title={label} style={{ display:"flex", alignItems:"center", gap:6, minWidth:0, gridColumn: full ? "1 / -1" : "auto" }}>
+      <span style={{ flex: grow ? "0 0 auto" : "1 1 auto", minWidth:0, fontSize:8.5, letterSpacing:"0.02em",
+                     textTransform:"uppercase", color:SW.faint, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{label}</span>
+      <span style={{ flex: grow ? "1 1 auto" : "none", display:"flex", alignItems:"center", gap:3, minWidth:0 }}>
+        {children}
+        <span style={{ width:13, flex:"none", fontSize:8.5, color:SW.faint, textAlign:"left" }}>{unit}</span>
+      </span>
+    </label>
+  );
+}
+const swBtn = (primary) => ({
+  padding:"8px 16px", fontSize:12, fontWeight:700, letterSpacing:"0.06em",
+  border:`1.5px solid ${primary ? SW.accent : SW.rule}`, background: primary ? SW.accent : SW.panel,
+  color: primary ? "#FFFFFF" : SW.ink, cursor:"pointer", borderRadius:4,
+});
+
+/* ────────────────────────────────────────────────────────────────────────
+   LIGHT THEME — Calculation Sheet only. 1:1 port of the standalone
+   shear-wall-calculator app (paper page, white sheet, compliance banner,
+   D/C utilization bars, collapsible sections, sticky row labels, column
+   highlight, formula tooltips, print). Namespaced Lt- / LT- so the dark
+   Design tab components above are untouched.
+   ──────────────────────────────────────────────────────────────────────── */
+// Utilization (UI layer) — derives D/C ratios + pass verdict from an engine
+// result WITHOUT touching calcSegment (engine stays verbatim per handoff §2).
+function withUtil(r, seg, grade) {
+  if (!r || !r.active) return r;
+  const selT = schedFor(grade)[Math.max(0, Math.min(2, (seg.selType || 1) - 1))];
+  const utilW = r.vW / selT.wind;
+  const utilS = r.vS / (r.factor * selT.seismic);
+  const { Pa224, Pa44, Pa226, Pa46, Pa66, Pa68 } = r.Pa;
+  const postCap =
+    r.post === "(2) 2x4" ? Pa224 : r.post === "4x4" ? Pa44 : r.post === "(2) 2x6" ? Pa226
+    : r.post === "4x6" ? Pa46 : r.post === "6x6" ? Pa66 : r.post === "6x8" ? Pa68
+    : seg.thickness <= 4 ? (Pa46 * 3.5) / 5.5 : Pa68; // NG! → largest available
+  const utilPost = r.maxComp / postCap;
+  const hdEntry = HD_TABLE.find((x) => r.hd.includes(x.name));
+  const utilHD = r.maxUplift === 0 ? 0 : hdEntry ? r.maxUplift / hdEntry.cap : r.maxUplift / HD_TABLE[5].cap;
+  const pass = r.status === "OK" && !r.aspectNG && r.post !== "NG!" && r.hd !== "NG!" && r.anchorSel !== "NG!!";
+  return { ...r, utilW, utilS, utilPost, utilHD, pass };
+}
+
+const LT = {
+  paper: "#EFEDE6", sheet: "#FFFFFF", ink: "#1C2733", faint: "#67737F",
+  rule: "#D8D4C8", blue: "#23577F", blueSoft: "#E8EFF4",
+  red: "#B23A2A", redSoft: "#F8E9E5", green: "#2E6B4F", greenSoft: "#E7F1EB",
+  amber: "#9A6B1F", amberSoft: "#F7EEDC", zebra: "#FAF9F5", hover: "#F1F4F6",
+};
+
+const LT_CSS = `
+  .sw-table { border-collapse: collapse; width: 100%; min-width: 760px; }
+  .sw-table td, .sw-table th { background: ${LT.sheet}; }
+  .sw-table td:first-child, .sw-table th:first-child {
+    position: sticky; left: 0; z-index: 2;
+    box-shadow: 2px 0 0 ${LT.rule};
+  }
+  .sw-table thead th { background: #F7F6F1; border-bottom: 1.5px solid ${LT.ink}; }
+  .sw-table td { transition: background .12s ease; }
+  .sw-table tbody tr:nth-child(even) td { background: ${LT.zebra}; }
+  .sw-table tbody tr:hover td { background: ${LT.hover}; }
+  .sw-table td.sw-hl, .sw-table th.sw-hl { background: ${LT.blueSoft} !important; }
+  .sw-scroll { overflow-x: auto; border: 1px solid ${LT.rule}; }
+  button:focus-visible, input:focus-visible, select:focus-visible, svg:focus-visible, [tabindex]:focus-visible {
+    outline: 2px solid ${LT.blue}; outline-offset: 1px;
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    .sw-collapse-body { animation: swFade 0.15s ease-out; }
+    @keyframes swFade { from { opacity: 0.4; } to { opacity: 1; } }
+  }
+  @media print {
+    .no-print { display: none !important; }
+    .sw-scroll { overflow: visible; border: none; }
+    body { background: #FFF !important; }
+  }
+`;
+
+function LtChip({ v, d = 0 }) {
+  let bg = "transparent", color = LT.ink, text = fmt(v, d);
+  if (v === "FAILED!!!" || v === "NG!" || v === "NG!!") { bg = LT.redSoft; color = LT.red; }
+  else if (v === "neglect") { bg = LT.amberSoft; color = LT.amber; }
+  else if (v === "None" || v === "—" || v === "Simpson" || v === "Threaded") { color = LT.faint; }
+  else if (v === "OK") { bg = LT.greenSoft; color = LT.green; }
+  return (
+    <span style={{ background: bg, color, fontFamily: MONO, fontSize: 12, padding: bg === "transparent" ? 0 : "1px 6px", borderRadius: 3, whiteSpace: "nowrap", fontWeight: bg !== "transparent" ? 600 : 400 }}>
+      {text}
+    </span>
+  );
+}
+
+function LtUtilBar({ ratio }) {
+  if (!isNum(ratio)) return <LtChip v="—" />;
+  const over = ratio > 1;
+  const pct = Math.min(ratio, 1.25) / 1.25 * 100;
+  const color = over ? LT.red : ratio > 0.85 ? LT.amber : LT.green;
+  const fillBg = over
+    ? "repeating-linear-gradient(135deg, #B23A2A 0 6px, #C5503F 6px 12px)"   // hatched when exceeding capacity
+    : `linear-gradient(180deg, ${color} 0%, ${color} 60%, rgba(0,0,0,0.08) 100%)`;
+  return (
+    <span style={{ display: "inline-flex", alignItems: "center", gap: 7 }}>
+      <span style={{ position: "relative", width: 72, height: 9, background: "#E7E4DA", borderRadius: 99,
+                     overflow: "hidden", flex: "none", boxShadow: "inset 0 1px 1.5px rgba(28,39,51,0.12)" }}>
+        <span style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: `${pct}%`, background: fillBg,
+                       borderRadius: 99, transition: "width .3s cubic-bezier(.22,.61,.36,1)" }} />
+        <span style={{ position: "absolute", left: `${100 / 1.25}%`, top: -1, bottom: -1, width: 2,
+                       background: LT.ink, opacity: 0.42, transform: "translateX(-1px)" }} title="100% capacity" />
+      </span>
+      <span style={{ fontFamily: MONO, fontSize: 11, color, fontWeight: 700, minWidth: 38, textAlign: "right",
+                     fontVariantNumeric: "tabular-nums" }}>{over ? "▲" : ""}{(ratio * 100).toFixed(0)}%</span>
+    </span>
+  );
+}
+
+const HL = React.createContext({ sel: null, setSel: () => {} });
+
+function LtRow({ label, unit, tip, cells, render }) {
+  const { sel } = React.useContext(HL);
+  return (
+    <tr style={{ borderBottom: `1px solid ${LT.rule}` }}>
+      <td title={tip} style={{ padding: "5px 10px", fontSize: 12, color: LT.ink, whiteSpace: "nowrap", cursor: tip ? "help" : "default" }}>
+        {label} {unit && <span style={{ color: LT.faint, fontSize: 11 }}>({unit})</span>}
+      </td>
+      {cells.map((r, i) => (
+        <td key={i} className={sel === i ? "sw-hl" : ""} style={{ padding: "5px 8px", textAlign: "right" }}>
+          {r.active ? render(r, i) : <span style={{ color: LT.rule }}>·</span>}
+        </td>
+      ))}
+    </tr>
+  );
+}
+
+function LtSegHeader({ segments }) {
+  const { sel, setSel } = React.useContext(HL);
+  return (
+    <thead>
+      <tr style={{ borderBottom: `1.5px solid ${LT.ink}` }}>
+        <th style={{ textAlign: "left", padding: "4px 10px", fontSize: 11 }}></th>
+        {segments.map((s, i) => (
+          <th
+            key={i} className={sel === i ? "sw-hl" : ""}
+            onClick={() => setSel(sel === i ? null : i)}
+            style={{ padding: "4px 8px", fontSize: 11, fontFamily: MONO, cursor: "pointer", color: (s.length ?? s) > 0 ? LT.blue : LT.faint }}
+            title="Click to highlight this wall in all tables"
+          >
+            SW-{i + 1}
+          </th>
+        ))}
+      </tr>
+    </thead>
+  );
+}
+
+function LtCollapse({ title, badge, right, defaultOpen = true, children }) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, margin: "22px 0 8px" }}>
+        <button
+          onClick={() => setOpen(!open)}
+          style={{ display: "flex", alignItems: "center", gap: 8, background: "none", border: "none", padding: 0, cursor: "pointer" }}
+        >
+          <span style={{ fontSize: 10, color: LT.blue, transform: open ? "rotate(90deg)" : "none", transition: "transform 0.12s", display: "inline-block" }}>▶</span>
+          <span style={{ fontSize: 11, fontWeight: 700, letterSpacing: "0.14em", textTransform: "uppercase", color: LT.blue }}>{title}</span>
+          {badge}
+        </button>
+        <div style={{ flex: 1, height: 1, background: LT.rule }} />
+        {right}
+      </div>
+      {open && <div className="sw-collapse-body">{children}</div>}
+    </div>
+  );
+}
+
+function LtNumInput({ value, onChange, step = 1, width = 64 }) {
+  return (
+    <input
+      type="number" step={step} value={value}
+      onChange={(e) => onChange(parseFloat(e.target.value) || 0)}
+      style={{ width, padding: "3px 6px", border: `1px solid ${LT.rule}`, borderRadius: 4, fontFamily: MONO, fontSize: 12, textAlign: "right", color: LT.blue, fontWeight: 600, background: "#FDFDFB", outline: "none" }}
+    />
+  );
+}
+
+const ltSel = { padding: "3px 4px", border: `1px solid ${LT.rule}`, borderRadius: 4, fontSize: 11, fontFamily: MONO, color: LT.blue, fontWeight: 600, background: "#FDFDFB", outline: "none" };
+
+function LtComplianceBanner({ segments, results }) {
+  const { sel, setSel } = React.useContext(HL);
+  const act = results.map((r, i) => ({ r, i })).filter((x) => x.r.active);
+  if (!act.length) return null;
+  const fails = act.filter((x) => !x.r.pass);
+  const allOK = fails.length === 0;
+  return (
+    <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 10, marginTop: 14, padding: "10px 14px", border: `1.5px solid ${allOK ? LT.green : LT.red}`, background: allOK ? LT.greenSoft : LT.redSoft }}>
+      <span style={{ fontFamily: MONO, fontSize: 13, fontWeight: 800, color: allOK ? LT.green : LT.red }}>
+        {allOK ? "✓ ALL WALLS PASS" : `✕ ${fails.length} OF ${act.length} WALL${act.length > 1 ? "S" : ""} FAILING`}
+      </span>
+      <span style={{ flex: 1 }} />
+      {act.map(({ r, i }) => (
+        <button
+          key={i} onClick={() => setSel(sel === i ? null : i)}
+          title={r.pass ? "Passing — click to highlight" : `Failing: ${[r.aspectNG && "aspect", r.status !== "OK" && "shear/type", r.post === "NG!" && "post", r.hd === "NG!" && "holdown"].filter(Boolean).join(", ")} — click to highlight`}
+          style={{
+            fontFamily: MONO, fontSize: 11, fontWeight: 700, padding: "3px 9px", cursor: "pointer", borderRadius: 3,
+            border: `1.5px solid ${r.pass ? LT.green : LT.red}`,
+            background: sel === i ? (r.pass ? LT.green : LT.red) : "#FFF",
+            color: sel === i ? "#FFF" : r.pass ? LT.green : LT.red,
+          }}
+        >
+          SW-{i + 1} {r.pass ? "✓" : "✕"}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function LtElevation({ segments, results }) {
+  const { sel, setSel } = React.useContext(HL);
+  const active = segments.map((s, i) => ({ ...s, r: results[i], i })).filter((s) => s.length > 0);
+  if (!active.length) return null;
+  const totalL = active.reduce((a, s) => a + s.length, 0);
+  const maxH = Math.max(...active.map((s) => s.height));
+  const W = 700, H = 130, gap = 8;
+  const scaleX = (W - gap * (active.length - 1)) / totalL;
+  const scaleY = 100 / maxH;
+  let x = 0;
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", maxWidth: 760, display: "block" }}>
+      <line x1="0" y1={H - 18} x2={W} y2={H - 18} stroke={LT.ink} strokeWidth="2" />
+      {active.map((s) => {
+        const w = s.length * scaleX, h = s.height * scaleY;
+        const failed = !s.r.pass;
+        const isSel = sel === s.i;
+        const el = (
+          <g key={s.i} transform={`translate(${x},0)`} style={{ cursor: "pointer" }} onClick={() => setSel(isSel ? null : s.i)}>
+            <rect x="0" y={H - 18 - h} width={w} height={h} fill={failed ? LT.redSoft : LT.blueSoft} stroke={failed ? LT.red : LT.blue} strokeWidth={isSel ? 3 : 1.5} />
+            <line x1="0" y1={H - 18 - h} x2={w} y2={H - 18} stroke={failed ? LT.red : LT.blue} strokeWidth="0.75" opacity="0.5" />
+            <line x1={w} y1={H - 18 - h} x2="0" y2={H - 18} stroke={failed ? LT.red : LT.blue} strokeWidth="0.75" opacity="0.5" />
+            <text x={w / 2} y={H - 18 - h / 2 - 4} textAnchor="middle" fontSize="11" fontWeight="700" fill={failed ? LT.red : LT.blue} fontFamily={MONO}>SW-{s.i + 1}</text>
+            <text x={w / 2} y={H - 18 - h / 2 + 9} textAnchor="middle" fontSize="9" fill={LT.faint} fontFamily={MONO}>{s.length}′ × {s.height}′</text>
+            <text x={w / 2} y={H - 5} textAnchor="middle" fontSize="9" fill={LT.faint} fontFamily={MONO}>{failed ? "✕" : "✓"} type {s.selType}</text>
+          </g>
+        );
+        x += w + gap;
+        return el;
+      })}
+    </svg>
+  );
+}
+
+// ---------- Wall elevation diagram (calc tab) — unchanged logic ----------
+function Elevation({ segments, results }) {
+  const active = segments.map((s, i) => ({ ...s, r: results[i], i })).filter((s) => s.length > 0);
+  if (!active.length) return null;
+  const totalL = active.reduce((a, s) => a + s.length, 0);
+  const maxH = Math.max(...active.map((s) => s.height));
+  const W = 700, H = 130, gap = 8;
+  const scaleX = (W - gap * (active.length - 1)) / totalL;
+  const scaleY = 100 / maxH;
+  let x = 0;
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} style={{ width:"100%", maxWidth:760, display:"block" }}>
+      <line x1="0" y1={H-18} x2={W} y2={H-18} stroke={SW.faint} strokeWidth="2" />
+      {active.map((s) => {
+        const w = s.length * scaleX, h = s.height * scaleY;
+        const failed = s.r.status === "FAILED!!!" || s.r.aspectNG;
+        const stroke = failed ? SW.red : SW.accent;
+        const el = (
+          <g key={s.i} transform={`translate(${x},0)`}>
+            <rect x="0" y={H-18-h} width={w} height={h} fill={failed ? SW.redSoft : SW.accentSoft} stroke={stroke} strokeWidth="1.5" />
+            <line x1="0" y1={H-18-h} x2={w} y2={H-18} stroke={stroke} strokeWidth="0.75" opacity="0.5" />
+            <line x1={w} y1={H-18-h} x2="0" y2={H-18} stroke={stroke} strokeWidth="0.75" opacity="0.5" />
+            <text x={w/2} y={H-18-h/2-4} textAnchor="middle" fontSize="11" fontWeight="700" fill={stroke} fontFamily={MONO}>SW-{s.i+1}</text>
+            <text x={w/2} y={H-18-h/2+9} textAnchor="middle" fontSize="9" fill={SW.faint} fontFamily={MONO}>{s.length}′ × {s.height}′</text>
+            <text x={w/2} y={H-5} textAnchor="middle" fontSize="9" fill={SW.faint} fontFamily={MONO}>{failed ? "✕" : "✓"} type {s.selType}</text>
+          </g>
+        );
+        x += w + gap;
+        return el;
+      })}
+    </svg>
+  );
+}
+
+// ---------- CALCULATION SHEET TAB — logic & structure unchanged; dark restyle ----------
+function CalcSheet({ g, setGl, segments, setSegments, results, totalL }) {
+  const setSeg = (i, key, val) =>
+    setSegments((prev) => prev.map((s, j) => (j === i ? { ...s, [key]: val } : s)));
+  const E_seis = (0.7 * g.vSeismic) / g.R;
+  const F_wind = g.code >= 3 ? 0.6 * g.wWind : g.wWind;
+
+  const failBadge = (cond) =>
+    cond ? <span style={{ fontFamily: MONO, fontSize: 10, fontWeight: 700, color: LT.red, background: LT.redSoft, padding: "1px 6px", borderRadius: 3 }}>✕</span> : null;
+  const anyFail = {
+    shear: results.some((r) => r.active && (r.status === "FAILED!!!" || r.aspectNG)),
+    post: results.some((r) => r.active && r.post === "NG!"),
+    hd: results.some((r) => r.active && (r.hd === "NG!" || r.anchorSel === "NG!!")),
+  };
+
+  return (
+    <div>
+      <LtComplianceBanner segments={segments} results={results} />
+
+      <LtCollapse title="Design loads">
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 16 }}>
+          <div style={{ flex: "1 1 260px", border: `1px solid ${LT.rule}`, padding: "10px 14px" }}>
+            <div style={{ fontSize: 11, fontWeight: 700, marginBottom: 8 }}>Seismic</div>
+            <table style={{ fontSize: 12, width: "100%" }}><tbody>
+              <tr><td>V<sub>SEISMIC</sub> (lbs·R)</td><td style={{ textAlign: "right" }}><LtNumInput value={g.vSeismic} onChange={(v) => setGl("vSeismic", v)} /></td></tr>
+              <tr><td>S<sub>DS</sub></td><td style={{ textAlign: "right" }}><LtNumInput value={g.sds} onChange={(v) => setGl("sds", v)} step={0.05} /></td></tr>
+              <tr><td>R</td><td style={{ textAlign: "right", fontFamily: MONO }}>{g.R}</td></tr>
+              <tr><td style={{ paddingTop: 6 }}>E = 0.70 · V / R</td><td style={{ textAlign: "right", fontFamily: MONO, fontWeight: 700, paddingTop: 6 }}>{fmt(E_seis, 2)} lbs</td></tr>
+            </tbody></table>
+          </div>
+          <div style={{ flex: "1 1 260px", border: `1px solid ${LT.rule}`, padding: "10px 14px" }}>
+            <div style={{ fontSize: 11, fontWeight: 700, marginBottom: 8 }}>Wind</div>
+            <table style={{ fontSize: 12, width: "100%" }}><tbody>
+              <tr><td>W<sub>WIND</sub> (lbs)</td><td style={{ textAlign: "right" }}><LtNumInput value={g.wWind} onChange={(v) => setGl("wWind", v)} /></td></tr>
+              <tr><td style={{ paddingTop: 6 }}>{g.code >= 3 ? "F = 0.60 · W" : "F = W"}</td><td style={{ textAlign: "right", fontFamily: MONO, fontWeight: 700, paddingTop: 6 }}>{fmt(F_wind)} lbs</td></tr>
+            </tbody></table>
+          </div>
+          <div style={{ flex: "1 1 260px", border: `1px solid ${LT.rule}`, padding: "10px 14px" }}>
+            <div style={{ fontSize: 11, fontWeight: 700, marginBottom: 8 }}>Dead loads</div>
+            <table style={{ fontSize: 12, width: "100%" }}><tbody>
+              <tr><td>Roof DL (psf)</td><td style={{ textAlign: "right" }}><LtNumInput value={g.roofDL} onChange={(v) => setGl("roofDL", v)} /></td></tr>
+              <tr><td>Floor DL (psf)</td><td style={{ textAlign: "right" }}><LtNumInput value={g.floorDL} onChange={(v) => setGl("floorDL", v)} /></td></tr>
+              <tr><td>Wall self (psf)</td><td style={{ textAlign: "right" }}><LtNumInput value={g.wallDL} onChange={(v) => setGl("wallDL", v)} /></td></tr>
+            </tbody></table>
+          </div>
+          <div style={{ flex: "1 1 260px", border: `1px solid ${LT.rule}`, padding: "10px 14px" }}>
+            <div style={{ fontSize: 11, fontWeight: 700, marginBottom: 8 }}>Sheathing</div>
+            <table style={{ fontSize: 12, width: "100%" }}><tbody>
+              <tr><td>Grade</td><td style={{ textAlign: "right" }}>
+                <select value={g.grade === "str1" ? "str1" : "rated"} onChange={(e) => setGl("grade", e.target.value)} style={ltSel}>
+                  <option value="rated">1/2&Prime; rated sheathing</option>
+                  <option value="str1">1/2&Prime; Structural I</option>
+                </select>
+              </td></tr>
+              <tr><td style={{ paddingTop: 6 }}>Type 1/2/3 wind (plf)</td><td style={{ textAlign: "right", fontFamily: MONO, paddingTop: 6 }}>{schedFor(g.grade).map((t) => t.wind).join(" / ")}</td></tr>
+              <tr><td>Type 1/2/3 seismic (plf)</td><td style={{ textAlign: "right", fontFamily: MONO }}>{schedFor(g.grade).map((t) => t.seismic).join(" / ")}</td></tr>
+            </tbody></table>
+          </div>
+        </div>
+      </LtCollapse>
+
+      <LtCollapse title={`Wall line elevation — total length ${fmt(totalL, 1)} ft`}>
+        <LtElevation segments={segments} results={results} />
+        <div style={{ fontSize: 10, color: LT.faint, marginTop: 4 }}>Click a wall to highlight its column in every table below.</div>
+      </LtCollapse>
+
+      <LtCollapse title="Wall segments — inputs">
+        <div className="sw-scroll">
+          <table className="sw-table">
+            <LtSegHeader segments={segments} />
+            <tbody>
+              {[
+                ["length", "Length", "ft", 0.5],
+                ["height", "Height", "ft", 0.5],
+                ["roofTrib", "Roof trib.", "ft", 0.5],
+                ["floorTrib", "Floor trib.", "ft", 0.5],
+                ["hdDist", "HD dist. to end of wall", "in", 0.5],
+              ].map(([key, label, unit, step]) => (
+                <tr key={key} style={{ borderBottom: `1px solid ${LT.rule}` }}>
+                  <td style={{ padding: "5px 10px", fontSize: 12, whiteSpace: "nowrap" }}>{label} <span style={{ color: LT.faint, fontSize: 11 }}>({unit})</span></td>
+                  {segments.map((s, i) => (
+                    <td key={i} style={{ padding: "4px 8px", textAlign: "right" }}>
+                      <LtNumInput value={s[key]} onChange={(v) => setSeg(i, key, v)} step={step} width={58} />
+                    </td>
+                  ))}
+                </tr>
+              ))}
+              <tr style={{ borderBottom: `1px solid ${LT.rule}` }}>
+                <td style={{ padding: "5px 10px", fontSize: 12 }}>Wall thickness <span style={{ color: LT.faint, fontSize: 11 }}>(in)</span></td>
+                {segments.map((s, i) => (
+                  <td key={i} style={{ padding: "4px 8px", textAlign: "right" }}>
+                    <select value={s.thickness} onChange={(e) => setSeg(i, "thickness", +e.target.value)} style={ltSel}>
+                      <option value={3.5}>3.5</option><option value={5.5}>5.5</option><option value={7.25}>7.25</option>
+                    </select>
+                  </td>
+                ))}
+              </tr>
+              <tr style={{ borderBottom: `1px solid ${LT.rule}` }}>
+                <td style={{ padding: "5px 10px", fontSize: 12 }}>Anchored into</td>
+                {segments.map((s, i) => (
+                  <td key={i} style={{ padding: "4px 8px", textAlign: "right" }}>
+                    <select value={s.anchor} onChange={(e) => setSeg(i, "anchor", e.target.value)} style={ltSel}>
+                      <option>Concrete</option><option>Masonry</option><option>Wood</option>
+                    </select>
+                  </td>
+                ))}
+              </tr>
+              <tr style={{ borderBottom: `1px solid ${LT.rule}` }}>
+                <td style={{ padding: "5px 10px", fontSize: 12 }}>Selected shearwall type</td>
+                {segments.map((s, i) => (
+                  <td key={i} style={{ padding: "4px 8px", textAlign: "right" }}>
+                    <select value={s.selType} onChange={(e) => setSeg(i, "selType", +e.target.value)} style={ltSel}>
+                      <option value={1}>1</option><option value={2}>2</option><option value={3}>3</option>
+                    </select>
+                  </td>
+                ))}
+              </tr>
+              <LtRow label="Aspect ratio h/L" tip="SW Calc!E22 — NG! if h/L > 3.5" cells={results} render={(r) => <LtChip v={r.aspectNG ? "NG!" : r.aspect} d={2} />} />
+            </tbody>
+          </table>
+        </div>
+      </LtCollapse>
+
+      <LtCollapse title="Demand / capacity summary" badge={failBadge(anyFail.shear || anyFail.post || anyFail.hd)}>
+        <div className="sw-scroll">
+          <table className="sw-table">
+            <LtSegHeader segments={segments} />
+            <tbody>
+              <LtRow label="Wind shear D/C" tip="vW ÷ schedule wind allowable at the selected type" cells={results} render={(r) => <LtUtilBar ratio={r.utilW} />} />
+              <LtRow label="Seismic shear D/C" tip="vS ÷ (2w/l factor × schedule seismic allowable at the selected type)" cells={results} render={(r) => <LtUtilBar ratio={r.utilS} />} />
+              <LtRow label="End post D/C" tip="max compression ÷ NDS capacity of the recommended post" cells={results} render={(r) => <LtUtilBar ratio={r.utilPost} />} />
+              <LtRow label="Holdown D/C" tip="max uplift ÷ capacity of the recommended HDU" cells={results} render={(r) => (r.maxUplift === 0 ? <LtChip v="—" /> : <LtUtilBar ratio={r.utilHD} />)} />
+              <LtRow label="Verdict" cells={results} render={(r) => <LtChip v={r.pass ? "OK" : "FAILED!!!"} />} />
+            </tbody>
+          </table>
+        </div>
+        <div style={{ fontSize: 10, color: LT.faint, marginTop: 4 }}>Bar fills toward the 100% marker. Green &lt; 85% · amber 85–100% · hatched red &gt; 100% (▲ over capacity).</div>
+      </LtCollapse>
+
+      <LtCollapse title="Seismic design" badge={failBadge(results.some((r) => r.active && r.sugS === "FAILED!!!"))} defaultOpen={false}>
+        <div className="sw-scroll">
+          <table className="sw-table">
+            <LtSegHeader segments={segments} />
+            <tbody>
+              <LtRow label="F" unit="lbs" tip="E23: F = E · L / ΣL" cells={results} render={(r) => <LtChip v={r.Fs} d={2} />} />
+              <LtRow label="Shear v" unit="plf" tip="E24: v = F / L" cells={results} render={(r) => <LtChip v={r.vS} d={2} />} />
+              <LtRow label="Seismic factor 2w/l" tip="E25: aspect ≥ 2 → 2L/h, else 1" cells={results} render={(r) => <LtChip v={r.factor} d={2} />} />
+              <LtRow label="Allowable shear" unit="plf" tip="E26" cells={results} render={(r) => <LtChip v={r.allowS} d={1} />} />
+              <LtRow label="Suggested shearwall #" tip="E27" cells={results} render={(r) => <LtChip v={r.sugS} />} />
+              <LtRow label="Mot" unit="ft·lbs" tip="E28: Mot = F · h" cells={results} render={(r) => <LtChip v={r.MotS} d={0} />} />
+              <LtRow label="DL factor A = 1+0.14·SDS" tip="E29" cells={results} render={(r) => <LtChip v={r.A} d={2} />} />
+              <LtRow label="A × wDL" unit="plf" tip="E30" cells={results} render={(r) => <LtChip v={r.AwDL} d={1} />} />
+              <LtRow label="End post compression" unit="lbs" tip="E31" cells={results} render={(r) => <LtChip v={r.compS} d={0} />} />
+              <LtRow label="DL factor B = 0.6−0.14·SDS" tip="E32" cells={results} render={(r) => <LtChip v={r.B} d={2} />} />
+              <LtRow label="End post uplift, HDs" unit="lbs" tip="E34 — < 625 lbs → neglect" cells={results} render={(r) => <LtChip v={r.upHD_S} d={0} />} />
+              <LtRow label="End post uplift, straps" unit="lbs" tip="E35" cells={results} render={(r) => <LtChip v={r.upStrap_S} d={0} />} />
+            </tbody>
+          </table>
+        </div>
+      </LtCollapse>
+
+      <LtCollapse title="Wind design" badge={failBadge(results.some((r) => r.active && r.sugW === "FAILED!!!"))} defaultOpen={false}>
+        <div className="sw-scroll">
+          <table className="sw-table">
+            <LtSegHeader segments={segments} />
+            <tbody>
+              <LtRow label="F" unit="lbs" tip="E37: F = Fwind · L / ΣL" cells={results} render={(r) => <LtChip v={r.Fw} d={0} />} />
+              <LtRow label="Shear v" unit="plf" tip="E38" cells={results} render={(r) => <LtChip v={r.vW} d={1} />} />
+              <LtRow label="Suggested shearwall #" tip="E39" cells={results} render={(r) => <LtChip v={r.sugW} />} />
+              <LtRow label="Mot" unit="ft·lbs" tip="E40" cells={results} render={(r) => <LtChip v={r.MotW} d={0} />} />
+              <LtRow label="wDL" unit="plf" tip="E41" cells={results} render={(r) => <LtChip v={r.wdl} d={1} />} />
+              <LtRow label="End post compression" unit="lbs" tip="E42 (source-sheet denominator replicated verbatim)" cells={results} render={(r) => <LtChip v={r.compW} d={0} />} />
+              <LtRow label="End post uplift, HDs" unit="lbs" tip="E45" cells={results} render={(r) => <LtChip v={r.upHD_W} d={0} />} />
+              <LtRow label="End post uplift, straps" unit="lbs" tip="E46" cells={results} render={(r) => <LtChip v={r.upStrap_W} d={0} />} />
+            </tbody>
+          </table>
+        </div>
+      </LtCollapse>
+
+      <LtCollapse title="End posts & holdowns" badge={failBadge(anyFail.post || anyFail.hd)}>
+        <div className="sw-scroll">
+          <table className="sw-table">
+            <LtSegHeader segments={segments} />
+            <tbody>
+              <LtRow label="Max end post compression" unit="lbs" tip="E47" cells={results} render={(r) => <LtChip v={r.maxComp} d={0} />} />
+              <LtRow label="Recommended minimum end post" tip="E48 — vs NDS column capacities" cells={results} render={(r) => <LtChip v={r.post} />} />
+              <LtRow label="Max holdown uplift" unit="lbs" tip="E49" cells={results} render={(r) => <LtChip v={r.maxUplift === 0 ? "—" : r.maxUplift} d={0} />} />
+              <LtRow label="Recommended HD holdown" tip="E50 — Simpson HDU; doubled when anchored to wood" cells={results} render={(r) => <LtChip v={r.hd} />} />
+              <LtRow label="Anchored with" tip="E51/E52" cells={results} render={(r) => (
+                <span style={{ fontFamily: MONO, fontSize: 12 }}>
+                  {r.anchorSel === "None" ? <LtChip v="None" /> : <>
+                    <LtChip v={r.anchorSel} />
+                    <div style={{ fontSize: 10, color: LT.faint }}>{isNum(r.embed) ? `${r.embed}″ embed` : r.embed}</div>
+                  </>}
+                </span>
+              )} />
+              <LtRow label="If anchored at end of FDN wall" tip="E53/E54" cells={results} render={(r) => (
+                <span style={{ fontFamily: MONO, fontSize: 12 }}>
+                  {r.anchorEnd === "None" ? <LtChip v="None" /> : <>
+                    <LtChip v={r.anchorEnd} />
+                    <div style={{ fontSize: 10, color: LT.faint }}>{isNum(r.embedEnd) ? `${r.embedEnd}″ embed` : r.embedEnd}</div>
+                  </>}
+                </span>
+              )} />
+              <LtRow label="Max strap uplift" unit="lbs" tip="E55" cells={results} render={(r) => <LtChip v={r.maxStrap === 0 ? "—" : r.maxStrap} d={0} />} />
+              <LtRow label="Alternate strap holdown" tip="E56" cells={results} render={(r) => <LtChip v={r.altStrap} />} />
+              <LtRow label="Strap at FDN corner / end" tip="E57" cells={results} render={(r) => <LtChip v={r.strapCorner} />} />
+            </tbody>
+          </table>
+        </div>
+      </LtCollapse>
+
+      <LtCollapse title="Deflection & type check">
+        <div className="sw-scroll">
+          <table className="sw-table">
+            <LtSegHeader segments={segments} />
+            <tbody>
+              <LtRow label="Δ seismic" unit="in" tip="Q2: bending + nail slip (Ga) + rotation terms" cells={results} render={(r) => <LtChip v={isFinite(r.deflS) ? r.deflS : "—"} d={3} />} />
+              <LtRow label="Δ wind" unit="in" tip="Q3" cells={results} render={(r) => <LtChip v={isFinite(r.deflW) ? r.deflW : "—"} d={3} />} />
+              <LtRow label="Selected type vs. required" tip="E59" cells={results} render={(r) => <LtChip v={r.status} />} />
+            </tbody>
+          </table>
+        </div>
+      </LtCollapse>
+
+      <LtCollapse title="Holdown footing estimate" defaultOpen={false}>
+        <div className="sw-scroll">
+          <table className="sw-table">
+            <LtSegHeader segments={segments} />
+            <tbody>
+              <tr style={{ borderBottom: `1px solid ${LT.rule}` }}>
+                <td style={{ padding: "5px 10px", fontSize: 12 }}>Footing width <span style={{ color: LT.faint, fontSize: 11 }}>(ft)</span></td>
+                {segments.map((s, i) => (
+                  <td key={i} style={{ padding: "4px 8px", textAlign: "right" }}>
+                    <LtNumInput value={s.ftgWidth} onChange={(v) => setSeg(i, "ftgWidth", v)} step={0.01} width={58} />
+                  </td>
+                ))}
+              </tr>
+              <tr style={{ borderBottom: `1px solid ${LT.rule}` }}>
+                <td style={{ padding: "5px 10px", fontSize: 12 }}>Footing thickness <span style={{ color: LT.faint, fontSize: 11 }}>(in)</span></td>
+                {segments.map((s, i) => (
+                  <td key={i} style={{ padding: "4px 8px", textAlign: "right" }}>
+                    <LtNumInput value={s.ftgThick} onChange={(v) => setSeg(i, "ftgThick", v)} step={1} width={58} />
+                  </td>
+                ))}
+              </tr>
+              <LtRow label="Lmin, seismic" unit="ft" tip="E69 — quadratic bearing solve" cells={results} render={(r) => <LtChip v={isFinite(r.LminS) ? r.LminS : "—"} d={2} />} />
+              <LtRow label="Lmin, wind" unit="ft" tip="E74" cells={results} render={(r) => <LtChip v={isFinite(r.LminW) ? r.LminW : "—"} d={2} />} />
+              <LtRow label="Required footing length" unit="ft" tip="E62 = max(L+1, Lmin seismic, Lmin wind)" cells={results} render={(r) => <LtChip v={isFinite(r.reqFtgLen) ? r.reqFtgLen : "—"} d={2} />} />
+            </tbody>
+          </table>
+        </div>
+      </LtCollapse>
+
+      <LtCollapse title="Shearwall schedule (reference)" defaultOpen={false}>
+        <div className="sw-scroll">
+          <table className="sw-table" style={{ fontSize: 11 }}>
+            <thead>
+              <tr style={{ borderBottom: `1.5px solid ${LT.ink}`, textAlign: "left" }}>
+                {["MARK", "SHEATHING", "EDGE NAILING", "FIELD NAILING", "BOTTOM PLATE — CONCRETE", "BOTTOM PLATE — WOOD", "WIND (plf)", "SEISMIC (plf)", "Ga"].map((h) => (
+                  <th key={h} style={{ padding: "4px 8px", fontSize: 10, letterSpacing: "0.06em" }}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {schedFor(g.grade).map((t) => (
+                <tr key={t.mark} style={{ borderBottom: `1px solid ${LT.rule}` }}>
+                  <td style={{ padding: "5px 8px", fontFamily: MONO, fontWeight: 700, color: LT.blue }}>{t.mark}</td>
+                  <td style={{ padding: "5px 8px" }}>{t.sheathing}</td>
+                  <td style={{ padding: "5px 8px" }}>{t.edge}</td>
+                  <td style={{ padding: "5px 8px" }}>{t.field}</td>
+                  <td style={{ padding: "5px 8px" }}>{t.concrete}</td>
+                  <td style={{ padding: "5px 8px" }}>{t.wood}</td>
+                  <td style={{ padding: "5px 8px", fontFamily: MONO, textAlign: "right" }}>{t.wind}</td>
+                  <td style={{ padding: "5px 8px", fontFamily: MONO, textAlign: "right" }}>{t.seismic}</td>
+                  <td style={{ padding: "5px 8px", fontFamily: MONO, textAlign: "right" }}>{t.ga.toFixed(1)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </LtCollapse>
+    </div>
+  );
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   DESIGN TAB — plan view fed by the Plan Sketcher
+   Each point-load wall becomes a shear-wall LINE carrying its reaction
+   (lbs) and wall height. Optimize fills every line; walls drag along
+   their line with live recalc; right-click a wall to override holdown,
+   edge nailing (type), or end post.
+   ════════════════════════════════════════════════════════════════════════ */
+
+// override validation against the engine's own capacities
+const postAllowable = (r, t, name) => {
+  const P = r.Pa;
+  if (t <= 4) return name==="(2) 2x4" ? P.Pa224 : name==="4x4" ? P.Pa44 : name==="4x6" ? (P.Pa46*3.5)/5.5 : 0;
+  return name==="(2) 2x6" ? P.Pa226 : name==="4x6" ? P.Pa46 : name==="6x6" ? P.Pa66 : name==="6x8" ? P.Pa68 : 0;
+};
+const hdCapacity = (name) => { const m = HD_TABLE.find(h => name.endsWith(h.name)); return m ? m.cap : 0; };
+
+// evaluate one line's segments through the engine (auto type unless overridden)
+function lineResults(line, segs, g, d) {
+  const gL = { ...g, wWind: line.forceLbs };
+  const totalL = segs.reduce((a, s) => a + s.length, 0);
+  return segs.map((s) => {
+    const base = { ...baseDesignSeg({ ...d, height: line.heightFt }), length: s.length };
+    const r1 = calcSegment({ ...base, selType: 1 }, gL, totalL);
+    let autoType = 1;
+    if (r1.active && isNum(r1.sugS) && isNum(r1.sugW)) autoType = Math.max(r1.sugS, r1.sugW);
+    const selType = s.ov && s.ov.type ? s.ov.type : Math.min(autoType, 3);
+    const r = calcSegment({ ...base, selType }, gL, totalL);
+    const ovBad = {
+      type: s.ov && s.ov.type ? r.status !== "OK" : false,
+      hd:   s.ov && s.ov.hd ? (s.ov.hd === "None" ? r.maxUplift !== 0 : r.maxUplift >= hdCapacity(s.ov.hd)) : false,
+      post: s.ov && s.ov.post ? r.maxComp > postAllowable(r, d.thickness, s.ov.post) : false,
+    };
+    const dispHd   = s.ov && s.ov.hd   ? s.ov.hd   : r.hd;
+    const dispPost = s.ov && s.ov.post ? s.ov.post : r.post;
+    const failed = !r.active || r.status !== "OK" || r.aspectNG || r.post === "NG!" || r.hd === "NG!" || ovBad.type || ovBad.hd || ovBad.post;
+    return { ...r, autoType: r1.active && (r1.sugS === "FAILED!!!" || r1.sugW === "FAILED!!!") ? "FAILED!!!" : r1.aspectNG ? "NG!" : autoType,
+             selType, dispHd, dispPost, ovBad, failed };
+  });
+}
+
+// ── Two-story vertical stacking (rev 27 / Step 6) ────────────────────────────
+// At the 1st-floor base the overturning is ARM-AWARE: the roof reaction sits a
+// full upper story higher, so its moment arm is H₁+H₂, not H₁. Because Step 5
+// already handed each floor the correct force AND design height, the arm-aware
+// base moment is exactly the SUM of the two floors' engine overturning moments
+// for the same vertically-aligned segment:  M_base = Mot(1st) + Mot(2nd).
+//   e.g. roof 5k @ 20ft + 2nd-floor 6k @ 10ft over a 10ft wall →
+//        (5·20 + 6·10)/10 = 16k  (NOT a flat (5+6)=11k).
+// End post + holdown are re-derived from that combined moment using the engine's
+// OWN formula shapes — calcSegment / lineResults are never touched (the withUtil
+// pattern). Shear capacity (status/selType/v) is unaffected: stacking changes
+// only overturning, and the shear was already carried by Step 5's combined load.
+// Step 7 (rev 28): the secondary detailing — anchor, embedment, strap, deflection
+// and footing — is now ALSO re-derived from the stacked demand, by mirroring
+// calcSegment's anchorFor / embedFor / strapFor / defl / footing formula shapes
+// here (the engine's 7 guarded fns stay byte-identical). Deflection's shear v is
+// unchanged (the 1st-floor story shear was already carried by Step 5's combined
+// load); only its chord (bending) term uses the STACKED end post, so a stacked
+// wall with a bigger required chord reports a smaller in-plane Δ — the as-built
+// behavior. Footing uses the stacked moments/uplifts with the 1st-floor's own
+// dead load + base shear (same dead-load convention Step 6 set, kept for parity).
+const upliftStk = (Mot, w, L, denomIn) => {            // mirror of calcSegment's local upliftFn
+  const u = (Mot - w*L*(L/2 - 1.5/12)) / (L - denomIn/12);
+  return u < 0 ? 0 : u < 625 ? "neglect" : u;
+};
+function stackSeg(r1, r2, L, g, d, h) {
+  if (!r1 || !r1.active || !r2 || !r2.active) return r1;   // top-floor / inactive → no stacking
+  const sp = g.species === 1, SCHED = schedFor(g.grade);
+  const anchor = d.anchor, hdDist = d.hdDist, thickness = d.thickness, ftgW = d.ftgWidth, ftgT = d.ftgThick;
+  const isWood = anchor === "Wood";
+  // ── ARM-AWARE combined overturning (= sum of the two floors' engine moments) ──
+  const MotW = r1.MotW + r2.MotW;                          // arm-aware combined wind moment @ 1st-floor base
+  const MotS = r1.MotS + r2.MotS;                          // …and seismic
+  const minL = Math.min(3, L/2);
+  const compW = (MotW + r1.wdl  * L * minL) / (L - (1.5 + hdDist/12) / 12);  // E42 quirk preserved
+  const compS = (MotS + r1.AwDL * L * minL) / (L - (1.5 + hdDist)   / 12);
+  const upHD_W = upliftStk(MotW, r1.CwDL, L, 1.5 + hdDist);
+  const upHD_S = upliftStk(MotS, r1.BwDL, L, 1.5 + hdDist);
+  const upStrap_W = upliftStk(MotW, r1.CwDL, L, 3);        // E56/E57 strap uplift: denominator is 3", not 1.5+hdDist
+  const upStrap_S = upliftStk(MotS, r1.BwDL, L, 3);
+  const maxComp   = xMax(compS, compW);
+  const maxUplift = xMax(upHD_S, upHD_W);
+  const maxStrap  = xMax(upStrap_S, upStrap_W);
+  // ── End post (engine's own ladder, same Pa as the 1st-floor segment) ──
+  const P = r1.Pa;
+  const post = thickness <= 4
+    ? maxComp <= P.Pa224 ? "(2) 2x4" : maxComp <= P.Pa44 ? "4x4" : maxComp <= (P.Pa46*3.5)/5.5 ? "4x6" : "NG!"
+    : maxComp <= P.Pa226 ? "(2) 2x6" : maxComp <= P.Pa46 ? "4x6" : maxComp <= P.Pa66 ? "6x6" : maxComp <= P.Pa68 ? "6x8" : "NG!";
+  // ── Holdown (HD_TABLE lookup on the stacked uplift) ──
+  let hd;
+  if (maxUplift === 0) hd = "None";
+  else { const found = HD_TABLE.find((x) => maxUplift < x.cap); hd = found ? (isWood ? `(2) ${found.name}` : found.name) : "NG!"; }
+  // ── Anchor + embedment (mirror of calcSegment.anchorFor / embedFor on the stacked hd/uplift) ──
+  const anchorFor = (variant) => {
+    if (maxUplift === 0 || hd === "None") return "None";
+    if (anchor === "Concrete") {
+      if (hd === "HDU2") return maxUplift < 4780 ? "SSTB16" : "5/8'' A.B.";
+      if (hd === "HDU4") return maxUplift < 4780 ? "SSTB16" : "5/8'' A.B.";
+      if (hd === "HDU5") return maxUplift < 5175 ? "SSTB24" : "5/8'' A.B.";
+      if (hd === "HDU8") return maxUplift < 10100 ? "SSTB28" : "7/8'' A.B.";
+      return "1'' A.B.";
+    }
+    if (anchor === "Masonry") {
+      const lim = variant === "interior" ? { a:4780, b:4780, c:6385 } : { a:1850, b:1850, c:4815 };
+      if (hd === "HDU2" || hd === "HDU4") return maxUplift < lim.a ? "SSTB16" : "5/8'' A.B.";
+      if (hd === "HDU5") return maxUplift < lim.b ? "SSTB24" : "5/8'' A.B.";
+      if (hd === "HDU8") return maxUplift < lim.c ? "SSTB28" : "7/8'' A.B.";
+      return "1'' A.B.";
+    }
+    if (["(2) HDU2", "(2) HDU4", "(2) HDU5"].includes(hd)) return "5/8'' Rod";
+    if (hd === "(2) HDU8") return "7/8'' Rod";
+    if (hd === "(2) HHDQ11" || hd === "(2) HHDQ14") return "1'' Rod";
+    return "NG!!";
+  };
+  const anchorSel = anchorFor("interior");
+  const anchorEnd = anchor === "Masonry" ? anchorFor("end") : anchorFor("interior");
+  const embedFor = (anchorName, atEnd) => {
+    if (anchorName === "None") return "None";
+    if (["SSTB16","SSTB24","SSTB28"].includes(anchorName)) return "Simpson";
+    if (anchor === "Concrete") return Math.max(16, Math.floor(maxUplift / (atEnd ? 876 : 1752) + 5));
+    if (anchor === "Masonry") return Math.max(16, Math.floor(maxUplift / (atEnd ? 254 : 508) + 5));
+    return "Threaded";
+  };
+  const embed = embedFor(anchorSel, false);
+  const embedEnd = embedFor(anchorEnd, true);
+  // ── Straps (mirror of calcSegment.strapFor on the stacked maxStrap/uplift) ──
+  const strapFor = (lims) => {
+    if (maxUplift === 0) return "None";
+    if (anchor === "Concrete") { for (const [lim, name] of lims) if (maxStrap < lim) return name; return "None"; }
+    if (anchor === "Wood") {
+      const woodLims = [[2010,"MST37"],[3105,"MST48"],[4800,"MST60"],[5660,"MSTC78"],[9235,"CMST12"]];
+      for (const [lim, name] of woodLims) if (maxStrap < lim) return name; return "None";
+    }
+    return "None";
+  };
+  const altStrap = strapFor([[3195,"STHD8"],[3730,"STHD10"],[5785,"STHD14"]]);
+  const strapCorner = strapFor([[2370,"STHD8"],[3730,"STHD10"],[5025,"STHD14"]]);
+  // ── Deflection (engine's defl shape; shear v unchanged, chord uses the STACKED post) ──
+  const Epost = ["(2) 2x4","4x4","(2) 2x6","4x6"].includes(post) ? (sp ? 1400000 : 1600000) : (sp ? 1500000 : 1300000);
+  const Apost = post === "(2) 2x4" ? 10.5 : post === "4x4" ? 12.25 : post === "(2) 2x6" ? 16.5 : post === "4x6" ? 19.25 : post === "6x6" ? 30.25 : 39.875;
+  const Ga = r1.selType === 1 ? SCHED[0].ga : r1.selType === 2 ? SCHED[1].ga : SCHED[2].ga;
+  const defl = (v) => (8*(v/0.7)*Math.pow(h,3))/(Epost*Apost*L) + ((v/0.7)*h)/(1000*Ga) + (h/L)*0.125;
+  const deflS = defl(r1.vS);
+  const deflW = defl(r1.vW);
+  // ── Footing (engine's quad; stacked moments + uplifts, 1st-floor dead load + base shear) ──
+  const quad = (qa, qb, qc) => { const disc = qb*qb - 4*qa*qc; if (disc < 0 || qa === 0) return NaN; return (-qb + Math.sqrt(disc)) / (2*qa); };
+  const aF = (Math.min(0.6, r1.B) * 150 * ftgW * ftgT) / 24;
+  const P65 = (MotS + r1.BwDL*L*(L/2 - hdDist/12)) / (L - (1.5 + hdDist)/12);
+  const uS = numOr0(upHD_S);
+  const LminS = quad(aF, (P65-uS)/2, uS*(hdDist/12 - L/2) + P65*(1.5/12 - L/2) - (r1.Fs*ftgT)/12);
+  const P70 = (MotW + r1.CwDL*L*(L/2 - hdDist/12)) / (L - (1.5 + hdDist/12)/12);
+  const uW = numOr0(upHD_W);
+  const LminW = quad(aF, (P70-uW)/2, uW*(hdDist/12 - L/2) + P70*(1.5/12 - L/2) - (r1.Fw*ftgT)/12);
+  const reqFtgLen = xMax(L + 1, LminS, LminW);
+  return { ...r1, MotW, MotS, compW, compS, upHD_W, upHD_S, upStrap_W, upStrap_S,
+           maxComp, maxUplift, maxStrap, post, hd,
+           anchorSel, anchorEnd, embed, embedEnd, altStrap, strapCorner,
+           deflS, deflW, LminS, LminW, reqFtgLen, stacked:true };
+}
+// Stacks a 1st-floor line onto its vertically-aligned 2nd-floor line (same id, shared segments),
+// then re-derives override validation + display + pass/fail from the stacked numbers.
+function stackedLineResults(line1, line2, segs, g, d) {
+  const r1arr = lineResults(line1, segs, g, d);
+  const r2arr = lineResults(line2, segs, g, d);
+  return r1arr.map((r1, i) => {
+    const stk = stackSeg(r1, r2arr[i], segs[i].length, g, d, line1.heightFt);
+    const s = segs[i];
+    const ovBad = {
+      type: s.ov && s.ov.type ? stk.status !== "OK" : false,   // shear unaffected by stacking
+      hd:   s.ov && s.ov.hd ? (s.ov.hd === "None" ? stk.maxUplift !== 0 : stk.maxUplift >= hdCapacity(s.ov.hd)) : false,
+      post: s.ov && s.ov.post ? stk.maxComp > postAllowable(stk, d.thickness, s.ov.post) : false,
+    };
+    const dispHd   = s.ov && s.ov.hd   ? s.ov.hd   : stk.hd;
+    const dispPost = s.ov && s.ov.post ? s.ov.post : stk.post;
+    const failed = !stk.active || stk.status !== "OK" || stk.aspectNG || stk.post === "NG!" || stk.hd === "NG!" || ovBad.type || ovBad.hd || ovBad.post;
+    return { ...stk, dispHd, dispPost, ovBad, failed };
+  });
+}
+
+// Shearwall schedule reference table — shown at the bottom of the Design tab
+// (same data as the Calculation Sheet's reference section)
+function SwScheduleRef({ grade }) {
+  return (
+    <LtCollapse title="Shearwall schedule (reference)">
+      <div className="sw-scroll">
+        <table className="sw-table" style={{ fontSize:11 }}>
+          <thead>
+            <tr style={{ borderBottom:`1.5px solid ${LT.ink}`, textAlign:"left" }}>
+              {["MARK", "SHEATHING", "EDGE NAILING", "FIELD NAILING", "BOTTOM PLATE — CONCRETE", "BOTTOM PLATE — WOOD", "WIND (plf)", "SEISMIC (plf)", "Ga"].map((h) => (
+                <th key={h} style={{ padding:"4px 8px", fontSize:10, letterSpacing:"0.06em" }}>{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {schedFor(grade).map((t) => (
+              <tr key={t.mark} style={{ borderBottom:`1px solid ${LT.rule}` }}>
+                <td style={{ padding:"5px 8px", fontFamily:MONO, fontWeight:700, color:LT.blue }}>{t.mark}</td>
+                <td style={{ padding:"5px 8px" }}>{t.sheathing}</td>
+                <td style={{ padding:"5px 8px" }}>{t.edge}</td>
+                <td style={{ padding:"5px 8px" }}>{t.field}</td>
+                <td style={{ padding:"5px 8px" }}>{t.concrete}</td>
+                <td style={{ padding:"5px 8px" }}>{t.wood}</td>
+                <td style={{ padding:"5px 8px", fontFamily:MONO, textAlign:"right" }}>{t.wind}</td>
+                <td style={{ padding:"5px 8px", fontFamily:MONO, textAlign:"right" }}>{t.seismic}</td>
+                <td style={{ padding:"5px 8px", fontFamily:MONO, textAlign:"right" }}>{t.ga.toFixed(1)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div style={{ fontSize:10, color:LT.faint, marginTop:4 }}>"Type n" on the plan and in the results table refers to MARK n in this schedule.</div>
+    </LtCollapse>
+  );
+}
+
+// Wall mark letters: A..Z, AA, AB, … assigned in line order then segment order
+const letterOf = (k) => { let s = ""; k += 1; while (k > 0) { k -= 1; s = String.fromCharCode(65 + (k % 26)) + s; k = Math.floor(k / 26); } return s; };
+
+// ---------- the plan canvas ----------
+function DesignPlan({ shape, lines, segsByLine, setSegsByLine, resultsByLine, selLine, setSelLine, snap, maxSegLen, onCtx, marks, showTags }) {
+  const svgRef = useRef(null);
+  const dragRef = useRef(null);
+  // fit viewBox to footprint
+  const vb = useMemo(() => {
+    let x0=Infinity,y0=Infinity,x1=-Infinity,y1=-Infinity;
+    (shape&&shape.nodes||[]).forEach(p=>{ x0=Math.min(x0,p.x);y0=Math.min(y0,p.y);x1=Math.max(x1,p.x);y1=Math.max(y1,p.y); });
+    if(!(x1>x0)) { x0=0;y0=0;x1=100;y1=60; }
+    const m=14; return { x:x0-m, y:y0-m, w:(x1-x0)+2*m, h:(y1-y0)+2*m };
+  }, [shape]);
+  const S = Math.max(vb.w, vb.h) / 110;   // graphic scale (matches sketcher's S idiom)
+  const band = 1.2*S;                      // shear-wall band half-width (rev 13: halved — thin-band drafting symbol)
+
+  const lineGeom = (ln) => {
+    const ux=(ln.b.x-ln.a.x)/ln.lengthFt, uy=(ln.b.y-ln.a.y)/ln.lengthFt;     // along the line
+    const nx=-uy, ny=ux;                                                       // across the line
+    return { ux, uy, nx, ny };
+  };
+  const snapTo = (v) => Math.round(v / snap) * snap;
+  const toPlan = (e) => {
+    const r = svgRef.current.getBoundingClientRect();
+    return { x: vb.x + ((e.clientX - r.left)/r.width)*vb.w, y: vb.y + ((e.clientY - r.top)/r.height)*vb.h };
+  };
+
+  const onDown = (e, lineId, idx, mode) => {
+    if (e.button !== 0) return;
+    e.preventDefault(); e.stopPropagation();
+    e.currentTarget.setPointerCapture?.(e.pointerId);
+    setSelLine(lineId);
+    dragRef.current = { lineId, idx, mode, startPlan: toPlan(e), orig: { ...segsByLine[lineId][idx] } };
+  };
+  const onMove = (e) => {
+    const dr = dragRef.current; if (!dr || !svgRef.current) return;
+    const ln = lines.find(l => l.id === dr.lineId); if (!ln) return;
+    const { ux, uy } = lineGeom(ln);
+    const p = toPlan(e);
+    const dxFt = (p.x - dr.startPlan.x)*ux + (p.y - dr.startPlan.y)*uy;        // movement along the line
+    const segs = segsByLine[dr.lineId];
+    const { idx, mode, orig } = dr;
+    const prevEnd = idx > 0 ? segs[idx-1].start + segs[idx-1].length : 0;
+    const nextStart = idx < segs.length-1 ? segs[idx+1].start : ln.lengthFt;
+    let { start, length } = orig;
+    if (mode === "M") {
+      start = snapTo(Math.min(Math.max(orig.start + dxFt, prevEnd), nextStart - orig.length));
+    } else if (mode === "R") {
+      const end = snapTo(Math.min(Math.max(orig.start + orig.length + dxFt, orig.start + 1), Math.min(nextStart, orig.start + maxSegLen)));
+      length = end - orig.start;
+    } else if (mode === "L") {
+      const ns = snapTo(Math.min(Math.max(orig.start + dxFt, Math.max(prevEnd, orig.start + orig.length - maxSegLen)), orig.start + orig.length - 1));
+      start = ns; length = orig.start + orig.length - ns;
+    }
+    setSegsByLine(prev => ({ ...prev, [dr.lineId]: prev[dr.lineId].map((s, j) => j === idx ? { ...s, start, length } : s) }));
+  };
+  const onUp = () => { dragRef.current = null; };
+
+  return (
+    <svg ref={svgRef} viewBox={`${vb.x} ${vb.y} ${vb.w} ${vb.h}`}
+         style={{ width:"100%", display:"block", background:C_BG, border:`1px solid ${SW.rule}`, borderRadius:8,
+                  touchAction:"none", userSelect:"none", maxHeight:520 }}
+         onPointerMove={onMove} onPointerUp={onUp} onPointerLeave={onUp}
+         onContextMenu={(e)=>e.preventDefault()}>
+      {/* footprint walls — no nodes (design view, not an editor) */}
+      {(shape&&shape.edges||[]).map((ed,i)=>{
+        const a=shape.nodes.find(n=>n.id===ed.a), b=shape.nodes.find(n=>n.id===ed.b);
+        if(!a||!b) return null;
+        return <line key={i} x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke={SW.wall} strokeWidth={0.55*S} strokeLinecap="round" opacity="0.8"/>;
+      })}
+      {/* design lines + shear walls */}
+      {lines.map(ln=>{
+        const { ux, uy, nx, ny } = lineGeom(ln);
+        const segs = segsByLine[ln.id] || [];
+        const res  = resultsByLine[ln.id] || [];
+        const isSel = selLine === ln.id;
+        const at = (ft, off=0) => ({ x: ln.a.x + ux*ft + nx*off, y: ln.a.y + uy*ft + ny*off });
+        const vert = ln.o === "v";
+        return (
+          <g key={ln.id}>
+            {/* line highlight (click selects) — force/length shown in the chips below the plan */}
+            <line x1={ln.a.x} y1={ln.a.y} x2={ln.b.x} y2={ln.b.y}
+                  stroke={isSel ? SW.accent : SW.faint} strokeWidth={(isSel?0.5:0.3)*S}
+                  strokeDasharray={`${1.6*S} ${1.2*S}`} opacity={isSel?0.9:0.45}
+                  style={{cursor:"pointer"}} onClick={()=>setSelLine(ln.id)}/>
+            {/* shear-wall segments — distinct hatched band over the wall line */}
+            {segs.map((s,i)=>{
+              const r=res[i]||{};
+              const stroke = r.failed ? SW.red : SW.accent;
+              const fill   = r.failed ? SW.redSoft : SW.accentSoft;
+              const p0=at(s.start), p1=at(s.start+s.length);
+              const corners=[ at(s.start,-band), at(s.start+s.length,-band), at(s.start+s.length,band), at(s.start,band) ];
+              const mid = s.start + s.length/2;
+              const hdRaw = (r.dispHd && r.dispHd!=="None") ? String(r.dispHd) : null;   // holdown designation, e.g. "HDU4" / "(2) HDU4" / "NG!"
+              const hdNum = hdRaw ? (hdRaw.match(/HDU(\d+)/)?.[1] ?? "!") : null;         // the hold-down NUMBER shown in the dot bubble
+              const hatch=[]; const step=1.3*S;
+              for(let f=step; f<s.length; f+=step) hatch.push(f);
+              return (
+                <g key={i}
+                   onContextMenu={(e)=>{ e.preventDefault(); e.stopPropagation(); onCtx(e, ln.id, i); }}>
+                  {/* body — hatched band (color scheme preserved), drag to slide */}
+                  <polygon points={corners.map(c=>`${c.x},${c.y}`).join(" ")}
+                           fill={fill} stroke={stroke} strokeWidth={0.28*S}
+                           style={{cursor:"grab"}} onPointerDown={(e)=>onDown(e,ln.id,i,"M")}/>
+                  {hatch.map((f,k)=>{
+                    const h1=at(s.start+Math.max(0,f-step*0.7), band), h2=at(s.start+f, -band);
+                    return <line key={k} x1={h1.x} y1={h1.y} x2={h2.x} y2={h2.y} stroke={stroke} strokeWidth={0.12*S} opacity="0.5" pointerEvents="none"/>;
+                  })}
+                  {/* detail-bubble callout above wall center: ▽ holds the shear-wall TYPE, LENGTH is dimensioned above it */}
+                  {(()=>{
+                    const tipOff=band+1.3*S, triH=2.3*S, triHalf=1.35*S;
+                    const apex=at(mid,-tipOff), tl=at(mid-triHalf,-(tipOff+triH)), trr=at(mid+triHalf,-(tipOff+triH));
+                    const wallTop=at(mid,-band), typePt=at(mid,-(tipOff+triH*0.56)), lenPt=at(mid,-(tipOff+triH+1.05*S));
+                    const rot=(pt)=> vert?`rotate(-90,${pt.x},${pt.y})`:undefined;
+                    return (
+                      <g pointerEvents="none">
+                        <line x1={wallTop.x} y1={wallTop.y} x2={apex.x} y2={apex.y} stroke={stroke} strokeWidth={0.14*S}/>
+                        <polygon points={`${apex.x},${apex.y} ${tl.x},${tl.y} ${trr.x},${trr.y}`} fill={C_BG} stroke={stroke} strokeWidth={0.16*S}/>
+                        <text x={typePt.x} y={typePt.y} textAnchor="middle" dominantBaseline="central"
+                              fontSize={1.5*S} fontWeight="800" fill={stroke} fontFamily={MONO} transform={rot(typePt)}>
+                          {isNum(r.selType) ? r.selType : "—"}
+                        </text>
+                        <text x={lenPt.x} y={lenPt.y} textAnchor="middle" dominantBaseline="central"
+                              fontSize={1.15*S} fontWeight="600" fill={SW.ink} fontFamily={MONO} transform={rot(lenPt)}>
+                          {fmt(s.length,2)}′
+                        </text>
+                      </g>
+                    );
+                  })()}
+                  {/* end zones — boundary X-box + holdown dot bubble carrying the HD number (dot kept; now numbered) */}
+                  {[p0,p1].map((p,k)=>{
+                    const eb=band, rot = vert?`rotate(-90,${p.x},${p.y})`:undefined;
+                    return (
+                      <g key={k} pointerEvents="none">
+                        <rect x={p.x-eb} y={p.y-eb} width={2*eb} height={2*eb} fill={C_BG} stroke={stroke} strokeWidth={0.16*S}/>
+                        <line x1={p.x-eb} y1={p.y-eb} x2={p.x+eb} y2={p.y+eb} stroke={stroke} strokeWidth={0.14*S}/>
+                        <line x1={p.x-eb} y1={p.y+eb} x2={p.x+eb} y2={p.y-eb} stroke={stroke} strokeWidth={0.14*S}/>
+                        {hdNum && <>
+                          <circle cx={p.x} cy={p.y} r={0.92*S} fill={stroke} stroke={C_BG} strokeWidth={0.12*S}/>
+                          <text x={p.x} y={p.y} textAnchor="middle" dominantBaseline="central"
+                                fontSize={hdNum.length>1?0.92*S:1.15*S} fontWeight="700" fill={C_BG} fontFamily={MONO} transform={rot}>
+                            {hdNum}
+                          </text>
+                        </>}
+                      </g>
+                    );
+                  })}
+                  {/* end stretch handles — invisible hit area (the X-box is the visual) */}
+                  {[["L",p0],["R",p1]].map(([mode,p])=>(
+                    <circle key={mode} cx={p.x} cy={p.y} r={1.5*S} fill="transparent"
+                            style={{cursor:"ew-resize"}} onPointerDown={(e)=>onDown(e,ln.id,i,mode)}/>
+                  ))}
+                  {/* optional SW mark tag — gated by the "wall tags" toggle (off by default) */}
+                  {showTags && (()=>{ const tg=at(mid, band+1.5*S); return (
+                    <text x={tg.x} y={tg.y} textAnchor="middle" dominantBaseline="central"
+                          fontSize={1.2*S} fontWeight="700" fill={stroke} fontFamily={MONO} pointerEvents="none"
+                          transform={vert?`rotate(-90,${tg.x},${tg.y})`:undefined}>
+                      SW-{(marks && marks[ln.id + "|" + i]) || "?"}
+                    </text>
+                  );})()}
+                </g>
+              );
+            })}
+          </g>
+        );
+      })}
+      <text x={vb.x+2*S} y={vb.y+3*S} fontSize={1.4*S} fill={SW.faint} fontFamily={MONO}>
+        PLAN — drag wall to slide · drag ▭ handles to stretch · right-click to edit · click a line to select
+      </text>
+    </svg>
+  );
+}
+
+// ---------- right-click override menu for a shear wall ----------
+function SwCtxMenu({ ctx, lines, segsByLine, resultsByLine, setOv, onRemove, onClose, thickness }) {
+  if (!ctx) return null;
+  const segs = segsByLine[ctx.lineId]||[]; const s = segs[ctx.idx]; if (!s) return null;
+  const r = (resultsByLine[ctx.lineId]||[])[ctx.idx] || {};
+  const postOpts = thickness <= 4 ? ["(2) 2x4","4x4","4x6"] : ["(2) 2x6","4x6","6x6","6x8"];
+  const row = { display:"flex", justifyContent:"space-between", alignItems:"center", gap:10, padding:"4px 0", fontSize:12, color:SW.ink };
+  const badge = (bad) => bad ? <span style={{color:SW.red,fontWeight:700,fontSize:11}}>NG</span> : null;
+  return (
+    <div style={{ position:"fixed", left:ctx.px, top:ctx.py, zIndex:60, background:SW.panel, border:`1px solid ${SW.rule}`,
+                  borderRadius:8, padding:"10px 12px", minWidth:240, boxShadow:"0 12px 32px -8px rgba(28,39,51,0.28)" }}
+         onContextMenu={(e)=>e.preventDefault()}>
+      <div style={{ fontSize:11, fontWeight:700, letterSpacing:"0.1em", textTransform:"uppercase", color:SW.accent, marginBottom:6 }}>
+        Shear wall · {fmt(s.length,2)}′
+      </div>
+      <div style={row}>
+        <span>Edge nailing (type)</span>
+        <span style={{display:"flex",alignItems:"center",gap:6}}>
+          {badge(r.ovBad&&r.ovBad.type)}
+          <select style={selStyle} value={s.ov&&s.ov.type||0}
+                  onChange={(e)=>setOv(ctx.lineId,ctx.idx,"type",+e.target.value||null)}>
+            <option value={0}>Auto (T{isNum(r.autoType)?r.autoType:"—"})</option>
+            <option value={1}>T1 · 6″ o.c.</option><option value={2}>T2 · 4″ o.c.</option><option value={3}>T3 · 3″ o.c.</option>
+          </select>
+        </span>
+      </div>
+      <div style={row}>
+        <span>Holdown</span>
+        <span style={{display:"flex",alignItems:"center",gap:6}}>
+          {badge(r.ovBad&&r.ovBad.hd)}
+          <select style={selStyle} value={s.ov&&s.ov.hd||""}
+                  onChange={(e)=>setOv(ctx.lineId,ctx.idx,"hd",e.target.value||null)}>
+            <option value="">Auto ({r.hd||"—"})</option>
+            <option value="None">None</option>
+            {HD_TABLE.map(h=><option key={h.name} value={h.name}>{h.name} · {fmt(h.cap)} lbs</option>)}
+          </select>
+        </span>
+      </div>
+      <div style={row}>
+        <span>End post</span>
+        <span style={{display:"flex",alignItems:"center",gap:6}}>
+          {badge(r.ovBad&&r.ovBad.post)}
+          <select style={selStyle} value={s.ov&&s.ov.post||""}
+                  onChange={(e)=>setOv(ctx.lineId,ctx.idx,"post",e.target.value||null)}>
+            <option value="">Auto ({r.post||"—"})</option>
+            {postOpts.map(p=><option key={p} value={p}>{p}</option>)}
+          </select>
+        </span>
+      </div>
+      <div style={{ display:"flex", gap:8, marginTop:8 }}>
+        <button style={{...swBtn(false), padding:"5px 10px"}} onClick={()=>{ setOv(ctx.lineId,ctx.idx,null,null); }}>Reset to auto</button>
+        <button style={{...swBtn(false), padding:"5px 10px", color:SW.red, borderColor:SW.red}} onClick={()=>{ onRemove(ctx.lineId,ctx.idx); onClose(); }}>Remove wall</button>
+        <button style={{...swBtn(true), padding:"5px 10px", marginLeft:"auto"}} onClick={onClose}>Done</button>
+      </div>
+    </div>
+  );
+}
+
+// ---------- DESIGN TAB ----------
+function DesignTab({ g, setGl, shape, lines, linesByFloor, segsByLine, setSegsByLine, ovSet, d, setDk, applyToCalc, selLine, setSelLine, twoStory, activeFloor, setActiveFloor, stale, onRebuild }) {
+  const [ctx, setCtx] = useState(null);
+  const [genMsg, setGenMsg] = useState(null);
+  const [showTags, setShowTags] = useState(false);   // rev 13: SW marks no longer auto-show on the plan
+  useEffect(()=>{ if(lines.length && !lines.find(l=>l.id===selLine)) setSelLine(lines[0].id); },[lines]); // eslint-disable-line
+
+  const resultsByLine = useMemo(()=>{
+    const out={};
+    // 2-story mode, viewing the 1st floor: re-derive each line's end-post/holdown from the
+    // ARM-AWARE combined overturning of both stories (roof reaction acts at H₁+H₂). The
+    // matching 2nd-floor line shares this line's id (ax|key) and its segments (shared layout).
+    const upper = (twoStory && activeFloor===1 && linesByFloor && linesByFloor[2]) ? linesByFloor[2] : null;
+    lines.forEach(ln=>{
+      const segs = segsByLine[ln.id]||[];
+      const ln2 = upper && upper.find(L=>L.id===ln.id);
+      out[ln.id] = ln2 ? stackedLineResults(ln, ln2, segs, g, d) : lineResults(ln, segs, g, d);
+    });
+    return out;
+  },[lines, linesByFloor, segsByLine, g, d, twoStory, activeFloor]);
+  const stacking = !!(twoStory && activeFloor===1 && linesByFloor && linesByFloor[2]);  // drives the 1st-floor overturning note
+
+  // unique wall marks (SW-A, SW-B, …) in line order then segment order
+  const wallMarks = useMemo(()=>{
+    const m={}; let k=0;
+    lines.forEach(ln=>{ (segsByLine[ln.id]||[]).forEach((s,i)=>{ m[ln.id+"|"+i]=letterOf(k); k++; }); });
+    return m;
+  },[lines, segsByLine]);
+
+  const optimizeAll = () => {
+    const next={}; let okCount=0, failNames=[];
+    lines.forEach(ln=>{
+      const out = generateDesign({ ...g, wWind: ln.forceLbs }, { ...d, lineLength: ln.lengthFt, height: ln.heightFt });
+      if(out){ next[ln.id]=out.segs.map(s=>({...s})); okCount++; }
+      else { next[ln.id]=[]; failNames.push(`${fmt(ln.forceLbs/1000,1)}k/${fmt(ln.lengthFt,0)}′ line`); }
+    });
+    setSegsByLine(next);
+    setGenMsg(failNames.length
+      ? { ok:false, text:`Optimized ${okCount}/${lines.length} lines. No passing configuration for: ${failNames.join(", ")} — relax max segment length/count or allow type 3.` }
+      : { ok:true, text:`Optimized all ${lines.length} line${lines.length>1?"s":""}.` });
+  };
+
+  const setOv = (lineId, idx, key, val) => ovSet(lineId, idx, key, val);
+  const removeSeg = (lineId, idx) => setSegsByLine(prev => ({ ...prev, [lineId]: prev[lineId].filter((_,j)=>j!==idx) }));
+  const addSeg = (lineId) => {
+    const ln=lines.find(l=>l.id===lineId); if(!ln) return;
+    const segs=(segsByLine[lineId]||[]).slice().sort((a,b)=>a.start-b.start);
+    // largest gap on the line
+    let best={start:0,room:0}, cursor=0;
+    [...segs,{start:ln.lengthFt,length:0}].forEach(s=>{ const room=s.start-cursor; if(room>best.room) best={start:cursor,room}; cursor=Math.max(cursor,s.start+s.length); });
+    if(best.room < d.minSegLen) return;
+    setSegsByLine(prev=>({ ...prev, [lineId]: [...(prev[lineId]||[]), {start:+(best.start+ (best.room-d.minSegLen)/2).toFixed(2), length:d.minSegLen}].sort((a,b)=>a.start-b.start) }));
+  };
+
+  const sel = lines.find(l=>l.id===selLine);
+  const selSegs = sel ? (segsByLine[sel.id]||[]) : [];
+  const selRes  = sel ? (resultsByLine[sel.id]||[]) : [];
+  const allPass = lines.length>0 && lines.every(ln=>{
+    const rs=resultsByLine[ln.id]||[]; return rs.length>0 && rs.every(r=>!r.failed);
+  });
+
+  // rev 24: shown when a loaded file had geometry-less lines (excluded on load). The saved plan is
+  // intact, so one click rebuilds every line from it. Rendered at the top of BOTH return paths below.
+  const staleBanner = stale ? (
+    <div style={{ marginTop:12, marginBottom:4, padding:"10px 14px", borderRadius:8,
+                  border:`1.5px solid ${SW.amber}`, background:SW.amberSoft,
+                  display:"flex", alignItems:"center", gap:12 }}>
+      <span style={{ fontSize:15, lineHeight:1 }} aria-hidden="true">⚠</span>
+      <div style={{ flex:1, fontSize:12.5, lineHeight:1.5, color:SW.ink }}>
+        This design was restored from a file with incomplete plan geometry, so it may be out of date.
+        Rebuild it from the saved plan to restore every line.
+      </div>
+      <button onClick={onRebuild} style={{ ...swBtn(true), whiteSpace:"nowrap" }}>↻ Rebuild from plan</button>
+    </div>
+  ) : null;
+
+  if (!lines.length) return (
+    <div>
+      {staleBanner}
+      <div style={{ marginTop:30, padding:36, border:`1px dashed ${SW.rule}`, borderRadius:10, textAlign:"center", color:SW.faint, fontSize:13, lineHeight:1.7 }}>
+        No shear-wall lines yet.<br/>
+        In the <b style={{color:SW.ink}}>Plan Sketcher</b>, drag wind sections across the plan, mark the walls that take point loads,
+        then press <b style={{color:SW.accent}}>Design shear walls →</b>. Each point-load wall arrives here as a line carrying its
+        reaction (kips) and wall height — parapets are not part of the shear-wall calc.
+      </div>
+      <div style={{ marginTop:14, display:"flex", alignItems:"center", gap:10 }}>
+        <SwField label="Sheathing">
+          <select value={g.grade === "str1" ? "str1" : "rated"} onChange={(e)=>setGl("grade",e.target.value)} style={selStyle}>
+            <option value="rated">1/2&Prime; rated</option>
+            <option value="str1">1/2&Prime; Structural I</option>
+          </select>
+        </SwField>
+      </div>
+      <SwScheduleRef grade={g.grade}/>
+    </div>
+  );
+
+  return (
+    <div onClick={()=>ctx&&setCtx(null)}>
+      {/* Pinned constraints — sticks below the suite tab bar exactly like the sketcher ribbon (rev 5 --tabbar-h) */}
+      <div style={{ position:"sticky", top:"var(--tabbar-h,42px)", zIndex:30, background:SW.sheet,
+                    paddingTop:4, paddingBottom:6, boxShadow:`0 6px 8px -8px rgba(28,39,51,.25)` }}>
+        <div style={{ display:"flex", alignItems:"center", gap:10, margin:"0 0 6px" }}>
+          <span style={{ width:6, height:6, background:SW.accent, display:"inline-block", flex:"none" }} aria-hidden="true"/>
+          <div style={{ fontSize:11, fontWeight:700, letterSpacing:"0.14em", textTransform:"uppercase", color:SW.accent }}>Design constraints</div>
+          <div style={{ flex:1, height:1, background:SW.rule }} />
+          {/* Floor switcher — flips which floor's design is shown (synced with the plan selector). Greyed until 2-story. */}
+          <div title={twoStory ? "Switch which floor's design you're viewing" : "Two-story mode only"}
+               style={{ display:"flex", alignItems:"center", gap:7, flex:"none", opacity: twoStory ? 1 : 0.45 }}>
+            <span style={{ fontSize:9, fontWeight:700, letterSpacing:"0.12em", textTransform:"uppercase", color:SW.faint }}>Designing</span>
+            <div style={{ display:"flex", border:`1.5px solid ${twoStory ? SW.accent : SW.rule}`, borderRadius:5, overflow:"hidden" }}>
+              {[1,2].map(f=>(
+                <button key={f} disabled={!twoStory} onClick={()=>twoStory&&setActiveFloor(f)}
+                  style={{ border:0, padding:"4px 12px", fontFamily:MONO, fontSize:11, fontWeight:700, letterSpacing:"0.02em",
+                           cursor: twoStory ? "pointer" : "default",
+                           borderLeft: f===2 ? `1px solid ${SW.rule}` : "none",
+                           background: (twoStory && activeFloor===f) ? SW.accent : "transparent",
+                           color: (twoStory && activeFloor===f) ? "#fff" : SW.faint }}>
+                  {f===1 ? "1st Floor" : "2nd Floor"}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+        <div style={{ display:"flex", flexWrap:"wrap", gap:8, alignItems:"flex-start" }}>
+          <div style={{ flex:"1.4 1 280px", minWidth:240 }}>
+            <PinCard title="Loads" cols={2}>
+              <PinRow label="Roof DL" unit="psf"><input type="number" step={1} value={g.roofDL} onChange={(e)=>setGl("roofDL",parseFloat(e.target.value)||0)} style={pinNumS}/></PinRow>
+              <PinRow label="Floor DL" unit="psf"><input type="number" step={1} value={g.floorDL} onChange={(e)=>setGl("floorDL",parseFloat(e.target.value)||0)} style={pinNumS}/></PinRow>
+              <PinRow label="Wall self" unit="psf"><input type="number" step={1} value={g.wallDL} onChange={(e)=>setGl("wallDL",parseFloat(e.target.value)||0)} style={pinNumS}/></PinRow>
+              <PinRow label="Roof trib" unit="ft"><input type="number" step={0.5} value={d.roofTrib} onChange={(e)=>setDk("roofTrib",parseFloat(e.target.value)||0)} style={pinNumS}/></PinRow>
+              <PinRow label="Floor trib" unit="ft"><input type="number" step={0.5} value={d.floorTrib} onChange={(e)=>setDk("floorTrib",parseFloat(e.target.value)||0)} style={pinNumS}/></PinRow>
+            </PinCard>
+          </div>
+          <div style={{ flex:"1.4 1 280px", minWidth:240 }}>
+            <PinCard title="Dimensions" cols={2}>
+              <PinRow label="Min segment" unit="ft"><input type="number" step={0.5} value={d.minSegLen} onChange={(e)=>setDk("minSegLen",parseFloat(e.target.value)||0)} style={pinNumS}/></PinRow>
+              <PinRow label="Max segment" unit="ft"><input type="number" step={0.5} value={d.maxSegLen} onChange={(e)=>setDk("maxSegLen",parseFloat(e.target.value)||0)} style={pinNumS}/></PinRow>
+              <PinRow label="Max segs"><select value={d.maxSegments} onChange={(e)=>setDk("maxSegments",+e.target.value)} style={pinSelS}>{[1,2,3,4,5,6].map(n=><option key={n} value={n}>{n}</option>)}</select></PinRow>
+              <PinRow label="Snap" unit="ft"><select value={d.snap} onChange={(e)=>setDk("snap",+e.target.value)} style={pinSelS}><option value={0.25}>0.25</option><option value={0.5}>0.5</option><option value={1}>1.0</option></select></PinRow>
+              <PinRow label="Thickness" unit="in"><select value={d.thickness} onChange={(e)=>setDk("thickness",+e.target.value)} style={pinSelS}><option value={3.5}>3.5</option><option value={5.5}>5.5</option><option value={7.25}>7.25</option></select></PinRow>
+              <PinRow label="HD dist" unit="in"><input type="number" step={0.5} value={d.hdDist} onChange={(e)=>setDk("hdDist",parseFloat(e.target.value)||0)} style={pinNumS}/></PinRow>
+            </PinCard>
+          </div>
+          <div style={{ flex:"1 1 210px", minWidth:200 }}>
+            <PinCard title="Plywood" cols={1}>
+              <PinRow label="Sheathing" grow><select value={g.grade === "str1" ? "str1" : "rated"} onChange={(e)=>setGl("grade",e.target.value)} style={{ ...pinSelS, width:"100%", flex:"1 1 auto", minWidth:0 }}><option value="rated">1/2&Prime; rated</option><option value="str1">1/2&Prime; Structural I</option></select></PinRow>
+              <PinRow label="Max SW type" grow><select value={d.maxType} onChange={(e)=>setDk("maxType",+e.target.value)} style={{ ...pinSelS, width:"100%", flex:"1 1 auto", minWidth:0 }}><option value={1}>1</option><option value={2}>2</option><option value={3}>3</option></select></PinRow>
+              <div style={{ gridColumn:"1 / -1", marginTop:1, fontSize:9, color:SW.faint, lineHeight:1.55 }}>
+                <div style={{ display:"flex", justifyContent:"space-between" }}><span>Allow. W (plf)</span><span style={{ fontFamily:MONO, color:SW.ink, fontWeight:600 }}>{schedFor(g.grade).map((t)=>t.wind).join("/")}</span></div>
+                <div style={{ display:"flex", justifyContent:"space-between" }}><span>Allow. S (plf)</span><span style={{ fontFamily:MONO, color:SW.ink, fontWeight:600 }}>{schedFor(g.grade).map((t)=>t.seismic).join("/")}</span></div>
+              </div>
+            </PinCard>
+          </div>
+          <div style={{ flex:"1 1 230px", minWidth:210 }}>
+            <PinCard title="Other constraints" cols={1}>
+              <PinRow label="Objective" grow><select value={d.objective} onChange={(e)=>setDk("objective",e.target.value)} style={{ ...pinSelS, width:"100%", flex:"1 1 auto", minWidth:0 }}><option value="length">Min. wall length</option><option value="nailing">Min. nailing (type)</option></select></PinRow>
+              <PinRow label="Anchored into" grow><select value={d.anchor} onChange={(e)=>setDk("anchor",e.target.value)} style={{ ...pinSelS, width:"100%", flex:"1 1 auto", minWidth:0 }}><option>Concrete</option><option>Masonry</option><option>Wood</option></select></PinRow>
+              <button style={{ ...swBtn(true), gridColumn:"1 / -1", marginTop:2, padding:"0 12px", height:PIN_H, boxSizing:"border-box", fontSize:11 }} onClick={optimizeAll}>⚡ Optimize design</button>
+            </PinCard>
+          </div>
+        </div>
+      </div>
+      <div style={{ fontSize:11, color:SW.faint, marginTop:6 }}>
+        Line force and wall height come from the Plan Sketcher (W<sub>WIND</sub> per line = its reaction). Seismic V, S<sub>DS</sub>, code &amp; species come from the Calculation sheet header; dead loads and sheathing grade are shared with it. Demand shear = line force ÷ total wall length on that line.
+      </div>
+
+      {genMsg && (
+        <div style={{ marginTop:12, padding:"8px 12px", fontSize:12, fontFamily:MONO, borderRadius:6,
+                      background:genMsg.ok?SW.greenSoft:SW.redSoft, color:genMsg.ok?SW.green:SW.red,
+                      border:`1px solid ${genMsg.ok?SW.green:SW.red}` }}>
+          {genMsg.text}
+        </div>
+      )}
+
+      <SectionTitle
+        right={
+          <div style={{ display:"flex", gap:8, alignItems:"center" }}>
+            <button onClick={()=>setShowTags(v=>!v)} style={{ ...swBtn(showTags), padding:"4px 12px", fontSize:11 }}
+                    title="Show or hide the SW-A / SW-B wall marks on the plan">
+              {showTags ? "Hide wall tags" : "Show wall tags"}
+            </button>
+            <div style={{ padding:"4px 10px", border:`1.5px solid ${allPass?SW.green:SW.red}`, borderRadius:6,
+                          background:allPass?SW.greenSoft:SW.redSoft, color:allPass?SW.green:SW.red,
+                          fontFamily:MONO, fontSize:11, fontWeight:700 }}>
+              {allPass ? "✓ ALL LINES PASS" : "✕ NOT PASSING"}
+            </div>
+          </div>
+        }>
+        Plan — live recalculation
+      </SectionTitle>
+
+      <DesignPlan shape={shape} lines={lines} marks={wallMarks} showTags={showTags}
+                  segsByLine={segsByLine} setSegsByLine={setSegsByLine}
+                  resultsByLine={resultsByLine} selLine={selLine} setSelLine={setSelLine}
+                  snap={d.snap} maxSegLen={d.maxSegLen}
+                  onCtx={(e, lineId, idx)=>{ setSelLine(lineId); setCtx({ px:Math.min(e.clientX, window.innerWidth-280), py:Math.min(e.clientY, window.innerHeight-240), lineId, idx }); }}/>
+
+      {/* per-line chips */}
+      <div style={{ display:"flex", flexWrap:"wrap", gap:8, marginTop:10 }}>
+        {lines.map(ln=>{
+          const rs=resultsByLine[ln.id]||[]; const pass=rs.length>0&&rs.every(r=>!r.failed);
+          const isSel=selLine===ln.id;
+          return (
+            <button key={ln.id} onClick={()=>setSelLine(ln.id)}
+              style={{ padding:"6px 12px", fontFamily:MONO, fontSize:12, cursor:"pointer", borderRadius:6,
+                       border:`1.5px solid ${isSel?SW.accent:SW.rule}`,
+                       background:isSel?SW.accentSoft:SW.panel,
+                       color: rs.length? (pass?SW.green:SW.red) : SW.faint }}>
+              {ln.windAxis==="h"?"E–W":"N–S"} · {fmt(ln.forceLbs/1000,2)}k · {fmt(ln.lengthFt,0)}′ {rs.length? (pass?"✓":"✕") : "·"}
+            </button>
+          );
+        })}
+      </div>
+
+      {sel && (
+        <>
+          <SectionTitle
+            right={
+              <div style={{ display:"flex", gap:8 }}>
+                <button style={swBtn(false)} onClick={()=>addSeg(sel.id)} disabled={selSegs.length>=6}>+ Add wall</button>
+                <button style={swBtn(false)} onClick={()=>applyToCalc(sel, selSegs, selRes, d)}>Send line to calculation sheet →</button>
+              </div>
+            }>
+            Selected line — {sel.windAxis==="h"?"E–W":"N–S"} wind · {fmt(sel.forceLbs/1000,2)}k · {fmt(sel.lengthFt,1)} ft · H {fmt(sel.heightFt,1)} ft
+          </SectionTitle>
+          {selSegs.length === 0 ? (
+            <div style={{ padding:20, border:`1px dashed ${SW.rule}`, borderRadius:8, color:SW.faint, fontSize:12 }}>
+              No shear walls on this line yet — press ⚡ Optimize design, or + Add wall.
+            </div>
+          ) : (
+          <>
+          {stacking && (
+            <div style={{ margin:"2px 0 10px", padding:"8px 12px", borderRadius:7,
+                          border:`1px solid ${SW.accent}`, background:SW.accentSoft||"rgba(35,87,127,0.06)",
+                          fontSize:11, lineHeight:1.5, color:SW.ink }}>
+              <b style={{ color:SW.accent }}>2-story stacking active.</b> Every row below is re-derived from the
+              <b> arm-aware</b> overturning of both stories — the roof reaction acts a full upper story higher
+              (arm H₁+H₂), so its moment adds on top of the 2nd-floor moment
+              (M<sub>base</sub> = M<sub>1st</sub> + M<sub>2nd</sub>), not a flat sum of the reactions. End post,
+              uplift, holdown, anchor, strap, deflection and footing all reflect the stacked demand. Wind/seismic
+              shear and nailing are unchanged (the combined story shear was already carried). Δ uses the stacked
+              (stiffer) end post, so the 1st-floor inter-story drift can read smaller than the single-story value.
+            </div>
+          )}
+          <div className="sw-scroll">
+            <table className="sw-table" style={{ minWidth:700, color:SW.ink }}>
+              <thead>
+                <tr style={{ borderBottom:`1.5px solid ${SW.faint}` }}>
+                  <th style={{ textAlign:"left", padding:"4px 10px", fontSize:11 }}></th>
+                  {selSegs.map((_, i) => (
+                    <th key={i} style={{ padding:"4px 8px", fontSize:11, fontFamily:MONO, color:SW.accent }}>SW-{wallMarks[selLine+"|"+i] || (i+1)}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                <Row label="Length / position" unit="ft" cells={selRes} render={(r, i) => (
+                  <span style={{ fontFamily:MONO, fontSize:12 }}>{fmt(selSegs[i].length,2)} <span style={{ color:SW.faint, fontSize:10 }}>@ {fmt(selSegs[i].start,2)}</span></span>
+                )} />
+                <Row label="Wall height h" unit="ft" cells={selRes} render={() => (
+                  <span style={{ fontFamily:MONO, fontSize:12 }}>{fmt(sel.heightFt,2)}</span>
+                )} />
+                <Row label="Aspect ratio h/L" cells={selRes} render={(r) => <Chip v={r.aspectNG ? "NG!" : r.aspect} d={2} />} />
+                <Row label="Wind shear v" unit="plf" cells={selRes} render={(r) => <Chip v={r.vW} d={1} />} />
+                <Row label="Seismic shear v" unit="plf" cells={selRes} render={(r) => <Chip v={r.vS} d={2} />} />
+                <Row label="Shear wall nailing" cells={selRes} render={(r) => {
+                  if (!isNum(r.selType)) return <Chip v={r.autoType} />;
+                  const bad = r.ovBad && r.ovBad.type;
+                  return (
+                    <span style={{ fontFamily:MONO, fontSize:12, color: bad ? SW.red : SW.ink }}>
+                      {NAIL_EDGE[r.selType]}
+                      <div style={{ fontSize:10, color: bad ? SW.red : SW.faint }}>
+                        Type {r.selType}{bad ? ` — requires Type ${r.autoType}` : ""}
+                      </div>
+                    </span>
+                  );
+                }} />
+                <Row label="Allowable wind / seismic" unit="plf" cells={selRes} render={(r) => {
+                  const t = isNum(r.selType) ? schedFor(g.grade)[r.selType-1] : null;
+                  return t ? <span style={{ fontFamily:MONO, fontSize:12 }}>{t.wind} / {fmt(r.factor*t.seismic,0)}</span> : <Chip v="—" />;
+                }} />
+                {stacking && (
+                  <Row label="Overturning M · stacked" unit="k·ft" cells={selRes} render={(r) => {
+                    const m = xMax(r.MotW, r.MotS);
+                    return <span style={{ fontFamily:MONO, fontSize:12, color:SW.accent, fontWeight:700 }}>{fmt(m/1000,1)}</span>;
+                  }} />
+                )}
+                <Row label="End post" cells={selRes} render={(r) => <Chip v={r.ovBad&&r.ovBad.post?"NG!":r.dispPost} />} />
+                <Row label="Max uplift" unit="lbs" cells={selRes} render={(r) => <Chip v={r.maxUplift === 0 ? "—" : r.maxUplift} d={0} />} />
+                <Row label="Holdown" cells={selRes} render={(r) => <Chip v={r.ovBad&&r.ovBad.hd?"NG!":r.dispHd} />} />
+                <Row label="Anchor" cells={selRes} render={(r) => <Chip v={r.anchorSel} />} />
+                <Row label="Strap alternative" cells={selRes} render={(r) => <Chip v={r.altStrap} />} />
+                <Row label="Δ wind" unit="in" cells={selRes} render={(r) => <Chip v={isFinite(r.deflW) ? r.deflW : "—"} d={3} />} />
+                <Row label="Req. footing length" unit="ft" cells={selRes} render={(r) => <Chip v={isFinite(r.reqFtgLen) ? r.reqFtgLen : "—"} d={2} />} />
+                <Row label="Status" cells={selRes} render={(r) => <Chip v={r.failed ? "FAILED!!!" : "OK"} />} />
+              </tbody>
+            </table>
+          </div>
+          </>
+          )}
+        </>
+      )}
+
+      <SwScheduleRef grade={g.grade}/>
+
+      <SwCtxMenu ctx={ctx} lines={lines} segsByLine={segsByLine} resultsByLine={resultsByLine}
+                 setOv={setOv} onRemove={removeSeg} onClose={()=>setCtx(null)} thickness={d.thickness}/>
+    </div>
+  );
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   APP SHELL — Plan Sketcher · Calculation Sheet · Design
+   The sketcher stays mounted (hidden) so the plan survives tab switches.
+   ════════════════════════════════════════════════════════════════════════ */
+// ── App-level design system (rev 9): Plex type, grid-paper signature, focus rings, micro-interactions ──
+const APP_CSS = `
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700;800&display=swap');
+
+/* Engineer's quad-ruled paper: faint 22px grid, heavier rule every 5th line (110px) */
+.paper-desk{
+  background-color:#EFEDE6;
+  background-image:
+    linear-gradient(rgba(35,87,127,.12) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(35,87,127,.12) 1px, transparent 1px),
+    linear-gradient(rgba(35,87,127,.06) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(35,87,127,.06) 1px, transparent 1px);
+  background-size:110px 110px, 110px 110px, 22px 22px, 22px 22px;
+}
+/* Suite tab bar as a drawing title block */
+.tbar{ box-shadow:0 1px 0 rgba(28,39,51,.06); }
+.tbrand{ border-right:1px solid #DAD6CA; align-self:stretch; display:flex; flex-direction:column; justify-content:center; }
+.tbrand small{ font-family:'IBM Plex Mono',ui-monospace,monospace; font-size:8.5px; letter-spacing:.22em; color:#67737F; font-weight:500; }
+.ttab{ position:relative; transition:color .14s ease, background .14s ease; }
+.ttab:hover{ color:#23577F !important; background:#F1F5F8 !important; }
+.ttab .teye{ font-family:'IBM Plex Mono',ui-monospace,monospace; font-size:8.5px; letter-spacing:.18em; font-weight:500;
+  color:inherit; opacity:.55; display:block; text-align:left; margin-bottom:1px; }
+/* Quality floor: visible keyboard focus, calm motion, honest print */
+button:focus-visible, select:focus-visible, input:focus-visible{ outline:2px solid #23577F; outline-offset:1.5px; border-radius:4px; }
+.sw-root button, .lt-root button{ transition:filter .14s ease, border-color .14s ease, box-shadow .14s ease; }
+.sw-root button:hover, .lt-root button:hover{ filter:brightness(.965); }
+.sw-root select, .sw-root input[type=number], .lt-root select, .lt-root input[type=number]{ transition:border-color .14s ease, box-shadow .14s ease; }
+.sw-root select:hover, .sw-root input[type=number]:hover, .lt-root select:hover, .lt-root input[type=number]:hover{ border-color:#23577F !important; }
+.sw-root input[type=number]:focus, .lt-root input[type=number]:focus{ border-color:#23577F !important; box-shadow:0 0 0 2.5px #E8EFF4; }
+.sw-root, .lt-root{ font-variant-numeric:tabular-nums; }
+@media (prefers-reduced-motion: reduce){ .ttab, .sw-root button, .lt-root button{ transition:none; } }
+@media print{ .paper-desk{ background-image:none !important; background-color:#FFF !important; } }
+`;
+
+// ── PROJECT-FILE DEFAULTS + VERSIONING ──────────────────────────────────────
+// These are the single source of truth for the shapes the loader REPLACES wholesale
+// (calc.g, design.d, calc.segments). Both the useState inits below and loadProject() below
+// consume them, so any field ADDED here in the future auto-fills its default on an OLD file
+// (the dominant forward-compat risk: a wholesale setG/setD/setSegments leaving a new field
+// `undefined`). Keep these byte-faithful to the prior inline inits — a value change here is a
+// behavior change for current files. NOTE: `g.grade` is deliberately NOT included (the calc
+// engine treats a falsy grade as "rated", so omitting it keeps the save shape unchanged and
+// current files byte-identical; add it here only if you want new saves to carry grade:"rated").
+const DEFAULT_G   = { code:4, species:1, line:"1", vSeismic:5, sds:1, R:6.5, wWind:26000, roofDL:20, floorDL:0, wallDL:15 };
+const DEFAULT_D   = { thickness:5.5, anchor:"Concrete", roofTrib:2, floorTrib:0, hdDist:5,
+                      minSegLen:4, maxSegLen:12, maxSegments:4, maxType:3, snap:0.5,
+                      objective:"length", ftgWidth:1.33, ftgThick:12, height:15, lineLength:40 };
+const SEG_DEFAULTS= { length:0, height:15, roofTrib:10, floorTrib:0, hdDist:5, thickness:5.5, anchor:"Concrete", selType:1, ftgWidth:1.33, ftgThick:12 };
+// Design-tab collections (rev 24). A design LINE is { id, key, windAxis, o, a, b, lengthFt, heightFt,
+// forceLbs }. Only the SCALAR fields are defaultable — the GEOMETRY (id/key/windAxis/o/a/b) cannot be
+// invented, so it is NOT in DEFAULT_LINE; a line missing geometry is filtered + flagged stale in
+// loadProject (it's regenerable from the saved plan). A PLACED shear-wall segment is { start, length,
+// ov? } — ov rides along in the spread and is already (s.ov||{})-tolerant downstream.
+const DEFAULT_LINE   = { lengthFt:0, heightFt:13, forceLbs:0 };
+const DEFAULT_PLACED = { start:0, length:0 };
+
+// Save-file schema version. WRITTEN by onSave and now READ by the loader (it used to be
+// decorative). Bump this on every schema change and add the matching MIGRATIONS step.
+const CURRENT_VERSION = 2;
+// Step migrations: MIGRATIONS[k] takes a project AT version k and returns it AT version k+1.
+// 1→2 is purely ADDITIVE — v2 only adds optional ui/camera/selection fields the loader already
+// feature-detects — so there is no data transform, we only stamp the version. This ladder exists
+// so the NEXT (possibly breaking) change has a home. Merge-on-defaults below handles ADDED fields
+// automatically; RENAMES and UNIT/SEMANTICS changes do NOT — they need an explicit step here, e.g.:
+//
+//   2: (p) => ({                                 // hypothetical v2 → v3
+//     ...p,
+//     design: { ...p.design, lines: (p.design?.lines||[]).map(l => ({
+//       ...l,
+//       forceN:  l.forceLbs * 4.4482216,         // UNIT change: lbs → newtons (same datum, new meaning)
+//       // forceLbs intentionally dropped after the rename
+//     })) },
+//     version: 3,
+//   }),
+//
+// Whenever you add a step: bump CURRENT_VERSION, FREEZE a fixture at the OLD version, and add a
+// test asserting that old fixture loads to the NEW correct value (the only thing that catches a
+// botched unit conversion — see the migration checklist in the handoff §4x / §7).
+const MIGRATIONS = {
+  1: (p) => ({ ...p, version:2 }),
+};
+// Walk a loaded project up to `target` one step at a time. `migrations`/`target` are injectable so a
+// test can prove the MECHANISM (ordering + value transforms) with a synthetic ladder even while the
+// real MIGRATIONS[1] is a no-op stamp. Returns the migrated project + `newer` (file from a future build).
+function migrateProject(raw, migrations = MIGRATIONS, target = CURRENT_VERSION){
+  const p = raw || {};
+  let v = (typeof p.version === "number") ? p.version : 1;   // pre-version / junk → treat as v1
+  const newer = v > target;
+  let out = p;
+  while(v < target && migrations[v]){ out = migrations[v](out); v = out.version; }
+  return { project: out, newer };
+}
+// Pure load normalizer: migrate, then merge every wholesale-replaced object onto its DEFAULT_*
+// so missing fields fill in. PRESERVES the loader's exact present-checks (g/segments/d are only
+// applied when present in the file; tab/hlSel/selLine keep their prior fallbacks) so current v1
+// AND v2 files resolve to byte-identical state. Returns ready-to-dispatch slices + the migrated
+// project (for the same `if(project.design)`/`if(project.calc)` guards the handler always used).
+function loadProject(raw){
+  const { project, newer } = migrateProject(raw);
+  const calc   = project.calc   || {};
+  const design = project.design || {};
+  const ui     = project.ui     || {};
+  // design lines: merge scalar/future fields onto DEFAULT_LINE, but NEVER invent geometry. A line
+  // missing a/b can't be rendered or designed, so it is EXCLUDED and the design is flagged STALE —
+  // the saved plan is intact, so a rebuild regenerates every line (the "flag + prompt re-run" choice,
+  // not a silent drop). placed segments merge onto DEFAULT_PLACED; ALL segsByLine keys are kept (even
+  // for a filtered line) so a rebuild can restore that line's layout by id.
+  // Back-compat: old files stored a single `design.lines` array (1-story); newer files store
+  // `design.linesByFloor` ({1:[...],2:[...]}). Normalize either into linesByFloor.
+  const hasGeom  = (l) => !!(l && l.id != null && Number.isFinite(l.lengthFt) && l.lengthFt > 0 &&
+                             l.a && Number.isFinite(l.a.x) && Number.isFinite(l.a.y) &&
+                             l.b && Number.isFinite(l.b.x) && Number.isFinite(l.b.y));
+  const rawByFloor = (design.linesByFloor && typeof design.linesByFloor === "object")
+    ? design.linesByFloor
+    : { 1: (Array.isArray(design.lines) ? design.lines : []) };   // legacy single-array → floor 1
+  const linesByFloor = {};
+  let stale = false;
+  for(const fk in rawByFloor){
+    const merged = (Array.isArray(rawByFloor[fk]) ? rawByFloor[fk] : []).map(l => ({ ...DEFAULT_LINE, ...l }));
+    const valid  = merged.filter(hasGeom);
+    if(valid.length < merged.length) stale = true;                 // some saved line lacked geometry
+    linesByFloor[fk] = valid;
+  }
+  if(!linesByFloor[1]) linesByFloor[1] = [];                       // always have a floor-1 slot
+  const sblIn    = design.segsByLine || {};
+  const segsByLine = {};
+  for(const k in sblIn) segsByLine[k] = (Array.isArray(sblIn[k]) ? sblIn[k] : []).map(s => ({ ...DEFAULT_PLACED, ...s }));
+  return {
+    newer, project,
+    calc: {
+      g:        calc.g        ? { ...DEFAULT_G, ...calc.g }                    : undefined,
+      segments: calc.segments ? calc.segments.map(s => ({ ...SEG_DEFAULTS, ...s })) : undefined,
+    },
+    design: {
+      linesByFloor, stale, segsByLine,
+      shape:      design.shape || null,
+      d:          design.d ? { ...DEFAULT_D, ...design.d } : undefined,
+      selLine:    design.selLine !== undefined ? design.selLine : null,
+    },
+    ui: { tab: ui.tab || "plan", hlSel: ("hlSel" in ui) ? ui.hlSel : null,
+          twoStory: ("twoStory" in ui) ? !!ui.twoStory : false,   // old files lack it → single story
+          activeFloor: ui.activeFloor === 2 ? 2 : 1 },
+  };
+}
+
+export default function App() {
+  const [tab, setTab] = useState("plan");
+  const [g, setG] = useState(DEFAULT_G);
+  const setGl = (key, val) => setG((p) => ({ ...p, [key]: val }));
+
+  const mkSeg = (length, roofTrib) => ({ ...SEG_DEFAULTS, length, roofTrib });
+  const [segments, setSegments] = useState([ mkSeg(5,2), mkSeg(5,2), mkSeg(0,10), mkSeg(0,10), mkSeg(0,10), mkSeg(0,10) ]);
+  const totalL = segments.reduce((a, s) => a + s.length, 0);
+  const results = useMemo(() => segments.map((s) => calcSegment(s, g, totalL)), [segments, g, totalL]);
+  // light calc sheet consumes util-augmented results (engine untouched)
+  const resultsU = useMemo(() => results.map((r, i) => withUtil(r, segments[i], g.grade)), [results, segments, g.grade]);
+  const actU = resultsU.filter((r) => r.active);
+  const calcOK = actU.length > 0 && actU.every((r) => r.pass);
+  const [hlSel, setHlSel] = useState(null); // column highlight (calc sheet)
+  // ── TWO-STORY MODE (Step 1: UI scaffold only — no second plan, no calc change yet) ──
+  const [twoStory, setTwoStory]     = useState(false);   // false = single story (today's behavior, untouched)
+  const [activeFloor, setActiveFloor] = useState(1);     // sketcher view: 1 = 1st floor, 2 = 2nd floor
+
+  // Design state (fed from the sketcher). Two-story keeps BOTH floors' designs keyed by floor;
+  // `designLines` is the active floor's lines (derived), so the Design tab + everything downstream is unchanged.
+  const [designLinesByFloor, setDesignLinesByFloor] = useState({});  // { 1:[...], 2:[...] }  (1-story → { 1:[...] })
+  const designLines = useMemo(()=> designLinesByFloor[activeFloor] || designLinesByFloor[1] || designLinesByFloor[2] || [],
+                              [designLinesByFloor, activeFloor]);
+  const [designShape, setDesignShape] = useState(null);
+  const [segsByLine, setSegsByLine] = useState({});
+  const [d, setD] = useState(DEFAULT_D);
+  const setDk = (k, v) => setD((p) => ({ ...p, [k]: v }));
+  const [selLine, setSelLine] = useState(null);   // selected design line — lifted from DesignTab so save/load restores it
+  const [designStale, setDesignStale] = useState(false);  // rev 24: a loaded file had geometry-less lines → prompt rebuild. Derived on load, NOT serialized (a re-save heals to the valid subset).
+
+  const onDesignShearWalls = (byFloor, shape) => {
+    setDesignLinesByFloor(byFloor);
+    setDesignShape(shape);
+    const allIds = new Set();
+    Object.values(byFloor).forEach(arr => (arr||[]).forEach(ln => allIds.add(ln.id)));
+    setSegsByLine(prev => {
+      const next = {};
+      allIds.forEach(id => { next[id] = prev[id] || []; });   // keep layouts for unchanged lines (shared across floors)
+      return next;
+    });
+    const act = byFloor[activeFloor] || byFloor[1] || byFloor[2] || [];
+    setSelLine(prev => act.find(l=>l.id===prev) ? prev : (act[0] ? act[0].id : null));
+    setDesignStale(false);                          // a fresh handoff always yields geometry-complete lines
+    setTab("design");
+  };
+  // ── PROJECT FILES (.wps = JSON: sketcher + design + calc, versioned) ──
+  const projectRef = useRef(null);                       // sketcher get/set, registered below
+  const fileInputRef = useRef(null);
+  const registerProject = useCallback((api)=>{ projectRef.current=api; },[]);
+  const onSave = useCallback(()=>{
+    const sk = projectRef.current ? projectRef.current.get() : null;
+    const proj = { app:"plan-sketcher-suite", version:CURRENT_VERSION, savedAt:new Date().toISOString(),
+                   sketcher:sk, design:{ linesByFloor:designLinesByFloor, shape:designShape, segsByLine, d, selLine },
+                   calc:{ g, segments }, ui:{ tab, hlSel, twoStory, activeFloor } };
+    const blob = new Blob([JSON.stringify(proj,null,1)], {type:"application/json"});
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "plan-project.wps";
+    a.click();
+    URL.revokeObjectURL(a.href);
+  },[designLinesByFloor, designShape, segsByLine, d, g, segments, tab, hlSel, selLine, twoStory, activeFloor]);
+  const onOpen = useCallback(()=>{ fileInputRef.current && fileInputRef.current.click(); },[]);
+  const onFileChosen = useCallback((e)=>{
+    const f = e.target.files && e.target.files[0];
+    e.target.value = "";                                  // allow re-opening the same file
+    if(!f) return;
+    const rd = new FileReader();
+    rd.onload = ()=>{
+      try{
+        const raw = JSON.parse(rd.result);
+        if(raw.app!=="plan-sketcher-suite") throw new Error("not a plan-sketcher-suite project");
+        const L = loadProject(raw);                       // version ladder + merge-onto-defaults
+        if(L.newer) window.alert("This project was saved by a newer version of the app — some data may not load correctly.");
+        const p = L.project;                              // migrated project (version stamped up)
+        if(p.sketcher && projectRef.current) projectRef.current.set(p.sketcher);
+        if(p.design){ setDesignLinesByFloor(L.design.linesByFloor); setDesignShape(L.design.shape);
+                      setSegsByLine(L.design.segsByLine); if(L.design.d) setD(L.design.d);
+                      setSelLine(L.design.selLine); }
+        if(p.calc){ if(L.calc.g) setG(L.calc.g); if(L.calc.segments) setSegments(L.calc.segments); }
+        setDesignStale(L.design.stale);                   // rev 24: flag if any saved line lacked geometry
+        // v2 drops you back where you left; v1 files (no ui slice) open on the Plan tab as before
+        setHlSel(L.ui.hlSel);
+        setTwoStory(L.ui.twoStory);
+        setActiveFloor(L.ui.activeFloor);
+        setTab(L.ui.tab);
+      }catch(err){ window.alert("Could not open project: "+err.message); }
+    };
+    rd.readAsText(f);
+  },[]);
+  const onNew = useCallback(()=>{
+    if(!window.confirm("Start a new project? Unsaved work will be lost.")) return;
+    if(projectRef.current) projectRef.current.set({ graph:{nodes:[],edges:[]}, wallProps:{},
+      noSupport:[], sections:{h:null,v:null}, nextId:0 });
+    setDesignLinesByFloor({}); setDesignShape(null); setSegsByLine({}); setDesignStale(false);
+    setTwoStory(false); setActiveFloor(1);
+  },[]);
+  // rev 24: the Design-tab stale banner rebuilds geometry-less lines from the restored plan. If the
+  // saved plan still has a wind reaction, regenerate straight from it (rerun → onDesignShearWalls,
+  // which clears stale); otherwise send the user to the Plan to place a cut.
+  const onRebuildDesign = useCallback(()=>{
+    const api = projectRef.current;
+    if(api && api.hasReactions && api.rerun){ api.rerun(); }
+    else { setTab("plan"); window.alert("This plan has no wind reaction yet. On the Plan, drag a wind section across the building and mark the point-load walls, then press “Design shear walls”."); }
+  },[]);
+  const fileOps = useMemo(()=>({onSave,onOpen,onNew}),[onSave,onOpen,onNew]);
+
+  const ovSet = (lineId, idx, key, val) =>
+    setSegsByLine(prev => ({ ...prev, [lineId]: prev[lineId].map((s,j)=> j!==idx ? s :
+      key===null ? { start:s.start, length:s.length } : { ...s, ov:{ ...(s.ov||{}), [key]:val||undefined } }) }));
+
+  // Design → calc sheet: this line's segments + force become the sheet
+  const applyToCalc = (line, segs, res, dC) => {
+    const next = Array.from({ length: 6 }, (_, i) => ({
+      length: segs[i] ? segs[i].length : 0,
+      height: line.heightFt, roofTrib: dC.roofTrib, floorTrib: dC.floorTrib,
+      hdDist: dC.hdDist, thickness: dC.thickness, anchor: dC.anchor,
+      selType: res[i] && isNum(res[i].selType) ? Math.min(res[i].selType, 3) : 1,
+      ftgWidth: dC.ftgWidth, ftgThick: dC.ftgThick,
+    }));
+    setSegments(next);
+    setGl("wWind", Math.round(line.forceLbs));
+    setTab("calc");
+  };
+
+  // Pinned-ribbon support: measure the sticky tab bar's height into a CSS var so the
+  // sketcher ribbon can stick exactly below it (fallback 42px in the .ribbon rule).
+  const tabBarRef = useRef(null);
+  useEffect(() => {
+    const setH = () => {
+      if (tabBarRef.current)
+        document.documentElement.style.setProperty("--tabbar-h", tabBarRef.current.offsetHeight + "px");
+    };
+    setH();
+    window.addEventListener("resize", setH);
+    return () => window.removeEventListener("resize", setH);
+  }, []);
+
+  const SHEET_NO = { plan:"S-1", design:"S-2", calc:"S-3" };
+  const tabBtn = (id, label, dot) => (
+    <button onClick={() => setTab(id)} className="ttab"
+      style={{ display:"flex", alignItems:"center", gap:7,
+               padding:"8px 22px 10px", fontSize:12, fontWeight:700, letterSpacing:"0.1em", textTransform:"uppercase",
+               border:"none", borderBottom: tab===id ? `3px solid ${SW.accent}` : "3px solid transparent",
+               background: tab===id ? SW.accentSoft : "transparent",
+               color: tab===id ? SW.accent : SW.faint, cursor:"pointer" }}>
+      <span><span className="teye">{SHEET_NO[id]}</span>{label}</span>
+      {dot !== undefined && (
+        <span style={{ width:8, height:8, borderRadius:99, background: dot ? SW.green : SW.red, display:"inline-block" }}
+              title={dot ? "All walls pass" : "Walls failing"} />
+      )}
+    </button>
+  );
+
+  // ── DARK SHEET — Design tab only (styling unchanged) ──
+  const designSheet = (
+    <div className="paper-desk sw-root" style={{ minHeight:"calc(100vh - 46px)", color:SW.ink, fontFamily:"'IBM Plex Sans','Helvetica Neue',Arial,sans-serif", padding:"20px 14px" }}>
+      <div style={{ maxWidth:1100, margin:"0 auto", background:SW.sheet, border:`1.5px solid ${SW.ink}`, boxShadow:"0 1px 1px rgba(28,39,51,.04), 0 10px 24px -14px rgba(28,39,51,.30), 4px 4px 0 rgba(28,39,51,.10)" }}>
+        {/* title block */}
+        <div style={{ display:"flex", flexWrap:"wrap", borderBottom:`1.5px solid ${SW.ink}` }}>
+          <div style={{ flex:"2 1 320px", padding:"16px 20px", borderRight:`1px solid ${SW.rule}` }}>
+            <div style={{ fontSize:10, letterSpacing:"0.2em", color:SW.faint, textTransform:"uppercase" }}>Structural Calculation</div>
+            <h1 style={{ margin:"4px 0 2px", fontSize:22, fontWeight:800, letterSpacing:"0.01em", color:SW.ink }}>
+              Plywood Shear Walls{g.grade === "str1" ? " (Structural I)" : ""} <span style={{ fontWeight:400, color:SW.faint }}>w/ Wood Studs</span>
+            </h1>
+            <div style={{ fontSize:11, fontFamily:MONO, color:SW.accent }}>{CODES[g.code]} · Basic Load Combinations</div>
+          </div>
+          <div style={{ flex:"1 1 160px", padding:"16px 20px", borderRight:`1px solid ${SW.rule}` }}>
+            <label style={{ fontSize:10, letterSpacing:"0.12em", textTransform:"uppercase", color:SW.faint, display:"block", marginBottom:4 }}>Building code</label>
+            <select value={g.code} onChange={(e)=>setGl("code",+e.target.value)} style={{ ...selStyle, width:"100%" }}>
+              <option value={1}>2006 IBC</option><option value={2}>2009 IBC</option>
+              <option value={3}>2012 IBC</option><option value={4}>2015 IBC</option>
+            </select>
+            <label style={{ fontSize:10, letterSpacing:"0.12em", textTransform:"uppercase", color:SW.faint, display:"block", margin:"10px 0 4px" }}>Wood framing</label>
+            <select value={g.species} onChange={(e)=>setGl("species",+e.target.value)} style={{ ...selStyle, width:"100%" }}>
+              <option value={1}>Southern Pine</option><option value={2}>Douglas-Fir</option>
+            </select>
+          </div>
+          <div style={{ flex:"0 1 120px", padding:"16px 20px" }}>
+            <label style={{ fontSize:10, letterSpacing:"0.12em", textTransform:"uppercase", color:SW.faint, display:"block", marginBottom:4 }}>Shear line</label>
+            <input value={g.line} onChange={(e)=>setGl("line",e.target.value)}
+              style={{ width:60, padding:"4px 8px", border:`1px solid ${SW.rule}`, borderRadius:4, fontFamily:MONO, fontSize:18,
+                       fontWeight:700, textAlign:"center", color:SW.accent, background:SW.input, outline:"none" }} />
+          </div>
+        </div>
+        <div style={{ padding:"8px 20px 28px" }}>
+          <DesignTab g={g} shape={designShape} lines={designLines} linesByFloor={designLinesByFloor}
+                     segsByLine={segsByLine} setSegsByLine={setSegsByLine} ovSet={ovSet}
+                     d={d} setDk={setDk} applyToCalc={applyToCalc} setGl={setGl}
+                     selLine={selLine} setSelLine={setSelLine}
+                     twoStory={twoStory} activeFloor={activeFloor} setActiveFloor={setActiveFloor}
+                     stale={designStale} onRebuild={onRebuildDesign}/>
+          <div style={{ marginTop:24, fontSize:10, color:SW.faint, lineHeight:1.6, borderTop:`1px solid ${SW.rule}`, paddingTop:10 }}>
+            Faithful port of the source spreadsheet, including its exact formulas and thresholds (e.g. the wind end-post compression denominator and uplift &lt; 625 lbs → "neglect"). The Design tab optimizer verifies every candidate through this same engine. Allowable values per the embedded schedule; holdowns/anchors per Simpson HDU / SSTB / STHD / MST capacities tabulated in the workbook. END OF CALC.
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+
+  // ── LIGHT SHEET — Calculation Sheet, 1:1 with the standalone calculator ──
+  const calcSheetPage = (
+    <div className="paper-desk lt-root" style={{ minHeight:"calc(100vh - 46px)", color:LT.ink, fontFamily:"'IBM Plex Sans','Helvetica Neue',Arial,sans-serif", padding:"24px 16px" }}>
+      <div style={{ maxWidth:1100, margin:"0 auto", background:LT.sheet, border:`1.5px solid ${LT.ink}`, boxShadow:"0 1px 1px rgba(28,39,51,.04), 0 10px 24px -14px rgba(28,39,51,.30), 4px 4px 0 rgba(28,39,51,.10)" }}>
+        {/* ===== TITLE BLOCK ===== */}
+        <div style={{ display:"flex", flexWrap:"wrap", borderBottom:`1.5px solid ${LT.ink}` }}>
+          <div style={{ flex:"2 1 320px", padding:"16px 20px", borderRight:`1px solid ${LT.rule}` }}>
+            <div style={{ fontSize:10, letterSpacing:"0.2em", color:LT.faint, textTransform:"uppercase" }}>Structural Calculation</div>
+            <h1 style={{ margin:"4px 0 2px", fontSize:22, fontWeight:800, letterSpacing:"0.01em", color:LT.ink }}>
+              Plywood Shear Walls{g.grade === "str1" ? " (Structural I)" : ""} <span style={{ fontWeight:400, color:LT.faint }}>w/ Wood Studs</span>
+            </h1>
+            <div style={{ fontSize:11, fontFamily:MONO, color:LT.blue }}>{CODES[g.code]} · Basic Load Combinations</div>
+          </div>
+          <div style={{ flex:"1 1 160px", padding:"16px 20px", borderRight:`1px solid ${LT.rule}` }}>
+            <label style={{ fontSize:10, letterSpacing:"0.12em", textTransform:"uppercase", color:LT.faint, display:"block", marginBottom:4 }}>Building code</label>
+            <select value={g.code} onChange={(e)=>setGl("code",+e.target.value)} style={{ ...ltSel, width:"100%" }}>
+              <option value={1}>2006 IBC</option><option value={2}>2009 IBC</option>
+              <option value={3}>2012 IBC</option><option value={4}>2015 IBC</option>
+            </select>
+            <label style={{ fontSize:10, letterSpacing:"0.12em", textTransform:"uppercase", color:LT.faint, display:"block", margin:"10px 0 4px" }}>Wood framing</label>
+            <select value={g.species} onChange={(e)=>setGl("species",+e.target.value)} style={{ ...ltSel, width:"100%" }}>
+              <option value={1}>Southern Pine</option><option value={2}>Douglas-Fir</option>
+            </select>
+          </div>
+          <div style={{ flex:"0 1 150px", padding:"16px 20px", display:"flex", flexDirection:"column", gap:8 }}>
+            <div>
+              <label style={{ fontSize:10, letterSpacing:"0.12em", textTransform:"uppercase", color:LT.faint, display:"block", marginBottom:4 }}>Shear line</label>
+              <input value={g.line} onChange={(e)=>setGl("line",e.target.value)}
+                style={{ width:60, padding:"4px 8px", border:`1px solid ${LT.rule}`, borderRadius:4, fontFamily:MONO, fontSize:18, fontWeight:700, textAlign:"center", color:LT.blue, background:"#FDFDFB", outline:"none" }} />
+            </div>
+            <button className="no-print" onClick={()=>window.print()}
+              style={{ alignSelf:"flex-start", padding:"5px 12px", fontSize:11, fontWeight:700, letterSpacing:"0.06em", border:`1.5px solid ${LT.rule}`, background:"#FFF", color:LT.ink, cursor:"pointer", borderRadius:4 }}>
+              ⎙ Print report
+            </button>
+          </div>
+        </div>
+        <div style={{ padding:"8px 20px 28px" }}>
+          <HL.Provider value={{ sel: hlSel, setSel: setHlSel }}>
+            <CalcSheet g={g} setGl={setGl} segments={segments} setSegments={setSegments} results={resultsU} totalL={totalL}/>
+          </HL.Provider>
+          <div style={{ marginTop:24, fontSize:10, color:LT.faint, lineHeight:1.6, borderTop:`1px solid ${LT.rule}`, paddingTop:10 }}>
+            Faithful port of the source spreadsheet, including its exact formulas and thresholds (e.g. the wind end-post compression denominator and uplift &lt; 625 lbs → "neglect"). Hover a row label for its source-cell reference. The Design tab optimizer verifies every candidate through this same engine. Allowable values per the embedded schedule; holdowns/anchors per Simpson HDU / SSTB / STHD / MST capacities tabulated in the workbook. END OF CALC.
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="paper-desk" style={{ minHeight:"100vh" }}>
+      <style>{LT_CSS}</style>
+      {/* tab bar */}
+      <style>{APP_CSS}</style>
+      <div ref={tabBarRef} className="no-print tbar" style={{ display:"flex", alignItems:"center", borderBottom:`1px solid ${SW.rule}`, background:SW.sheet, position:"sticky", top:0, zIndex:40 }}>
+        <div className="tbrand" style={{ padding:"6px 16px" }}>
+          <div style={{ fontSize:12, fontWeight:800, letterSpacing:"0.06em", color:SW.ink }}>
+            PLAN<span style={{color:SW.accent}}>·</span>SKETCHER <span style={{color:SW.faint,fontWeight:400}}>+ Shear Walls</span>
+          </div>
+          <small>STRUCTURAL SUITE</small>
+        </div>
+        {tabBtn("plan","Plan Sketcher")}
+        {tabBtn("design","Design")}
+        {tabBtn("calc","Calculation Sheet", actU.length ? calcOK : undefined)}
+        <div style={{ marginLeft:"auto", padding:"6px 16px", fontFamily:MONO, fontSize:11, fontWeight:700,
+                      letterSpacing:"0.08em", color:SW.faint, whiteSpace:"nowrap" }}
+             title="App version">
+          Version {APP_VERSION}
+        </div>
+      </div>
+      {/* keep the sketcher mounted so the plan survives tab switches */}
+      <input ref={fileInputRef} type="file" accept=".wps,.json" style={{display:"none"}} onChange={onFileChosen}/>
+      <div style={{ display: tab==="plan" ? "block" : "none" }}>
+        <PlanSketcher onDesignShearWalls={onDesignShearWalls} fileOps={fileOps} registerProject={registerProject}
+                      twoStory={twoStory} setTwoStory={setTwoStory} activeFloor={activeFloor} setActiveFloor={setActiveFloor}/>
+      </div>
+      {tab === "design" && designSheet}
+      {tab === "calc" && calcSheetPage}
+    </div>
+  );
+}
