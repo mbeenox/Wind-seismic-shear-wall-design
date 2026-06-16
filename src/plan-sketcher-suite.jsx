@@ -8,7 +8,7 @@ import React, { useState, useRef, useMemo, useEffect, useCallback } from "react"
 //   • APP_VERSION (here)      — human-facing build number in the UI ("Version 1.00").
 //   • CURRENT_VERSION (~below)— save-file SCHEMA version; drives .wps migrations. Do NOT couple.
 //   • handoff "rev" number    — the dev changelog in PLAN_SKETCHER_SUITE_HANDOFF.md.
-const APP_BUILD = 110;                                                                 // +1 per release
+const APP_BUILD = 111;                                                                 // +1 per release
 const APP_VERSION = `${Math.floor(APP_BUILD / 100)}.${String(APP_BUILD % 100).padStart(2, "0")}`;  // "1.00"
 
 // ── geometry space: 1 unit = 1 ft ──────────────────────────────────────────
@@ -421,6 +421,11 @@ const CSS = `
 .rbtn.ron{background:#E8EFF4;border-color:var(--accent);color:var(--accent);}
 .rbtn.raccent{border-color:var(--accent);color:var(--accent);}
 .rbtn:disabled{opacity:.35;cursor:default;border-color:var(--line);color:var(--muted);}
+.rsel{border:1px solid var(--line);background:#FFFFFF;color:var(--ink);font-size:11.5px;font-weight:600;
+  padding:5px 8px;border-radius:4px;cursor:pointer;white-space:nowrap;font-family:inherit;
+  transition:border-color .14s ease,color .14s ease,background .14s ease;}
+.rsel:hover{border-color:var(--accent);color:var(--accent);background:#F6F9FB;}
+.rsel:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px rgba(35,87,127,.15);}
 .rsep{width:1px;background:linear-gradient(180deg,transparent,var(--line) 22%,var(--line) 78%,transparent);margin:0;}
 .statusbar{display:flex;align-items:center;gap:14px;margin-top:8px;padding:5px 12px;border:1px solid var(--line);
   border-radius:4px;background:var(--panel);font-size:11px;color:var(--muted);
@@ -716,12 +721,12 @@ const C_BG="#FFFFFF", C_GRID="#E9E7DE", C_WALL="#1C2733", C_NODE="#23577F",
       C_LOAD="#23577F", C_REACT="#B23A2A", C_DIMBOX="#23577F", C_REACTBOX="#B23A2A", C_DRAFT="#9A6B1F";
 
 /* masked label box (blue for dimensions, red for reactions) — readable over any line */
-function Tag({ x, y, text, box, S, rot=0 }) {
-  const fs=1.35*S, w=text.length*fs*0.64+0.9*S, h=fs*1.35;
+function Tag({ x, y, text, box, S, rot=0, ts=1 }) {
+  const fs=1.35*S*ts, w=text.length*fs*0.64+0.9*S*ts, h=fs*1.35;
   return (
     <g transform={rot?`rotate(${rot},${x},${y})`:undefined}>
-      <rect x={x-w/2} y={y-h/2} width={w} height={h} rx={0.3*S} fill={box}/>
-      <text x={x} y={y+0.15*S} fill="#fff" fontSize={fs} fontWeight="700"
+      <rect x={x-w/2} y={y-h/2} width={w} height={h} rx={0.3*S*ts} fill={box}/>
+      <text x={x} y={y+0.15*S*ts} fill="#fff" fontSize={fs} fontWeight="700"
             textAnchor="middle" dominantBaseline="middle">{text}</text>
     </g>
   );
@@ -742,7 +747,7 @@ function Field({ label, unit, value, onChange }) {
 }
 
 /* ═══════════════ WINDWARD LINE-LOAD (static, CAD style) ═══════════════ */
-function WindLoad({ load, onOpen, S=1 }) {
+function WindLoad({ load, onOpen, S=1, ts=1 }) {
   const { nx, ny } = load;
   // one group per leeward sub-region (split where the back wall's parapet changes). Adjacent
   // sub-regions that resolve to the SAME plf are merged into one span here so the wall shows a
@@ -780,7 +785,7 @@ function WindLoad({ load, onOpen, S=1 }) {
             {arrows.map(a=>(
               <line key={a.k} x1={a.x1} y1={a.y1} x2={a.x2} y2={a.y2} stroke={C_LOAD} strokeWidth={0.16*S} markerEnd="url(#loadArr)"/>
             ))}
-            <text x={lx} y={ly} fill={C_LOAD} fontSize={1.35*S} fontWeight="600" textAnchor="middle" dominantBaseline="central"
+            <text x={lx} y={ly} fill={C_LOAD} fontSize={1.35*S*ts} fontWeight="600" textAnchor="middle" dominantBaseline="central"
                   transform={wallVert?`rotate(-90,${lx},${ly})`:undefined}>{fmt1(total)} plf</text>
           </g>
         );
@@ -794,7 +799,7 @@ function WindLoad({ load, onOpen, S=1 }) {
    windward side along the load direction (tdir). On vertical walls the load runs down the wall, so
    the label is rotated to lie ALONG the shaft — text + arrowhead read as one rocket (matching the
    horizontal case) instead of a horizontal chip with an arrow poking out of it. */
-function Reaction({ r, tdir, S }) {
+function Reaction({ r, tdir, S, ts=1 }) {
   const dx=tdir.x, dy=tdir.y;
   const vert = Math.abs(dy) > Math.abs(dx);               // vertical rocket → rotate label to lie along the shaft
   const shaft=2.1*S;
@@ -804,7 +809,7 @@ function Reaction({ r, tdir, S }) {
   return (
     <g>
       <line x1={tx} y1={ty} x2={hx} y2={hy} stroke={C_REACT} strokeWidth={0.42*S} strokeLinecap="round" markerEnd="url(#reactArr)"/>
-      <Tag x={lx} y={ly} text={`${fmt2(r.kips)}k`} box={C_REACTBOX} S={S} rot={vert ? -90 : 0}/>
+      <Tag x={lx} y={ly} text={`${fmt2(r.kips)}k`} box={C_REACTBOX} S={S} ts={ts} rot={vert ? -90 : 0}/>
     </g>
   );
 }
@@ -908,6 +913,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
   const [snapOn,   setSnapOn]   = useState(true);
   const [ortho,    setOrtho]    = useState(true);
   const [dims,     setDims]     = useState(true);
+  const [textScale,setTextScale]= useState(1);       // on-plan text size multiplier (View ▸ Text): 1 / .75 / .5 / .25 — shrinks labels so they don't cover a zoomed-out plan
   const [panMode,  setPanMode]  = useState(false);   // left-drag "hand" pan tool (from canvas menu)
   const [zoomEnabled,setZoomEnabled]=useState(true); // wheel-zoom master switch (canvas-menu light)
   const [panCursor,setPanCursor]=useState(false);    // true while a pan gesture is live (grab cursor)
@@ -1154,7 +1160,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
                   // v2: the camera + working state, so a reopened file looks like where you left it
                   view:viewRef.current, selected:selRef.current,
                   drawMode:drawModeRef.current, panMode:panModeRef.current,
-                  zoomEnabled:zoomEnabledRef.current, snapOn, ortho, dims }),
+                  zoomEnabled:zoomEnabledRef.current, snapOn, ortho, dims, textScale }),
       set: (s)=>{
         if(!s||!s.graph) return;
         setGraph(s.graph);
@@ -1173,6 +1179,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
         if("snapOn" in s) setSnapOn(!!s.snapOn);
         if("ortho" in s) setOrtho(!!s.ortho);
         if("dims" in s) setDims(!!s.dims);
+        if("textScale" in s) setTextScale(Number(s.textScale)||1);
         history.current=[]; future.current=[];
       },
       // rev 24: let the Design tab rebuild geometry-less (stale) lines straight from the restored
@@ -1679,6 +1686,19 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
         </div>
         <div className="rsep"/>
         <div className="rgroup">
+          <div className="rlabel">Text</div>
+          <div className="rbtns">
+            <select className="rsel" title="On-plan text size — shrink labels (loads, dimensions, reactions) so they don't cover a zoomed-out plan"
+                    value={textScale} onChange={e=>setTextScale(parseFloat(e.target.value))}>
+              <option value="1">Text&nbsp;1×</option>
+              <option value="0.75">Text&nbsp;0.75×</option>
+              <option value="0.5">Text&nbsp;0.5×</option>
+              <option value="0.25">Text&nbsp;0.25×</option>
+            </select>
+          </div>
+        </div>
+        <div className="rsep"/>
+        <div className="rgroup">
           <div className="rlabel">Stories</div>
           <div className="rbtns">
             <div className={"storypill"+(twoStory?" two":"")}
@@ -1749,7 +1769,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
                   {anchor && (()=>{ const L=dist(anchor,drawPrev); if(L<0.5) return null;
                     const mx=(anchor.x+drawPrev.x)/2, my=(anchor.y+drawPrev.y)/2;
                     const vert=Math.abs(drawPrev.y-anchor.y)>Math.abs(drawPrev.x-anchor.x);
-                    return <text x={mx} y={my-1.6*S} textAnchor="middle" fontSize={1.35*S} fontWeight="700"
+                    return <text x={mx} y={my-1.6*S} textAnchor="middle" fontSize={1.35*S*textScale} fontWeight="700"
                                  fill={C_NODE} fontFamily="ui-monospace,Menlo,monospace"
                                  transform={vert?`rotate(-90,${mx},${my-1.6*S})`:undefined}>{fmt1(L)}′</text>; })()}
                   {drawPrev.snapped
@@ -1770,17 +1790,17 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
             )))}
 
             {/* windward line-load graphics — one per windward wall (all legs) */}
-            {secH&&secH.windLoads.map((wl,i)=><WindLoad key={"hL"+wl.key} load={wl} S={S} onOpen={()=>setActiveWall({axis:"h",key:wl.key})}/>)}
-            {secV&&secV.windLoads.map((wl,i)=><WindLoad key={"vL"+wl.key} load={wl} S={S} onOpen={()=>setActiveWall({axis:"v",key:wl.key})}/>)}
+            {secH&&secH.windLoads.map((wl,i)=><WindLoad key={"hL"+wl.key} load={wl} S={S} ts={textScale} onOpen={()=>setActiveWall({axis:"h",key:wl.key})}/>)}
+            {secV&&secV.windLoads.map((wl,i)=><WindLoad key={"vL"+wl.key} load={wl} S={S} ts={textScale} onOpen={()=>setActiveWall({axis:"v",key:wl.key})}/>)}
 
             {/* aggregated reactions (a shared support wall sums contributions into one arrow) */}
-            {secH&&secH.reactions.map((r,i)=><Reaction key={"hR"+i} r={r} tdir={secH.tdir} S={S}/>)}
-            {secV&&secV.reactions.map((r,i)=><Reaction key={"vR"+i} r={r} tdir={secV.tdir} S={S}/>)}
+            {secH&&secH.reactions.map((r,i)=><Reaction key={"hR"+i} r={r} tdir={secH.tdir} S={S} ts={textScale}/>)}
+            {secV&&secV.reactions.map((r,i)=><Reaction key={"vR"+i} r={r} tdir={secV.tdir} S={S} ts={textScale}/>)}
 
             {/* load-imbalance flags */}
             {[secH,secV].filter(Boolean).flatMap(sc=>(sc.windLoads||[]).filter(w=>w.imbalance).map((w,i)=>{
               const mx=(w.wa.x+w.wb.x)/2, my=(w.wa.y+w.wb.y)/2;
-              return <text key={(sc.axis)+i} x={mx+w.nx*4*S} y={my+w.ny*4*S} fill="#B23A2A" fontSize={1.35*S}
+              return <text key={(sc.axis)+i} x={mx+w.nx*4*S} y={my+w.ny*4*S} fill="#B23A2A" fontSize={1.35*S*textScale}
                            fontWeight="700" textAnchor="middle" dominantBaseline="middle">⚠ imbalance</text>;
             }))}
 
@@ -1805,7 +1825,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
               const editing=dimEdit&&same(dimEdit.edge,ed);
               return(
                 <g key={`d${ed.a}-${ed.b}`} style={{cursor:panMode?"grab":"text"}} onPointerDown={e=>{ if(panMode&&e.button===0){ beginPan(e); return; } e.stopPropagation(); }} onClick={e=>onDimClick(ed,e)}>
-                  <Tag x={mx} y={my} text={`${Math.round(L)}'`} box={editing?"#9A6B1F":C_DIMBOX} S={S} rot={isV?-90:0}/>
+                  <Tag x={mx} y={my} text={`${Math.round(L)}'`} box={editing?"#9A6B1F":C_DIMBOX} S={S} ts={textScale} rot={isV?-90:0}/>
                 </g>
               );
             })}
