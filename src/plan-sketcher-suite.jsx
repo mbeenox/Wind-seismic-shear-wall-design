@@ -8,7 +8,7 @@ import React, { useState, useRef, useMemo, useEffect, useCallback } from "react"
 //   • APP_VERSION (here)      — human-facing build number in the UI ("Version 1.00").
 //   • CURRENT_VERSION (~below)— save-file SCHEMA version; drives .wps migrations. Do NOT couple.
 //   • handoff "rev" number    — the dev changelog in PLAN_SKETCHER_SUITE_HANDOFF.md.
-const APP_BUILD = 111;                                                                 // +1 per release
+const APP_BUILD = 112;                                                                 // +1 per release
 const APP_VERSION = `${Math.floor(APP_BUILD / 100)}.${String(APP_BUILD % 100).padStart(2, "0")}`;  // "1.00"
 
 // ── geometry space: 1 unit = 1 ft ──────────────────────────────────────────
@@ -767,9 +767,9 @@ function WindLoad({ load, onOpen, S=1, ts=1 }) {
       {segs.map((sg,si)=>{
         const wa=sg.a, wb=sg.b, total=sg.plf;
         const len=Math.hypot(wb.x-wa.x, wb.y-wa.y);
-        const aLen = clamp(total/55, 3, 8) * 0.5 * S;
+        const aLen = clamp(total/55, 3, 8) * 0.25 * S;   // rev 31: load arrow halved (was *0.5)
         const n = Math.max(2, Math.round(len/(5.5*S)));
-        const tip = 0.3*S;
+        const tip = 0.15*S;                               // rev 31: halved (was 0.3)
         const b1={x:wa.x+nx*aLen, y:wa.y+ny*aLen}, b2={x:wb.x+nx*aLen, y:wb.y+ny*aLen};
         const arrows=[];
         for(let i=0;i<=n;i++){
@@ -781,9 +781,9 @@ function WindLoad({ load, onOpen, S=1, ts=1 }) {
         const lx=mx+nx*(aLen+2.2*S), ly=my+ny*(aLen+2.2*S);
         return (
           <g key={si}>
-            <line x1={b1.x} y1={b1.y} x2={b2.x} y2={b2.y} stroke={C_LOAD} strokeWidth={0.2*S}/>
+            <line x1={b1.x} y1={b1.y} x2={b2.x} y2={b2.y} stroke={C_LOAD} strokeWidth={0.1*S}/>
             {arrows.map(a=>(
-              <line key={a.k} x1={a.x1} y1={a.y1} x2={a.x2} y2={a.y2} stroke={C_LOAD} strokeWidth={0.16*S} markerEnd="url(#loadArr)"/>
+              <line key={a.k} x1={a.x1} y1={a.y1} x2={a.x2} y2={a.y2} stroke={C_LOAD} strokeWidth={0.08*S} markerEnd="url(#loadArr)"/>
             ))}
             <text x={lx} y={ly} fill={C_LOAD} fontSize={1.35*S*ts} fontWeight="600" textAnchor="middle" dominantBaseline="central"
                   transform={wallVert?`rotate(-90,${lx},${ly})`:undefined}>{fmt1(total)} plf</text>
@@ -802,13 +802,13 @@ function WindLoad({ load, onOpen, S=1, ts=1 }) {
 function Reaction({ r, tdir, S, ts=1 }) {
   const dx=tdir.x, dy=tdir.y;
   const vert = Math.abs(dy) > Math.abs(dx);               // vertical rocket → rotate label to lie along the shaft
-  const shaft=2.1*S;
+  const shaft=1.05*S;                                     // rev 31: arrow halved (was 2.1)
   const hx=r.ax, hy=r.ay;                                  // nose tip at the support node
   const tx=r.ax-dx*shaft, ty=r.ay-dy*shaft;                // shaft tail (windward side)
   const lx=r.ax-dx*(shaft+1.55*S), ly=r.ay-dy*(shaft+1.55*S); // label body behind the shaft
   return (
     <g>
-      <line x1={tx} y1={ty} x2={hx} y2={hy} stroke={C_REACT} strokeWidth={0.42*S} strokeLinecap="round" markerEnd="url(#reactArr)"/>
+      <line x1={tx} y1={ty} x2={hx} y2={hy} stroke={C_REACT} strokeWidth={0.21*S} strokeLinecap="round" markerEnd="url(#reactArr)"/>
       <Tag x={lx} y={ly} text={`${fmt2(r.kips)}k`} box={C_REACTBOX} S={S} ts={ts} rot={vert ? -90 : 0}/>
     </g>
   );
@@ -1809,9 +1809,9 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
               const isSel=p.id===selected;
               return(
                 <g key={p.id} style={{cursor:"grab"}} onPointerDown={e=>onNodeLDown(p.id,e)} onContextMenu={e=>openMenu(e,{kind:"node",id:p.id})}>
-                  <circle cx={p.x} cy={p.y} r={3.5*S} fill="transparent"/>
-                  {isSel&&<circle cx={p.x} cy={p.y} r={1.8*S} fill="rgba(35,87,127,.18)"/>}
-                  <circle cx={p.x} cy={p.y} r={(isSel?1.05:0.85)*S} fill={C_NODE} stroke={C_BG} strokeWidth={0.25*S}/>
+                  <circle cx={p.x} cy={p.y} r={3.5*S} fill="transparent"/>{/* hit-target kept full size for easy click/grab */}
+                  {isSel&&<circle cx={p.x} cy={p.y} r={0.9*S} fill="rgba(35,87,127,.18)"/>}
+                  <circle cx={p.x} cy={p.y} r={(isSel?0.525:0.425)*S} fill={C_NODE} stroke={C_BG} strokeWidth={0.125*S}/>{/* rev 31: node dot halved */}
                 </g>
               );
             })}
