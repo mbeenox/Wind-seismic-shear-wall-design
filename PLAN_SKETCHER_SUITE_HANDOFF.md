@@ -1,5 +1,5 @@
 # PLAN SKETCHER SUITE — SESSION HANDOFF
-*Updated: 2026-06-16 (rev 32 — **UNIFIED MARKUP SCALE.** Reworked rev-30/31: the toolbar dropdown now scales ALL on-plan markup together — text labels, the load/reaction arrows, AND the nodes — off one factor. The rev-31 hardcoded halving of arrows/nodes is REVERTED (base sizes restored to original); at `1×` everything is exactly its original size, and `0.75×`/`0.5×`/`0.25×` shrink text+arrows+nodes uniformly. The ribbon group is relabeled **Text → "Markup"** (options now bare `1×`…`0.25×`) and the state `textScale → markScale` (persisted under `markScale`, with a `textScale` back-compat read for any rev-30 save). Node click/grab hit-target stays full size (unscaled). Both arrowheads auto-scale via `markerUnits="strokeWidth"`. Engine + all 10 guarded fns byte-identical. `APP_BUILD = 113` ("Version 1.13"). See the rev-32 blockquote + §4gg.** Prior current rev — rev 31 — plan glyphs halved (now superseded/reverted by rev 32); see §4ff for history. Step 7a = the secondary detailing (anchor · embed · strap · deflection · footing) is re-derived from the stacked demand; Step 7c = a 25-assert stacking regression test; Step 7b = a frozen two-story `.wps` fixture + 31-assert round-trip load test + a schema tripwire locking the two-story field names (`H2`, `twoStory`, `activeFloor`, `linesByFloor`). All test/fixture infra is checked in; 7b made NO app-code change (persistence already worked). Engine + the 7 guarded fns byte-identical throughout.) · File: `plan-sketcher-suite.jsx` (~4,036 lines, single file, default export `App`)*
+*Updated: 2026-06-16 (rev 33 — **ENGINE EXTRACTED TO `calcCore.js` (first file split).** The shear-wall calculation engine — `calcSegment`, `generateDesign`, `baseDesignSeg`, `evaluateCandidate`, the `SCHEDULE`/`SCHEDULE_STR1`/`schedFor`/`HD_TABLE`/`NAIL_EDGE`/`CODES` data, and the `isNum`/`xMax`/`numOr0`/`CP` helpers — moved **verbatim** out of `plan-sketcher-suite.jsx` into a new sibling module `src/calcCore.js`. The app file now imports them at the top (`import { calcSegment, generateDesign, baseDesignSeg, schedFor, HD_TABLE, NAIL_EDGE, CODES, isNum, xMax, numOr0 } from "./calcCore.js";`). The block is self-contained (Math + its own helpers only — no React, no geometry/sketcher deps), so there is NO circular import. **Behavior is byte-identical:** all 12 guarded fns extract-and-diff IDENTICAL vs the pre-split baseline, AND the rendered `App` is byte-for-byte identical (32,000 chars, both). `APP_BUILD` stays **113 ("Version 1.13")** — like the rev-29 Vite scaffold, this is a structural/infra refactor with zero behavioral change, so no version bump. The wind engine (`lineReactions`/`buildSecData`/`findLeewardPartner`) and the design/stacking logic (`lineResults`/`stackSeg`/…) were left in the app file this pass — they're entangled with geometry helpers + React state and belong to the *next* split step. **DEPLOY NOTE:** the repo now has THREE source files in `src/` — `main.jsx`, `plan-sketcher-suite.jsx`, **and the new `calcCore.js`** — so the GitHub push must ADD `src/calcCore.js` alongside replacing `src/plan-sketcher-suite.jsx`. `index.html`/`main.jsx`/`package.json`/`vite.config.js` are unchanged. See §4hh. Prior rev — rev 32 — **UNIFIED MARKUP SCALE.** Reworked rev-30/31: the toolbar dropdown now scales ALL on-plan markup together — text labels, the load/reaction arrows, AND the nodes — off one factor. The rev-31 hardcoded halving of arrows/nodes is REVERTED (base sizes restored to original); at `1×` everything is exactly its original size, and `0.75×`/`0.5×`/`0.25×` shrink text+arrows+nodes uniformly. The ribbon group is relabeled **Text → "Markup"** (options now bare `1×`…`0.25×`) and the state `textScale → markScale` (persisted under `markScale`, with a `textScale` back-compat read for any rev-30 save). Node click/grab hit-target stays full size (unscaled). Both arrowheads auto-scale via `markerUnits="strokeWidth"`. Engine + all 10 guarded fns byte-identical. `APP_BUILD = 113` ("Version 1.13"). See the rev-32 blockquote + §4gg.** Prior current rev — rev 31 — plan glyphs halved (now superseded/reverted by rev 32); see §4ff for history. Step 7a = the secondary detailing (anchor · embed · strap · deflection · footing) is re-derived from the stacked demand; Step 7c = a 25-assert stacking regression test; Step 7b = a frozen two-story `.wps` fixture + 31-assert round-trip load test + a schema tripwire locking the two-story field names (`H2`, `twoStory`, `activeFloor`, `linesByFloor`). All test/fixture infra is checked in; 7b made NO app-code change (persistence already worked). Engine + the 7 guarded fns byte-identical throughout.) · File: `plan-sketcher-suite.jsx` (~4,036 lines, single file, default export `App`)*
 
 *Prior: rev 26 — Steps 1–5 of two-story (UI scaffold, `H2` model, two line loads, `SecDiagram2`, floor-aware on-plan loads + two-floor design). rev 25 — User-facing "Version X.XX" in the top bar. rev 24 — Design-data forward-compat + stale-line recovery + schema guards.*
 
@@ -21,7 +21,7 @@
 
 ## 0. START HERE — how to resume this project (read me first)
 
-**This project = the app + this handoff + the engine guards + the deploy scaffold:** `plan-sketcher-suite.jsx` (the app) · this handoff · `test_str1_golden.mjs` + `test_str1_design.mjs` (engine guards) · the rev-29 Vite host shell (`index.html` · `main.jsx` · `package.json` · `vite.config.js` · `.gitignore`, see §4dd) that makes it deployable · and separately `STRUCTURAL_SUITE_UI_THEME.md` (a *different* task — see bottom). **The whole repo (app + scaffold + this handoff) is what's committed to GitHub → Vercel.**
+**This project = the app + the engine module + this handoff + the engine guards + the deploy scaffold:** `plan-sketcher-suite.jsx` (the app) · `calcCore.js` (the shear-wall engine module, rev-33 split — §4hh) · this handoff · `test_str1_golden.mjs` + `test_str1_design.mjs` (engine guards) · the rev-29 Vite host shell (`index.html` · `main.jsx` · `package.json` · `vite.config.js` · `.gitignore`, see §4dd) that makes it deployable · and separately `STRUCTURAL_SUITE_UI_THEME.md` (a *different* task — see bottom). **The whole repo (app + engine module + scaffold + this handoff) is what's committed to GitHub → Vercel; `src/` now holds `main.jsx`, `plan-sketcher-suite.jsx`, AND `calcCore.js`.**
 
 **Standing rules for every session (do these automatically, without being asked):**
 - **Preview on resume.** As soon as you've read this handoff, preview the current `plan-sketcher-suite.jsx` in chat — copy it to `/mnt/user-data/outputs/` and present it so it renders as a live artifact — *before* writing the state summary and waiting for a task. The user wants to see the live app at the start of every session.
@@ -33,11 +33,13 @@
 
 **To keep building:**
 1. **Push the latest code to GitHub** (web UI → Vercel auto-deploys) so your live app matches this file's rev. The repo holds the app + the rev-29 Vite scaffold (§4dd) + THIS handoff — commit all three together (the handoff was missing from the first push; rev 29 closes that gap). Every push to `main` auto-redeploys on Vercel.
-2. **Open a NEW Claude chat, attach `plan-sketcher-suite.jsx` + this handoff**, and paste:
-   > Continuing development of my Plan Sketcher / Shear Wall Suite. Attached: the current app (`plan-sketcher-suite.jsx`, rev 32) and `PLAN_SKETCHER_SUITE_HANDOFF.md`. Read the handoff fully first. Key points: single-file React 18 + Vite app, default export `App`, deployed to Vercel via a thin host scaffold (§4dd — `index.html`/`main.jsx`/`package.json`/`vite.config.js`/`.gitignore`) that wraps the app WITHOUT touching it; the calc engine is a faithful port of a Struware-style spreadsheet and must stay byte-identical unless I explicitly approve a formula change; my workflow is GitHub web UI → Vercel (no terminal), so give me complete copy-paste-ready files. §6b has the full test harness — set it up and run it ONCE at the start of the session (build + render smoke + engine guard), and snapshot the engine baseline before your first edit (`cp work/plan-sketcher-suite.jsx work/.engine-baseline.jsx`). After that, don't re-run the whole sweep on every edit — per change, just compile + the engine byte-identity check + a focused smoke for what you touched. Per the §0 standing rules: after reading the handoff, preview the current jsx in chat (render it as a live artifact), and update this handoff in the same response as any code change. Confirm you've read the handoff, preview the current `plan-sketcher-suite.jsx`, give me a one-paragraph summary of the current state, then wait for my task.
+2. **Open a NEW Claude chat, attach `plan-sketcher-suite.jsx` + `calcCore.js` + this handoff** (zip the `src/` files together), and paste:
+   > Continuing development of my Plan Sketcher / Shear Wall Suite. Attached: the current app (`plan-sketcher-suite.jsx`, rev 33), the engine module (`calcCore.js`), and `PLAN_SKETCHER_SUITE_HANDOFF.md`. Read the handoff fully first. Key points: React 18 + Vite app, default export `App` in `plan-sketcher-suite.jsx`; **as of rev 33 the shear-wall calc engine lives in a separate `src/calcCore.js`** (`calcSegment`/`generateDesign`/`baseDesignSeg`/`schedFor`/`HD_TABLE`/`NAIL_EDGE`/`CODES`/`isNum`/`xMax`/`numOr0`, imported at the top of the app file) — the wind engine + design/stacking logic are still in the app file pending a later split. Deployed to Vercel via a thin host scaffold (§4dd — `index.html`/`main.jsx`/`package.json`/`vite.config.js`/`.gitignore`) that wraps the app WITHOUT touching it; the calc engine is a faithful port of a Struware-style spreadsheet and must stay byte-identical unless I explicitly approve a formula change; my workflow is GitHub web UI → Vercel (no terminal), so give me complete copy-paste-ready files. §6b has the full test harness — set it up and run it ONCE at the start of the session (build + render smoke + engine guard), and snapshot the engine baseline before your first edit (`cp work/src/plan-sketcher-suite.jsx work/.engine-baseline.jsx` AND keep `calcCore.js` alongside). The engine guard now extracts the moved fns from `calcCore.js` and the rest from the app file (§6b). After that, don't re-run the whole sweep on every edit — per change, just compile + the engine byte-identity check + a focused smoke for what you touched. Per the §0 standing rules: after reading the handoff, preview the current app in chat (bundle `calcCore.js` + `plan-sketcher-suite.jsx` into one temp jsx and render THAT as a live artifact — a multi-file app no longer renders as a standalone artifact), and update this handoff in the same response as any code change. Confirm you've read the handoff, preview the current app, give me a one-paragraph summary of the current state, then wait for my task.
 3. **Describe what you want changed.** For visual tweaks, paste a screenshot of the live UI — that gets the best results.
 
 **Tests:** the two `.mjs` engine guards are kept as ready-to-run files (they protect the calculations). **Checked-in save-file guards (rev 23–24):** `test_loadstate.cjs` (real-file load regression) · `test_schema.cjs` + `schema.expected.json` (a tripwire that fails if a defaulted field is renamed/removed) · `test_migrate_ladder.cjs` (proves the version-migration mechanism) · frozen fixtures `fixture_v1.wps` / `fixture_v2.wps` / `fixture_v2_design.wps` / `fixture_v2_stale.wps`. They all `require` a `work/exp.cjs` bundle built from a temp-export copy of the app (see §4w/§4x for the one-liner). The 8 UI/SSR `.cjs` suites aren't shipped as files — their full source is in **§6b** and a new chat regenerates them on demand.
+
+**Where rev 33 left off (ENGINE EXTRACTED TO `calcCore.js`):** the shear-wall engine is now a separate sibling module `src/calcCore.js` (exports `calcSegment`, `generateDesign`, `baseDesignSeg`, `evaluateCandidate`, `schedFor`, `SCHEDULE`, `SCHEDULE_STR1`, `NAIL_EDGE`, `CODES`, `HD_TABLE`, `isNum`, `xMax`, `numOr0`, `CP`); `plan-sketcher-suite.jsx` imports the 10 it uses at the top. Verbatim move — all 12 guarded fns byte-identical AND the rendered `App` byte-identical to the pre-split baseline (32,000 chars). No version bump (infra refactor; `APP_BUILD` stays 113). **Deploy:** ADD `src/calcCore.js` to the repo and replace `src/plan-sketcher-suite.jsx`; nothing else changes. NEXT: this was the "do calcCore now, the rest later" first cut — the natural follow-ups (when the user wants them) are (a) wind engine + geometry helpers → `geometry.js`/`windEngine.js` (these need geometry helpers extracted too, since `PlanSketcher` shares `keyOf`/`clamp`/`dist`/`segInt`/`pointInRing`), (b) design/stacking logic → `designLogic.js`, (c) the big UI modules (sketcher / calc sheet / design tab). Also still open from rev 29: the two-story live sign-off on Vercel.
 
 **Where rev 32 left off (UNIFIED MARKUP SCALE):** the toolbar dropdown (now labeled **Markup**, state `markScale`) scales text + load/reaction arrows + nodes together. rev-31's halving is reverted — base sizes are original again, so `1×` = original plan, and `0.75/0.5/0.25×` shrink everything uniformly. Geometry scales via the per-component `ts` prop (= `markScale`) multiplied into `Reaction` shaft/stroke/gap and `WindLoad` aLen/tip/strokes/gap, and via `markScale` directly on the node dot/halo/stroke + ghost preview. Node hit-target, arrow count, and snap ring stay unscaled by design. Persisted under `markScale` (`.wps` session) with a `textScale` back-compat read. Engine + all 10 fns byte-identical. Build `APP_BUILD = 113` ("Version 1.13"). NEXT: deploy (push the jsx + this handoff) and the still-open two-story live sign-off on Vercel. If the user later wants a different default or an even smaller floor, the base literals live in `Reaction`/`WindLoad`/the nodes block (all `rev 32:`-commented), and adding a `0.1×`/larger option is one `<option>` line.
 
@@ -74,7 +76,7 @@ The user (licensed PE/SE) replaces commercial spreadsheets (Struware) with these
 | ~480–630 | sketcher visuals: colors `C_BG/C_WALL/C_NODE/C_LOAD/C_REACT/...`, `Tag`, `WindLoad` (renders per-region `subLoads`), `Reaction`, `SecDiagram`, `WindWindow` |
 | ~640–1140 | `PlanSketcher({ onDesignShearWalls, fileOps, registerProject })`: state, history/**future** (redo), draw mode, LENGTHEN dim editing, view fit/freeze/**auto-expand**, pointer handlers, `runDesignHandoff` |
 | ~1150–1450 | sketcher JSX: header, **ribbon toolbar**, canvas (grid, walls, divides, loads, reactions, rubber band), side panel (cards unchanged + design button), **status bar**, `WindWindow` mount |
-| ~1500–1810 | shear-wall module: `SCHEDULE/CODES/HD_TABLE`, **`calcSegment` (verbatim — don't touch)**, `generateDesign`, dark theme `SW`, `Chip/Row/SectionTitle/NumInput/SwField/selStyle/swBtn` (**used by Design tab only now**), dark `Elevation` (currently unused, kept) |
+| ~1500–1810 | shear-wall module: **the engine — `SCHEDULE/SCHEDULE_STR1/schedFor/CODES/NAIL_EDGE/HD_TABLE`, `calcSegment`, `baseDesignSeg`, `evaluateCandidate`, `generateDesign`, `isNum/xMax/numOr0/CP` — moved to `src/calcCore.js` in rev 33 (§4hh) and imported at the top of the app file; treat `calcCore.js` as verbatim/don't-touch**. Still in THIS file: dark theme `SW`, `Chip/Row/SectionTitle/NumInput/SwField/selStyle/swBtn` (**used by Design tab only now**), dark `Elevation` (currently unused, kept) |
 | ~1810–2130 | **LIGHT calc-sheet module** (namespaced `Lt*`/`LT` — collision-free with dark set): `withUtil(r,seg)` (derives `utilW/utilS/utilPost/utilHD/pass` WITHOUT touching the engine), `LT` palette, `LT_CSS` (`.sw-table` sticky/zebra/hover/`.sw-hl`, focus rings, `@media print .no-print`), `LtChip/LtUtilBar/LtRow/LtSegHeader/LtCollapse/LtNumInput/ltSel/LtComplianceBanner/LtElevation`, `HL` context (`React.createContext` — react import not widened), `CalcSheet` (light, 1:1 body from standalone rev; consumes **util-augmented** results) |
 | ~1950–2400 | Design tab: `lineResults` (auto type + override validation: `postAllowable`, `hdCapacity`), `DesignPlan` (plan canvas, drag, ctx menu trigger), `SwCtxMenu`, `DesignTab` |
 | ~2780–end | **`App` shell**: tabs (Calculation tab now carries a green/red pass dot from `calcOK`), shear globals `g` + calc `segments`, `resultsU = results.map(withUtil)` + `hlSel` column-highlight state, **`calcSheetPage`** (light page: `LT.paper` bg, white sheet, light title block + Print, `<style>{LT_CSS}</style>`, `HL.Provider` wrapping `CalcSheet results={resultsU}`) and **`designSheet`** (dark wrapper, unchanged styling, DesignTab only) replacing the old shared `sheetTab`; **.wps save/open/new**, `applyToCalc`, sketcher kept mounted (`display:none`) so plan survives tab switches. Suite tab bar has `className="no-print"`. |
@@ -519,6 +521,20 @@ The user asked to halve three on-plan drawing elements (distinct from rev 30, wh
 
 **Tweaks if asked:** base sizes live in the `rev 32:`-commented lines (nodes block, `Reaction`, `WindLoad`); a smaller floor or different default is one `<option>` / the `useState(1)` initial; promoting the scale into a shared constant isn't needed since `markScale`/`ts` already is that single factor.
 
+## 4hh. Rev 33 — Shear-wall engine extracted to `calcCore.js` (first file split; user-requested)
+
+The user asked to start splitting the monolithic single-file app into modules (motivation: easier debugging + not re-uploading the whole 4k-line file for every change), beginning with the calc engine and doing the rest later. This rev extracts ONLY the shear-wall calculation engine into a new sibling module `src/calcCore.js`. It is a **pure text move — zero behavioral change** (proven two ways below). `APP_BUILD` stays **113 ("Version 1.13")**: like the rev-29 Vite scaffold, this is structural/infra, and the user-facing version tracks app-code behavior changes, of which there are none.
+
+- **What moved (verbatim) into `src/calcCore.js`:** the data `SCHEDULE`, `SCHEDULE_STR1`, `schedFor`, `NAIL_EDGE`, `CODES`, `HD_TABLE`; the helpers `isNum`, `xMax`, `numOr0`, `CP`; and the engine fns `calcSegment`, `baseDesignSeg`, `evaluateCandidate`, `generateDesign`. These were lines ~1989–2198 of the rev-32 file (the whole block between the "PLYWOOD SHEAR WALL MODULE" banner and the `// ---------- Formatting + dark theme` comment). `calcCore.js` ends with one `export { … }` of all 14 names.
+- **Why this block specifically (clean cut, no circular import):** the shear engine is **self-contained** — it references only `Math.*` and helpers defined within the block (`schedFor`/`xMax`/`CP`/`HD_TABLE`/`numOr0`/`isNum`). It does NOT use any geometry helper (`keyOf`/`clamp`/`dist`/…) or React. So it can live in its own module with **no imports back into the app file** → no circular dependency. (The wind engine `lineReactions`/`buildSecData`/`findLeewardPartner` is NOT self-contained — it uses the geometry helpers that `PlanSketcher` also uses — which is exactly why it was left for a later split that also extracts `geometry.js`.)
+- **What the app file imports back:** the 10 names actually referenced outside the block — `calcSegment, generateDesign, baseDesignSeg, schedFor, HD_TABLE, NAIL_EDGE, CODES, isNum, xMax, numOr0` — via `import { … } from "./calcCore.js";` placed immediately after the React import. (`CP`, `evaluateCandidate`, `SCHEDULE`, `SCHEDULE_STR1` have no external callers — they stay internal to `calcCore.js` but are still exported for the test harness / future modules.) The "PLYWOOD SHEAR WALL MODULE" banner comment stays in the app file with an added note that the engine now lives in `calcCore.js`.
+- **Still in `plan-sketcher-suite.jsx` (deliberately, for the later split):** the wind engine (`lineReactions`/`buildSecData`/`findLeewardPartner`), the design/stacking logic (`lineResults`/`stackSeg`/`stackedLineResults`/`upliftStk`/`withUtil`/`postAllowable`/`hdCapacity`), all React components, `fmt`, the themes/CSS, persistence (`loadProject`/`migrateProject`/`DEFAULT_*`), and `App`. `fmt` calls `isNum` (now imported) — fine.
+- **Proven byte-identical TWO ways.** (1) **Engine guard:** all **12** guarded fns (`calcSegment`, `generateDesign`, `evaluateCandidate`, `baseDesignSeg`, `lineReactions`, `buildSecData`, `findLeewardPartner`, `lineResults`, `withUtil`, `stackSeg`, `stackedLineResults`, `upliftStk`) extract-and-diff **IDENTICAL** vs the rev-32 baseline — the 4 moved ones found in `calcCore.js`, the other 8 in the app file. (2) **Rendered-App diff:** bundled `App` from the rev-32 monolith AND from the post-split pair, `renderToString`'d both → **byte-for-byte identical, 32,000 chars each**. Plus: both files esbuild-compile (the `./calcCore.js` import resolves), comment-balance clean in both, and a direct functional test of `calcCore.js` as an imported module (all 14 exports present; the Structural-I golden `vW = 438.75`; `schedFor("str1")` caps 475/715/930; `schedFor(undefined) === SCHEDULE`).
+- **Deploy (IMPORTANT — this push ADDS a file).** The repo `src/` now holds **three** source files: `main.jsx` (unchanged — still `import App from "./plan-sketcher-suite.jsx"`), `plan-sketcher-suite.jsx` (replaced — engine block removed, import added), and **`calcCore.js` (NEW — must be created in the repo)**. `index.html`, `package.json`, `vite.config.js`, `.gitignore` are all unchanged (Vite resolves the new relative import automatically; no config needed). So via GitHub web UI: add `src/calcCore.js`, replace `src/plan-sketcher-suite.jsx`, and re-commit this handoff.
+- **Preview workflow note (changed by the split).** A multi-file app no longer renders as a standalone Claude artifact (the artifact runtime can't resolve `./calcCore.js`). To keep the §0 "preview as a live artifact" rule working, **bundle `calcCore.js` + `plan-sketcher-suite.jsx` into one temp single-file jsx and present THAT** (concatenate calcCore minus its `export`, then the app file minus its `calcCore` import — or esbuild-bundle). The committed repo stays modular; the preview is a throwaway bundle.
+- **Harness impact (see §6/§6b updates):** the engine byte-identity guard now searches BOTH `calcCore.js` (moved fns) and the app file (the rest), and its extractor handles `const name =` arrows (e.g. `upliftStk`) as well as `function name(`. The golden-suite bundle step now bundles `calcCore.js` directly (it already exports the engine) instead of appending an `export` to a copy of the app file.
+- **NEXT (the "rest later" the user deferred):** (a) `geometry.js` (`clamp`/`dist`/`keyOf`/`fmt1`/`fmt2`/`niceStep`/`wallAng`/`segInt`/`computeCut`/`buildFrom`/`loopInfo`/`pointInRing`/`mergeWallProps`/`DEF_SECTION`) + `windEngine.js` (`lineReactions`/`buildSecData`/`findLeewardPartner`) — these move together because the wind engine depends on the geometry helpers, which `PlanSketcher` ALSO imports; (b) `designLogic.js` (the stacking/`withUtil` block); (c) the big UI modules (`sketcher.jsx`, `calcSheet.jsx`, `designTab.jsx`) + `App.jsx`. Group by change-frequency to minimize multi-file web-UI commits. Each step: text-move only, keep the engine/render guards green, bundle a preview.
+
 ## 6. Verification workflow (run the FULL sweep once at session start; minimal guard per edit)
 
 **Cadence (rev 27):** run the full sweep below **once, at the beginning of the chat**, to establish a clean baseline (and snapshot the engine baseline before the first edit). After that, **don't re-run the whole sweep on every edit** — it burns tokens. The minimal per-edit guard is: (1) esbuild compile, (2) the engine byte-identity check (cheap), (3) one focused render/headless smoke for the specific thing you changed. Run the full sweep again only before handing back a finished increment (or when you touched something broad).
@@ -575,9 +591,10 @@ $ESB /tmp/calc_tab.jsx --bundle --format=cjs --outfile=work/calc_tab.cjs --exter
 cp $SRC /tmp/rk.jsx; printf '\nexport { Reaction };\n' >> /tmp/rk.jsx
 $ESB /tmp/rk.jsx --bundle --format=cjs --outfile=work/rk.cjs --external:react --external:react-dom --log-level=error
 
-# (e) engine functions exported — used by the two .mjs golden suites
-cp $SRC /tmp/sw_test.jsx; printf '\nexport { calcSegment, generateDesign, schedFor, SCHEDULE, SCHEDULE_STR1, withUtil };\n' >> /tmp/sw_test.jsx
-$ESB /tmp/sw_test.jsx --bundle --format=cjs --outfile=work/sw_test.cjs --external:react --external:react-dom --log-level=error
+# (e) engine functions — as of rev 33 calcCore.js ALREADY exports them, so bundle it DIRECTLY
+#     (calcSegment/generateDesign/schedFor/SCHEDULE/SCHEDULE_STR1 live in calcCore.js now;
+#      `withUtil` still lives in the app file — export it from a copy of $SRC if a suite needs it).
+$ESB work/src/calcCore.js --bundle --format=cjs --outfile=work/sw_test.cjs --log-level=error
 
 # (f) wind-field engine exported — used by test_reentrant_reactions (rev 18)
 cp $SRC /tmp/secdata.jsx; printf '\nexport { buildSecData, keyOf };\n' >> /tmp/secdata.jsx
@@ -595,30 +612,53 @@ done
 node work/test_str1_golden.mjs && node work/test_str1_design.mjs
 
 # Engine guard: prove no UI edit changed the math.
-# ONE-TIME, before your first edit this session, snapshot the baseline:
-#     cp work/plan-sketcher-suite.jsx work/.engine-baseline.jsx
-# Then after any edit, run this to confirm the 7 engine fns are byte-identical to that baseline:
+# ONE-TIME, before your first edit this session, snapshot the baseline (the app file alone is fine
+# as the baseline ONLY if you snapshot it before splitting; post-rev-33 the engine lives in calcCore.js,
+# so snapshot BOTH or — simplest — snapshot a concatenation. The script below diffs each guarded fn
+# from wherever it currently lives (calcCore.js for the moved engine fns, the app file for the rest)
+# against the baseline. As of rev 33 the baseline must contain the engine text too; if you split further,
+# extend SRCS with the new module files.):
+#     cp work/src/plan-sketcher-suite.jsx work/.engine-baseline.jsx   # (pre-rev-33 monolith baseline)
+#     # post-rev-33: the baseline is the rev-32 monolith; the guard finds moved fns in calcCore.js.
+# Then after any edit, run this to confirm the guarded fns are byte-identical to that baseline:
 python3 - <<'PY'
 import os, sys
 BASE='work/.engine-baseline.jsx'
+# the guarded fns may now live across multiple files; search them in order:
+SRCS=['work/src/calcCore.js','work/src/plan-sketcher-suite.jsx']
 if not os.path.exists(BASE):
-    sys.exit("no baseline yet — run: cp work/plan-sketcher-suite.jsx work/.engine-baseline.jsx (do this BEFORE your first edit)")
+    sys.exit("no baseline yet — snapshot the current (rev-32 monolith) jsx as work/.engine-baseline.jsx BEFORE your first edit")
 def fn(src,name):
-    i=src.find('function '+name+'(');d=0;k=src.find('{',i)
-    while True:
-        if src[k]=='{':d+=1
-        elif src[k]=='}':
+    # handles `function name(` and `const name =` (arrow with block body, e.g. upliftStk)
+    i=-1
+    for pat in ('function '+name+'(','const '+name+' ='):
+        i=src.find(pat)
+        if i!=-1: break
+    if i==-1: return None
+    k=src.find('{',i); d=0; j=k
+    while j<len(src):
+        if src[j]=='{': d+=1
+        elif src[j]=='}':
             d-=1
-            if d==0:break
-        k+=1
-    return src[i:k+1]
-prev=open(BASE).read(); new=open('work/plan-sketcher-suite.jsx').read()
-fns=['calcSegment','generateDesign','evaluateCandidate','lineResults','withUtil','buildSecData','lineReactions']
-bad=[f for f in fns if fn(prev,f)!=fn(new,f)]
-print('ENGINE', 'CLEAN' if not bad else 'DIRTY — changed: '+', '.join(bad))
+            if d==0: return src[i:j+1]
+        j+=1
+    return None
+prev=open(BASE).read()
+cur={p:open(p).read() for p in SRCS if os.path.exists(p)}
+def find_cur(name):
+    for p in SRCS:
+        if p in cur:
+            t=fn(cur[p],name)
+            if t is not None: return t
+    return None
+fns=['calcSegment','generateDesign','evaluateCandidate','baseDesignSeg','lineReactions','buildSecData',
+     'findLeewardPartner','lineResults','withUtil','stackSeg','stackedLineResults','upliftStk']
+bad=[f for f in fns if fn(prev,f)!=find_cur(f)]
+print('ENGINE', 'CLEAN' if not bad else 'DIRTY — changed/missing: '+', '.join(bad))
 PY
 # NOTE: refresh the baseline only when the user EXPLICITLY approves an engine/formula change,
-# i.e. after that change lands: cp work/plan-sketcher-suite.jsx work/.engine-baseline.jsx
+# i.e. after that change lands: cp the relevant current source over work/.engine-baseline.jsx
+# (or re-derive a fresh monolith baseline).
 ```
 
 ### Step 4 — the test sources (write each verbatim to `work/<name>`)
@@ -950,7 +990,7 @@ process.exit(fail?1:0);
 
 1. User uploads this MD + `plan-sketcher-suite.jsx` (zip).
 2. `unzip` to `/home/claude/work`, **read the relevant regions before editing** (file is large; use targeted `view`/grep).
-3. **Preview the app in chat right away** — copy `plan-sketcher-suite.jsx` to `/mnt/user-data/outputs/` and present it so it renders as a live artifact. Do this after reading the MD and before waiting for a task (§0 standing rule).
+3. **Preview the app in chat right away** — since rev 33 the app is multi-file (`plan-sketcher-suite.jsx` + `calcCore.js`) and no longer renders as a standalone artifact, so **bundle the two into one temp single-file jsx** (concatenate `calcCore.js` minus its `export` + the app file minus its `./calcCore.js` import, or esbuild-bundle), copy that to `/mnt/user-data/outputs/`, and present it so it renders as a live artifact. Do this after reading the MD and before waiting for a task (§0 standing rule). The committed repo stays modular — the bundle is preview-only, not a deliverable.
 4. `npm install esbuild react@18 react-dom@18` in `/home/claude` if the env is fresh; recreate `test_render_smoke.cjs` from §6 if tests weren't uploaded.
 5. Make minimal `str_replace` edits → compile → render smoke → logic tests → copy to `/mnt/user-data/outputs/` → present.
 6. **Update this handoff in the same session as any app change** (§0 standing rule) — bump the top rev line, add a `§4*`-style rev subsection, update the rev number in the §0 resume prompt, refresh "Where rev N left off" / "Open items". Code + handoff ship together.
