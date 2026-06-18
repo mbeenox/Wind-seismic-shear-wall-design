@@ -15,7 +15,7 @@ import {
 //   • APP_VERSION (here)      — human-facing build number in the UI ("Version 1.00").
 //   • CURRENT_VERSION (~below)— save-file SCHEMA version; drives .wps migrations. Do NOT couple.
 //   • handoff "rev" number    — the dev changelog in PLAN_SKETCHER_SUITE_HANDOFF.md.
-const APP_BUILD = 113;                                                                 // +1 per release
+const APP_BUILD = 114;                                                                 // +1 per release
 const APP_VERSION = `${Math.floor(APP_BUILD / 100)}.${String(APP_BUILD % 100).padStart(2, "0")}`;  // "1.00"
 
 // ── geometry space: 1 unit = 1 ft ──────────────────────────────────────────
@@ -754,7 +754,7 @@ function Field({ label, unit, value, onChange }) {
 }
 
 /* ═══════════════ WINDWARD LINE-LOAD (static, CAD style) ═══════════════ */
-function WindLoad({ load, onOpen, S=1, ts=1 }) {
+function WindLoad({ load, onOpen, S=1, ts=1, displayPlf=null }) {
   const { nx, ny } = load;
   // one group per leeward sub-region (split where the back wall's parapet changes). Adjacent
   // sub-regions that resolve to the SAME plf are merged into one span here so the wall shows a
@@ -763,11 +763,18 @@ function WindLoad({ load, onOpen, S=1, ts=1 }) {
   const raw = (load.subLoads && load.subLoads.length)
     ? load.subLoads
     : [{ a:load.wa, b:load.wb, plf:load.total }];
-  const segs = [];
-  for(const sg of raw){
-    const prev = segs[segs.length-1];
-    if(prev && Math.abs(prev.plf - sg.plf) < 0.5) prev.b = sg.b;   // same plf → extend the span
-    else segs.push({ a:sg.a, b:sg.b, plf:sg.plf });
+  let segs = [];
+  if(displayPlf!=null){
+    // rev 34 — 2-story FLOOR-1 view: the floor diaphragm load (½·H·pw + ½·H₂·pw) is uniform along the
+    // wall (the leeward-parapet term lives only in the ROOF diaphragm, which transfers down through the
+    // shear walls, not the floor diaphragm), so collapse to ONE span showing the floor-only plf.
+    segs = [{ a:load.wa, b:load.wb, plf:displayPlf }];
+  } else {
+    for(const sg of raw){
+      const prev = segs[segs.length-1];
+      if(prev && Math.abs(prev.plf - sg.plf) < 0.5) prev.b = sg.b;   // same plf → extend the span
+      else segs.push({ a:sg.a, b:sg.b, plf:sg.plf });
+    }
   }
   return (
     <g style={{cursor:"pointer"}} onPointerDown={e=>e.stopPropagation()} onClick={onOpen}>
@@ -851,7 +858,11 @@ function WindWindow({ section, setVals, onReverse, onClose, onRemove, twoStory }
   // The 2nd-story wall (H₂) splits: upper ½ → roof diaphragm, lower ½ → 2nd-floor diaphragm.
   const wallRes2 = 0.5 * num(v.H2) * num(v.pw);        // ½·H₂·pw
   const roofLL   = wallRes2 + windPar + leePar;        // roof diaphragm = ½·H₂·pw + parapets  → designs 2nd-floor walls
-  const floorLL  = wallRes + wallRes2 + roofLL;        // 2nd-floor diaphragm = ½·H·pw + ½·H₂·pw + transferred roof load → designs 1st-floor walls
+  // 2nd-floor diaphragm carries ONLY the half-walls directly above and below it (½·H·pw + ½·H₂·pw).
+  // The roof diaphragm + parapets do NOT pour into the floor diaphragm — that load transfers DOWN
+  // through the 2nd-story shear wall into the 1st-story shear wall as a POINT load (stacked overturning
+  // / holdown, unchanged). So this is the floor-only line load, not roof+floor combined. (rev 34)
+  const floorLL  = wallRes + wallRes2;                 // 2nd-floor diaphragm = ½·H·pw + ½·H₂·pw  → designs 1st-floor walls
   // Reverse flips the plan's wind direction; the window re-points to the new windward wall. With
   // one parapet stored per physical wall, each wall keeps its own height — so the values simply
   // swap windward/leeward roles, no copying needed, and they survive on split walls too.
@@ -883,7 +894,6 @@ function WindWindow({ section, setVals, onReverse, onClose, onRemove, twoStory }
               <div style={{ marginTop:8, paddingTop:8, borderTop:"1px solid rgba(255,255,255,.08)" }}>
                 <div className="brk"><span>½·H₂·pw — 2nd-story wall (lower ½)</span><b>{fmt1(wallRes2)} plf</b></div>
                 <div className="brk"><span>½·H·pw — 1st-story wall (upper ½)</span><b>{fmt1(wallRes)} plf</b></div>
-                <div className="brk"><span>roof load transferred ↓</span><b>{fmt1(roofLL)} plf</b></div>
               </div>
             </div>
           ) : (
@@ -1548,6 +1558,16 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
     const H=p.H||0, H2=p.H2||0;
     return { ...p, H: activeFloor===2 ? H2 : H + 2*H2 };
   },[propsFor, twoStory, activeFloor]);
+  // rev 34 — 2-story FLOOR-1 ON-PLAN LABEL (display only). The 2nd-floor diaphragm carries ONLY the
+  // half-walls above and below it (½·H·pw + ½·H₂·pw); the roof diaphragm + parapets do NOT pour into
+  // it — that load transfers down through the 2nd-story shear wall into the 1st-story wall as a POINT
+  // load. The combined load above (H+2·H₂ via propsForActive) still drives the REACTIONS/point loads
+  // (unchanged), so this floor-only value is purely what the plan LABEL shows. Uniform along a wall
+  // (no leeward-parapet term → it cancels), and uses the REAL H/H₂ (not the propsForActive substitution).
+  const floorDiaphragmPlf = useCallback((key)=>{
+    const p = propsFor(key);
+    return 0.5*(p.pw||0)*((p.H||0)+(p.H2||0));
+  },[propsFor]);
   const toggleSupport = useCallback((edge)=>{
     const k=keyOf(edge);
     setNoSupport(s=>{ const n=new Set(s); n.has(k)?n.delete(k):n.add(k); return n; });
@@ -1791,15 +1811,23 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
             {draft&&(<line x1={draft.x1} y1={draft.y1} x2={draft.x2} y2={draft.y2} stroke={C_DRAFT} strokeWidth={0.5*S} strokeDasharray={`${2*S} ${1.5*S}`} opacity=".7"/>)}
 
             {/* dashed tributary divides — where the line load changes (front node or projected
-                back-wall node) — drawn from the windward face across to the leeward face */}
-            {[secH,secV].filter(Boolean).flatMap(sc=>(sc.divides||[]).map((d,i)=>(
+                back-wall node) — drawn from the windward face across to the leeward face.
+                rev 34: hidden in 2-story FLOOR-1 view — the floor diaphragm load is uniform along
+                each wall there (the parapet/leeward variation lives in the ROOF diaphragm only). */}
+            {!(twoStory&&activeFloor===1) && [secH,secV].filter(Boolean).flatMap(sc=>(sc.divides||[]).map((d,i)=>(
               <line key={(sc.axis)+"div"+i} x1={d.x1} y1={d.y1} x2={d.x2} y2={d.y2}
                     stroke={C_LOAD} strokeWidth={0.18*S} strokeDasharray={`${1.4*S} ${1.4*S}`} opacity=".55"/>
             )))}
 
-            {/* windward line-load graphics — one per windward wall (all legs) */}
-            {secH&&secH.windLoads.map((wl,i)=><WindLoad key={"hL"+wl.key} load={wl} S={S} ts={markScale} onOpen={()=>setActiveWall({axis:"h",key:wl.key})}/>)}
-            {secV&&secV.windLoads.map((wl,i)=><WindLoad key={"vL"+wl.key} load={wl} S={S} ts={markScale} onOpen={()=>setActiveWall({axis:"v",key:wl.key})}/>)}
+            {/* windward line-load graphics — one per windward wall (all legs). rev 34: in 2-story
+                FLOOR-1 view the label shows the FLOOR-only diaphragm plf (½·H·pw + ½·H₂·pw); the roof
+                load reaches the 1st floor through the shear walls as a point load, not the diaphragm. */}
+            {secH&&secH.windLoads.map((wl,i)=><WindLoad key={"hL"+wl.key} load={wl} S={S} ts={markScale}
+                 displayPlf={twoStory&&activeFloor===1 ? floorDiaphragmPlf(wl.key) : null}
+                 onOpen={()=>setActiveWall({axis:"h",key:wl.key})}/>)}
+            {secV&&secV.windLoads.map((wl,i)=><WindLoad key={"vL"+wl.key} load={wl} S={S} ts={markScale}
+                 displayPlf={twoStory&&activeFloor===1 ? floorDiaphragmPlf(wl.key) : null}
+                 onOpen={()=>setActiveWall({axis:"v",key:wl.key})}/>)}
 
             {/* aggregated reactions (a shared support wall sums contributions into one arrow) */}
             {secH&&secH.reactions.map((r,i)=><Reaction key={"hR"+i} r={r} tdir={secH.tdir} S={S} ts={markScale}/>)}
