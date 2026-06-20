@@ -15,7 +15,7 @@ import {
 //   • APP_VERSION (here)      — human-facing build number in the UI ("Version 1.00").
 //   • CURRENT_VERSION (~below)— save-file SCHEMA version; drives .wps migrations. Do NOT couple.
 //   • handoff "rev" number    — the dev changelog in PLAN_SKETCHER_SUITE_HANDOFF.md.
-const APP_BUILD = 122;                                                                 // +1 per release
+const APP_BUILD = 123;                                                                 // +1 per release
 const APP_VERSION = `${Math.floor(APP_BUILD / 100)}.${String(APP_BUILD % 100).padStart(2, "0")}`;  // "1.00"
 
 // ── geometry space: 1 unit = 1 ft ──────────────────────────────────────────
@@ -953,8 +953,15 @@ function SecDiagramSeq({ seq, v, upd, floorLL, roofLL, commit }){
   const leftX=70, rightX=250, sp=rightX-leftX;   // (rev 41) walls pulled left so the diaphragm callouts no longer overlap the leeward wall line
   const xAt=(i)=> N<=1?leftX:(leftX + i*sp/(N-1));
   const topY=(w)=> wallBot - (w.one? w.H : w.H+w.H2)*pxPerFt;
-  const yF2 = wallBot - H1*pxPerFt;                 // floor diaphragm (1-story top = 2nd-floor line)
-  const yRoof= wallBot - (H1+H2box)*pxPerFt;        // roof diaphragm over the 2-story block
+  // (rev 43) PER-WALL diaphragm levels so the diaphragm lines CONNECT to each wall's own top and the
+  // section DEFORMS as a connected shape when a height changes (the 1-story's sloping ROOF LINE,
+  // generalized to N walls), instead of a flat line pinned at the max height. floorY = a wall's
+  // 1st-story top (Level-1/floor node); roofY = a 2-story wall's full top (Level-2/roof node). When the
+  // heights all match these collapse to the old flat lines, so a uniform building looks unchanged.
+  const floorY=(i)=> wallBot - W[i].H*pxPerFt;
+  const roofY =(i)=> wallBot - (W[i].H + (W[i].one?0:W[i].H2))*pxPerFt;
+  const yF2 = wallBot - H1*pxPerFt;                 // max 1-story top (kept for scale/label fallback)
+  const yRoof= wallBot - (H1+H2box)*pxPerFt;        // max block top
   const CY="#23577F", YEL="#1C2733", GOLD="#9A6B1F", GRN="#2E6B4F", GRY="#6B7684";
   const pw0=W[0].pw, q0=W[0].q, qL=W[last].q;
   // (rev 41) scale the arrows over EVERY wall's pressures (incl. the 2-story block), so the block's
@@ -973,21 +980,29 @@ function SecDiagramSeq({ seq, v, upd, floorLL, roofLL, commit }){
       <text x={cx} y={cy+0.4} fill="#fff" fontSize={7} fontWeight={700} textAnchor="middle" dominantBaseline="middle" style={{userSelect:"none"}}>{text}</text></g>); };
   const twoIdx=W.map((w,i)=>w.one?-1:i).filter(i=>i>=0);   // indices of 2-story walls (the block)
   const calloutX=300;   // (rev 41) right of rightX(250)+leeward arrows → no overlap with the wall line
+  const cFloorY=floorY(last);                                   // (rev 43) anchor the Level-1 callout to the floor diaphragm's leeward END
+  const cRoofY = twoIdx.length ? roofY(twoIdx[twoIdx.length-1]) : yRoof;   // Level-2 callout → roof diaphragm's leeward end
   return (
    <div style={{position:"relative"}}>
     <svg viewBox={`0 0 ${VBW} ${VBH}`} style={{width:"100%",height:"auto",display:"block"}}>
       <defs><marker id="dArrM" markerWidth="6" markerHeight="6" refX="4.6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill={CY}/></marker></defs>
       <rect x="0" y="0" width={VBW} height={VBH} fill={C_BG} rx="6"/>
-      {/* foundation + diaphragms */}
+      {/* foundation */}
       <line x1={xAt(0)} y1={wallBot} x2={xAt(last)} y2={wallBot} stroke={YEL} strokeWidth="1.4"/>
-      <line x1={xAt(0)} y1={yF2} x2={xAt(last)} y2={yF2} stroke={GOLD} strokeWidth="1.3" strokeDasharray="5 3"/>
-      {twoIdx.length>0 && <line x1={xAt(twoIdx[0])} y1={yRoof} x2={xAt(twoIdx[twoIdx.length-1])} y2={yRoof} stroke={YEL} strokeWidth="1.4"/>}
-      {/* each wall in the cut, front → back */}
+      {/* (rev 43) LEVEL-1 (floor) diaphragm — a POLYLINE through every wall's own 1st-story top with a NODE
+          at each, so changing any wall's H makes the diaphragm slope/step and the section deforms as one
+          connected shape (like the 1-story sloping ROOF LINE). Flat when all 1st-story heights match. */}
+      <polyline points={W.map((w,i)=>`${xAt(i)},${floorY(i)}`).join(" ")} fill="none" stroke={GOLD} strokeWidth="1.3" strokeDasharray="5 3"/>
+      {W.map((w,i)=><circle key={"fn"+i} cx={xAt(i)} cy={floorY(i)} r="2" fill={GOLD} stroke="#fff" strokeWidth="1"/>)}
+      {/* (rev 43) LEVEL-2 (roof) diaphragm — polyline through the 2-story block walls' full tops + nodes */}
+      {twoIdx.length>0 && <polyline points={twoIdx.map(i=>`${xAt(i)},${roofY(i)}`).join(" ")} fill="none" stroke={YEL} strokeWidth="1.4"/>}
+      {twoIdx.map(i=><circle key={"rn"+i} cx={xAt(i)} cy={roofY(i)} r="2" fill={YEL} stroke="#fff" strokeWidth="1"/>)}
+      {/* each wall in the cut, front → back (its top coincides with its diaphragm node, so they connect) */}
       {W.map((w,i)=>{ const x=xAt(i), ty=topY(w), pty=ty-w.par*pxPerFt, col=w.one?GRN:YEL;
         return (<g key={i}>
           <line x1={x} y1={ty} x2={x} y2={wallBot} stroke={col} strokeWidth={w.one?1.8:1.6}/>
           {w.par>0 && <line x1={x} y1={ty} x2={x} y2={pty} stroke={col} strokeWidth={w.one?1.8:1.6}/>}
-          {w.par>0 && <circle cx={x} cy={ty} r="2" fill={col} stroke="#fff" strokeWidth="1"/>}
+          {w.par>0 && <circle cx={x} cy={pty} r="1.7" fill={col} stroke="#fff" strokeWidth=".8"/>}
           <text x={x} y={wallBot+11} fill={w.one?GRN:GRY} fontSize="5.6" fontWeight="700" textAnchor="middle">{w.one?"1-STY":"2-STY"}</text>
         </g>); })}
       {/* windward pressure (front wall: full height + parapet) */}
@@ -1027,12 +1042,12 @@ function SecDiagramSeq({ seq, v, upd, floorLL, roofLL, commit }){
       {/* labels + diaphragm callouts */}
       <text x={(xAt(0)+xAt(last))/2} y={wallBot+22} fill={GRY} fontSize="6.5" letterSpacing=".1em" textAnchor="middle">1ST FLOOR · FOUNDATION</text>
       {twoIdx.length>0 && <g>
-        <line x1={xAt(twoIdx[twoIdx.length-1])} y1={yRoof} x2={calloutX-2} y2={yRoof} stroke={GOLD} strokeWidth=".7" strokeDasharray="2 2"/>
-        <text x={calloutX} y={yRoof-2.5} fill={GOLD} fontSize="6.8" fontWeight="700">Level 2 diaphragm</text>
-        <text x={calloutX} y={yRoof+7.5} fill={GOLD} fontSize="9.5" fontWeight="700">{fmt1(roofLL)} plf</text></g>}
-      <line x1={xAt(last)} y1={yF2} x2={calloutX-2} y2={yF2} stroke={GOLD} strokeWidth=".7" strokeDasharray="2 2"/>
-      <text x={calloutX} y={yF2-2.5} fill={GOLD} fontSize="6.8" fontWeight="700">Level 1 diaphragm</text>
-      <text x={calloutX} y={yF2+7.5} fill={GOLD} fontSize="9.5" fontWeight="700">{fmt1(floorLL)} plf</text>
+        <line x1={xAt(twoIdx[twoIdx.length-1])} y1={cRoofY} x2={calloutX-2} y2={cRoofY} stroke={GOLD} strokeWidth=".7" strokeDasharray="2 2"/>
+        <text x={calloutX} y={cRoofY-2.5} fill={GOLD} fontSize="6.8" fontWeight="700">Level 2 diaphragm</text>
+        <text x={calloutX} y={cRoofY+7.5} fill={GOLD} fontSize="9.5" fontWeight="700">{fmt1(roofLL)} plf</text></g>}
+      <line x1={xAt(last)} y1={cFloorY} x2={calloutX-2} y2={cFloorY} stroke={GOLD} strokeWidth=".7" strokeDasharray="2 2"/>
+      <text x={calloutX} y={cFloorY-2.5} fill={GOLD} fontSize="6.8" fontWeight="700">Level 1 diaphragm</text>
+      <text x={calloutX} y={cFloorY+7.5} fill={GOLD} fontSize="9.5" fontWeight="700">{fmt1(floorLL)} plf</text>
       {/* editable FRONT (windward) wall boxes */}
       {(()=>{ const x=xAt(0), w=W[0], ty=topY(w), pty=ty-w.par*pxPerFt, y2=wallBot-w.H*pxPerFt; return (<g>
         {w.pw>0&&<Box cx={x-aWall/2} cy={(ty+wallBot)/2} text={`${fmt1(w.pw)} psf`} color={C_DIMBOX} field="pw" prop="pw" rot={-90}/>}
