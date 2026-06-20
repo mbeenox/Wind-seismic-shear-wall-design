@@ -15,7 +15,7 @@ import {
 //   • APP_VERSION (here)      — human-facing build number in the UI ("Version 1.00").
 //   • CURRENT_VERSION (~below)— save-file SCHEMA version; drives .wps migrations. Do NOT couple.
 //   • handoff "rev" number    — the dev changelog in PLAN_SKETCHER_SUITE_HANDOFF.md.
-const APP_BUILD = 114;                                                                 // +1 per release
+const APP_BUILD = 122;                                                                 // +1 per release
 const APP_VERSION = `${Math.floor(APP_BUILD / 100)}.${String(APP_BUILD % 100).padStart(2, "0")}`;  // "1.00"
 
 // ── geometry space: 1 unit = 1 ft ──────────────────────────────────────────
@@ -351,6 +351,145 @@ function buildSecData(section, graph, loop, isSup, propsFor){
   }
 }
 
+// ── STEP 3: 1st-floor (floor diaphragm) load for the MIXED-height case ───────────────────────────
+// Additive sibling of buildSecData (the guarded fn is UNTOUCHED). Used ONLY on the 1st-floor view /
+// floor-1 design when ≥1 wall is tagged 1-story. A windward wall's floor-diaphragm plf VARIES along
+// its length: at each across-wind station it sums the strips connected to the FLOOR diaphragm in its
+// downwind shadow —
+//   • own ½·H·pw      (the top half of its own wall)
+//   • + its OWN parapet IF it is 1-story (a 1-story wall's roof sits at the floor-diaphragm level)
+//     — a 2-story windward wall instead adds ½·H₂·pw (bottom half of ITS upper wall; no parapet,
+//       whose load belongs to the roof diaphragm)
+//   • + ½·H₂·pw of the NEAREST 2-story wall standing behind it (ONE face — its upper wall's bottom
+//     half pours into this floor diaphragm; the top half already went to the roof)  ← "the 454"
+//   • + leeward parapet of the exterior back wall IF that back wall is 1-story
+// Same windward + overlap-shadow + line-grouping + subdivision machinery as buildSecData; reuses
+// findLeewardPartner and lineReactions verbatim. isOne(key) = the wall is tagged 1-story.
+function buildSecDataF1(section, graph, loop, isSup, propsFor, isOne){
+  if(!section) return null;
+  const { axis, sign } = section;
+  const travel = axis==="v" ? {x:0,y:sign} : {x:sign,y:0};
+  const ring = loop?loop.ring:null;
+  let cx=0,cy=0,cn=0;
+  (ring||graph.nodes).forEach(p=>{cx+=p.x;cy+=p.y;cn++;}); if(cn){cx/=cn;cy/=cn;}
+  const extN=(a,b)=>{
+    const dx=b.x-a.x, dy=b.y-a.y, len=Math.hypot(dx,dy)||1;
+    let nx=-dy/len, ny=dx/len;
+    const mx=(a.x+b.x)/2, my=(a.y+b.y)/2;
+    if(ring){ if(pointInRing(mx+nx*0.4,my+ny*0.4,ring)){ nx=-nx; ny=-ny; } }
+    else { if((mx-cx)*nx+(my-cy)*ny<0){ nx=-nx; ny=-ny; } }
+    return {nx,ny,len};
+  };
+  const windLoads=[];
+  for(const e of graph.edges){
+    const a=graph.nodes.find(n=>n.id===e.a), b=graph.nodes.find(n=>n.id===e.b);
+    if(!a||!b) continue;
+    const wallAxis=edgeAxis(a,b);
+    if(axis==="v" ? wallAxis!=="h" : wallAxis!=="v") continue;
+    const {nx,ny,len}=extN(a,b);
+    if(nx*travel.x + ny*travel.y >= -1e-6) continue;
+    windLoads.push({ wa:a, wb:b, nx, ny, len, key:keyOf(e) });
+  }
+  const along=(p)=> p.x*travel.x + p.y*travel.y;
+  const tran =(p)=> -p.y*travel.x + p.x*travel.y;
+  const ov=(a0,a1,b0,b1)=> Math.min(Math.max(a0,a1),Math.max(b0,b1)) - Math.max(Math.min(a0,a1),Math.min(b0,b1));
+  const kept = windLoads.filter(w=>{
+    const wa0=tran(w.wa), wa1=tran(w.wb), aw=along({x:(w.wa.x+w.wb.x)/2,y:(w.wa.y+w.wb.y)/2});
+    const overlapShadow = windLoads.some(u=>{
+      if(u===w) return false;
+      const au=along({x:(u.wa.x+u.wb.x)/2,y:(u.wa.y+u.wb.y)/2});
+      return au < aw-0.5 && ov(wa0,wa1,tran(u.wa),tran(u.wb)) > 0.5;
+    });
+    return !overlapShadow;
+  });
+  let anyImbalance=false;
+  const sOf =(p)=> axis==="v" ? p.x : p.y;
+  const recv = axis==="v" ? "h" : "v";
+  // a windward wall's OWN floor-diaphragm contribution (no leeward parapet / no accumulation yet)
+  const baseOf=(key)=>{
+    const pr=propsFor(key); const half=0.5*(pr.H||0)*(pr.pw||0);
+    const val = isOne(key) ? half + (pr.par||0)*(pr.qWind||0)   // 1-story: + own parapet (floor-level roof)
+                           : half + 0.5*(pr.H2||0)*(pr.pw||0);  // 2-story: + bottom half of its own upper wall
+    return { val, pr };
+  };
+  kept.forEach(w=>{
+    const {val,pr}=baseOf(w.key);
+    const cLee=findLeewardPartner(w.key, axis, sign, graph);
+    const cPar=(cLee && isOne(cLee)) ? (propsFor(cLee).par||0) : 0;   // leeward parapet only if back wall is 1-story
+    w.total = val + cPar*(pr.qLee||0);
+    w.tdir=travel;
+  });
+  const drawn = kept.filter(w=>w.total>0);
+  let alMin=Infinity, alMax=-Infinity;
+  graph.nodes.forEach(p=>{ const al=along(p); if(al<alMin)alMin=al; if(al>alMax)alMax=al; });
+  const lines=[];
+  drawn.forEach(w=>{
+    const depth=(along(w.wa)+along(w.wb))/2;
+    let L=lines.find(l=>Math.abs(l.depth-depth)<0.6);
+    if(!L){ L={depth, segs:[], smin:Infinity, smax:-Infinity}; lines.push(L); }
+    const ws0=Math.min(sOf(w.wa),sOf(w.wb)), ws1=Math.max(sOf(w.wa),sOf(w.wb));
+    const {val:base, pr}=baseOf(w.key);
+    // back walls overlapping this windward wall (downwind): parapet (leeward, only if 1-story) +
+    // the ½·H₂·pw accumulation (only if 2-story) + depth d.
+    const backs=[];
+    for(const e of graph.edges){
+      if(keyOf(e)===w.key) continue;
+      const a=graph.nodes.find(n=>n.id===e.a), b=graph.nodes.find(n=>n.id===e.b); if(!a||!b) continue;
+      if(edgeAxis(a,b)!==recv) continue;
+      const d=(along(a)+along(b))/2; if(d<=depth+0.6) continue;
+      const lo=Math.max(ws0,Math.min(sOf(a),sOf(b))), hi=Math.min(ws1,Math.max(sOf(a),sOf(b)));
+      if(hi-lo>0.5){
+        const bp=propsFor(keyOf(e)), one=isOne(keyOf(e));
+        backs.push({ lo, hi, d,
+                     par: one ? (bp.par||0) : 0,                  // → floor diaphragm only if 1-story
+                     h2:  one ? 0 : 0.5*(bp.H2||0)*(bp.pw||0) }); // ½·H₂·pw accumulation only if 2-story
+      }
+    }
+    const bps=new Set([ws0,ws1]);
+    backs.forEach(bk=>{ if(bk.lo>ws0+1e-6&&bk.lo<ws1-1e-6)bps.add(bk.lo); if(bk.hi>ws0+1e-6&&bk.hi<ws1-1e-6)bps.add(bk.hi); });
+    const pts=[...bps].sort((p,q)=>p-q);
+    const interp=(s)=>{ const den=(sOf(w.wb)-sOf(w.wa))||1, f=(s-sOf(w.wa))/den;
+      return { x:w.wa.x+(w.wb.x-w.wa.x)*f, y:w.wa.y+(w.wb.y-w.wa.y)*f }; };
+    w.subLoads=[];
+    for(let i=0;i<pts.length-1;i++){
+      const a0=pts[i], a1=pts[i+1]; if(a1-a0<0.5) continue;
+      const mid=(a0+a1)/2;
+      let leePar=0, bestD=-Infinity;                                   // exterior (farthest) back parapet
+      backs.forEach(bk=>{ if(mid>=bk.lo-1e-6&&mid<=bk.hi+1e-6&&bk.d>bestD){ bestD=bk.d; leePar=bk.par; } });
+      let acc=0, nearD=Infinity;                                       // NEAREST 2-story back → one face
+      backs.forEach(bk=>{ if(bk.h2>0&&mid>=bk.lo-1e-6&&mid<=bk.hi+1e-6&&bk.d<nearD){ nearD=bk.d; acc=bk.h2; } });
+      const plf = base + leePar*(pr.qLee||0) + acc;
+      L.segs.push({ s0:a0, s1:a1, plf });
+      w.subLoads.push({ plf, len:a1-a0, a:interp(a0), b:interp(a1) });
+      L.smin=Math.min(L.smin,a0); L.smax=Math.max(L.smax,a1);
+    }
+  });
+  const divides=[];
+  lines.forEach(L=>{
+    L.segs.sort((p,q)=>p.s0-q.s0);
+    for(let i=0;i<L.segs.length-1;i++){
+      const cur=L.segs[i], nxt=L.segs[i+1];
+      if(Math.abs(cur.s1-nxt.s0)<0.6 && Math.abs(cur.plf-nxt.plf)>0.5){
+        const a=(cur.s1+nxt.s0)/2;
+        const Pw = axis==="v" ? {x:a, y:L.depth*sign} : {x:L.depth*sign, y:a};
+        divides.push({ x1:Pw.x, y1:Pw.y, x2:Pw.x+travel.x*(alMax-L.depth), y2:Pw.y+travel.y*(alMax-L.depth) });
+      }
+    }
+  });
+  const agg={}; let baseShear=0;
+  lines.forEach(L=>{
+    L.segs.forEach(s=> baseShear += s.plf*(s.s1-s.s0)/1000);
+    const r=lineReactions(L, graph, isSup, travel, sOf, along);
+    if(r.imbalance) anyImbalance=true;
+    r.reactions.forEach(rr=>{
+      if(!agg[rr.key]) agg[rr.key]={ key:rr.key, kips:0, ax:rr.ax, ay:rr.ay };
+      agg[rr.key].kips += rr.kips;
+    });
+  });
+  return { axis, sign, tdir:travel, windLoads:drawn, reactions:Object.values(agg),
+           divides, baseShear, imbalance:anyImbalance };
+}
+
 // ── styles ─────────────────────────────────────────────────────────────────
 const CSS = `
 .r{ --bg:#EFEDE6;--panel:#FFFFFF;--line:#D8D4C8;--ink:#1C2733;--muted:#67737F;--accent:#23577F;--hot:#9A6B1F;--pink:#B23A2A;
@@ -474,6 +613,10 @@ const CSS = `
   font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;
   padding:4px 9px;border-radius:3px;box-shadow:0 2px 6px -2px rgba(28,39,51,.4);}
 .floorbadge span{font-weight:500;opacity:.78;}
+.allonestory-warn{position:absolute;top:8px;right:8px;z-index:5;pointer-events:none;max-width:62%;
+  background:rgba(154,107,31,.95);color:#FFFFFF;font-family:'IBM Plex Sans','Helvetica Neue',Arial,sans-serif;
+  font-size:11px;font-weight:600;letter-spacing:.02em;line-height:1.3;
+  padding:5px 10px;border-radius:3px;box-shadow:0 2px 6px -2px rgba(28,39,51,.4);}
 /* 2nd-story height field in the wind window (2-story mode). */
 .h2row{border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:4px;padding:9px 11px;margin-bottom:12px;background:#F6F9FB;}
 .h2top{display:flex;align-items:center;justify-content:space-between;gap:10px;}
@@ -692,10 +835,10 @@ function SecDiagram2({ v, upd, roofLL, floorLL }) {
 
         {/* diaphragm load callouts (gold leaders to the right, anchored at the leeward points) */}
         <line x1={wallRX} y1={yRoofR} x2={calloutX-2} y2={yRoofR} stroke={GOLD} strokeWidth=".7" strokeDasharray="2 2"/>
-        <text x={calloutX} y={yRoofR-2.5} fill={GOLD} fontSize="7" fontWeight="700">Roof diaphragm</text>
+        <text x={calloutX} y={yRoofR-2.5} fill={GOLD} fontSize="7" fontWeight="700">Level 2 diaphragm</text>
         <text x={calloutX} y={yRoofR+7}  fill={GOLD} fontSize="9" fontWeight="700">{fmt1(roofLL)} plf</text>
         <line x1={wallRX} y1={yF2R} x2={calloutX-2} y2={yF2R} stroke={GOLD} strokeWidth=".7" strokeDasharray="2 2"/>
-        <text x={calloutX} y={yF2R-2.5} fill={GOLD} fontSize="7" fontWeight="700">2nd-flr diaphragm</text>
+        <text x={calloutX} y={yF2R-2.5} fill={GOLD} fontSize="7" fontWeight="700">Level 1 diaphragm</text>
         <text x={calloutX} y={yF2R+7}  fill={GOLD} fontSize="9" fontWeight="700">{fmt1(floorLL)} plf</text>
 
         {/* pressure boxes (blue) */}
@@ -726,6 +869,221 @@ function SecDiagram2({ v, upd, roofLL, floorLL }) {
 /* ── CAD palette ── */
 const C_BG="#FFFFFF", C_GRID="#E9E7DE", C_WALL="#1C2733", C_NODE="#23577F",
       C_LOAD="#23577F", C_REACT="#B23A2A", C_DIMBOX="#23577F", C_REACTBOX="#B23A2A", C_DRAFT="#9A6B1F";
+const C_ONESTORY="#2E6B4F";   // (2-story mode) wall tagged as 1-story only — drawn green to stand out
+
+// (rev 39) nearest 2-story wall standing DOWNWIND of a windward wall (one face), so a 1-story cut can
+// draw the stepped section + the ½·H₂·pw it pours forward. Mirrors buildSecDataF1's `backs` scan.
+function nearestTwoStoryBehind(key, axis, sign, graph, propsFor, isOne){
+  const e0=graph.edges.find(x=>keyOf(x)===key); if(!e0) return null;
+  const a0=graph.nodes.find(n=>n.id===e0.a), b0=graph.nodes.find(n=>n.id===e0.b); if(!a0||!b0) return null;
+  const travel = axis==="v" ? {x:0,y:sign} : {x:sign,y:0};
+  const along=(p)=> p.x*travel.x + p.y*travel.y;
+  const sOf =(p)=> axis==="v" ? p.x : p.y;
+  const recv = axis==="v" ? "h" : "v";
+  const depth=(along(a0)+along(b0))/2;
+  const ws0=Math.min(sOf(a0),sOf(b0)), ws1=Math.max(sOf(a0),sOf(b0));
+  let best=null, bestD=Infinity;
+  for(const e of graph.edges){
+    if(keyOf(e)===key) continue;
+    const a=graph.nodes.find(n=>n.id===e.a), b=graph.nodes.find(n=>n.id===e.b); if(!a||!b) continue;
+    if(edgeAxis(a,b)!==recv) continue;
+    if(isOne(keyOf(e))) continue;                                  // only 2-story walls
+    const d=(along(a)+along(b))/2; if(d<=depth+0.6) continue;       // downwind only
+    const lo=Math.max(ws0,Math.min(sOf(a),sOf(b))), hi=Math.min(ws1,Math.max(sOf(a),sOf(b)));
+    if(hi-lo>0.5 && d<bestD){ bestD=d; best=keyOf(e); }
+  }
+  return best ? propsFor(best) : null;
+}
+
+// (rev 40) The ORDERED run of across-wind walls an overall-building section cut crosses at across-wind
+// position `sAcross`, front (windward) → back (leeward) by downwind depth. Floor-INDEPENDENT (always
+// the full graph). Drives both the section TYPE (from the 1/2-story pattern: 1·2·2·1=A, 1·1=B,
+// 1·2·2=C, 2·2·1=C-rev) and the SecDiagramSeq drawing. Each entry carries the wall's own props.
+function sectionSequence(sAcross, axis, sign, graph, propsFor, isOne){
+  if(sAcross==null || sign==null) return [];
+  const travel = axis==="v" ? {x:0,y:sign} : {x:sign,y:0};
+  const along=(p)=> p.x*travel.x + p.y*travel.y;
+  const sOf =(p)=> axis==="v" ? p.x : p.y;
+  const recv = axis==="v" ? "h" : "v";
+  const hits=[];
+  for(const e of graph.edges){
+    const a=graph.nodes.find(n=>n.id===e.a), b=graph.nodes.find(n=>n.id===e.b); if(!a||!b) continue;
+    if(edgeAxis(a,b)!==recv) continue;
+    const s0=Math.min(sOf(a),sOf(b)), s1=Math.max(sOf(a),sOf(b));
+    if(sAcross < s0-0.6 || sAcross > s1+0.6) continue;     // the cut line crosses this wall
+    const p=propsFor(keyOf(e));
+    hits.push({ key:keyOf(e), depth:(along(a)+along(b))/2, one:!!isOne(keyOf(e)),
+                H:p.H, H2:p.H2, par:p.par, pw:p.pw, qWind:p.qWind, qLee:p.qLee });
+  }
+  hits.sort((a,b)=>a.depth-b.depth);                        // windward (front) → leeward (back)
+  return hits;
+}
+
+/* (rev 39) STEPPED MIXED-height section — a 1-story windward wall WITH a 2-story portion behind it
+   (the user's "1ST FLOOR PLAN" SECTION A). Short green windward wall + parapet in front, the taller
+   2-story block behind rising to the roof, the leeward wall, the floor diaphragm at the 1-story level
+   and the roof diaphragm over the block. The floor-diaphragm line load picks up ½·H₂·pw from the block
+   → the 454. The block height is display-only (it comes from the 2-story wall on the plan); the
+   windward wall's own fields stay editable. SecDiagram / SecDiagram2 are untouched. */
+/* (rev 40) GENERAL OVERALL-BUILDING SECTION — draws whatever ordered run of walls the cut crosses,
+   front (windward) → back (leeward), each at its own story height. This single renderer covers all
+   of the schematic's section types from the wall SEQUENCE alone:
+     1→2→2→1  = Section A   ·   1→1 = Section B (handled by SecDiagram)   ·   1→2→2 = Section C
+     2→2→1    = Section C reverse.
+   `seq` = [{one,H,H2,par,pw,qWind,qLee}, …] front→back (one = tagged 1-story). The floor diaphragm
+   runs across every wall at the 1-story top; the roof diaphragm spans the contiguous 2-story block.
+   The front & back walls are editable through the live `v`/`upd` buffer; interior walls are display
+   only (their props come from the plan). SecDiagram / SecDiagram2 are untouched. */
+function SecDiagramSeq({ seq, v, upd, floorLL, roofLL, commit }){
+  const [edit,setEdit]=useState(null);
+  const [ebuf,setEbuf]=useState({});          // (rev 42) raw-string buffer for INTERIOR-wall inputs (key-based), so "13." survives typing
+  const num=s=>Math.max(0,parseFloat(s)||0);
+  const N=Math.max(seq.length,1), last=N-1;
+  const propOf=(i)=>{ const w=seq[i]||{};
+    if(i===0)    return { one:w.one, H:num(v.H),    H2:num(v.H2 ?? w.H2), par:num(v.wH), pw:num(v.pw),  q:num(v.wQ) };
+    if(i===last) return { one:w.one, H:num(v.leeH), H2:num(v.leeH2 ?? w.H2), par:num(v.lH), pw:num(w.pw), q:num(v.lQ) };
+    return { one:w.one, H:num(w.H), H2:num(w.H2), par:num(w.par), pw:num(w.pw), q:num(w.qWind) };
+  };
+  const W=seq.map((_,i)=>propOf(i));
+  const H1=Math.max(1,...W.map(w=>w.H));
+  const H2box=Math.max(0,...W.filter(w=>!w.one).map(w=>w.H2));
+  const VBW=380, VBH=300, padTop=22, padBot=30, availH=VBH-padTop-padBot, wallBot=padTop+availH;  // (rev 41) wider → room for the right-side callouts
+  const maxFt=Math.max(1,...W.map(w=>(w.one?w.H:w.H+w.H2)+w.par));
+  const pxPerFt=availH/maxFt;
+  const leftX=70, rightX=250, sp=rightX-leftX;   // (rev 41) walls pulled left so the diaphragm callouts no longer overlap the leeward wall line
+  const xAt=(i)=> N<=1?leftX:(leftX + i*sp/(N-1));
+  const topY=(w)=> wallBot - (w.one? w.H : w.H+w.H2)*pxPerFt;
+  const yF2 = wallBot - H1*pxPerFt;                 // floor diaphragm (1-story top = 2nd-floor line)
+  const yRoof= wallBot - (H1+H2box)*pxPerFt;        // roof diaphragm over the 2-story block
+  const CY="#23577F", YEL="#1C2733", GOLD="#9A6B1F", GRN="#2E6B4F", GRY="#6B7684";
+  const pw0=W[0].pw, q0=W[0].q, qL=W[last].q;
+  // (rev 41) scale the arrows over EVERY wall's pressures (incl. the 2-story block), so the block's
+  // windward/parapet/leeward arrows are proportional and fit the 30px budget.
+  const maxPsf=Math.max(pw0,q0,qL,1,...seq.map(w=>Math.max(num(w.pw),num(w.qWind),num(w.qLee)))), aS=30/maxPsf;
+  const aOf=(psf)=> psf>0?Math.max(psf*aS,6):0;
+  const aWall=aOf(pw0), aWind=aOf(q0), aLee=aOf(qL);
+  const rows=(yTop,yBot)=>{ const n=Math.max(1,Math.round((yBot-yTop)/8)); return Array.from({length:n+1},(_,i)=>yTop+(yBot-yTop)*i/n); };
+  // (rev 42) `open` carries an optional edge `key`: when set, the floating input edits THAT wall's props
+  // directly via `commit(key,prop,val)` (interior block walls); when absent it uses the v/upd front-back path.
+  const open=(field,prop,cx,cy,key)=>setEdit({field,prop,key,l:cx/VBW*100,t:cy/VBH*100});
+  const seqVal=(key,prop)=>{ const w=seq.find(s=>s.key===key)||{}; return num(w[prop]); };   // current value for a keyed input
+  const Box=({cx,cy,text,color,field,prop,rot=0,ed=true,wkey})=>{ const w=text.length*4.1+6,h=11;
+    return (<g style={{cursor:ed?"pointer":"default"}} onClick={ed?()=>open(field,prop,cx,cy,wkey):undefined} transform={rot?`rotate(${rot},${cx},${cy})`:undefined}>
+      <rect x={cx-w/2} y={cy-h/2} width={w} height={h} rx={1.5} fill={color}/>
+      <text x={cx} y={cy+0.4} fill="#fff" fontSize={7} fontWeight={700} textAnchor="middle" dominantBaseline="middle" style={{userSelect:"none"}}>{text}</text></g>); };
+  const twoIdx=W.map((w,i)=>w.one?-1:i).filter(i=>i>=0);   // indices of 2-story walls (the block)
+  const calloutX=300;   // (rev 41) right of rightX(250)+leeward arrows → no overlap with the wall line
+  return (
+   <div style={{position:"relative"}}>
+    <svg viewBox={`0 0 ${VBW} ${VBH}`} style={{width:"100%",height:"auto",display:"block"}}>
+      <defs><marker id="dArrM" markerWidth="6" markerHeight="6" refX="4.6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill={CY}/></marker></defs>
+      <rect x="0" y="0" width={VBW} height={VBH} fill={C_BG} rx="6"/>
+      {/* foundation + diaphragms */}
+      <line x1={xAt(0)} y1={wallBot} x2={xAt(last)} y2={wallBot} stroke={YEL} strokeWidth="1.4"/>
+      <line x1={xAt(0)} y1={yF2} x2={xAt(last)} y2={yF2} stroke={GOLD} strokeWidth="1.3" strokeDasharray="5 3"/>
+      {twoIdx.length>0 && <line x1={xAt(twoIdx[0])} y1={yRoof} x2={xAt(twoIdx[twoIdx.length-1])} y2={yRoof} stroke={YEL} strokeWidth="1.4"/>}
+      {/* each wall in the cut, front → back */}
+      {W.map((w,i)=>{ const x=xAt(i), ty=topY(w), pty=ty-w.par*pxPerFt, col=w.one?GRN:YEL;
+        return (<g key={i}>
+          <line x1={x} y1={ty} x2={x} y2={wallBot} stroke={col} strokeWidth={w.one?1.8:1.6}/>
+          {w.par>0 && <line x1={x} y1={ty} x2={x} y2={pty} stroke={col} strokeWidth={w.one?1.8:1.6}/>}
+          {w.par>0 && <circle cx={x} cy={ty} r="2" fill={col} stroke="#fff" strokeWidth="1"/>}
+          <text x={x} y={wallBot+11} fill={w.one?GRN:GRY} fontSize="5.6" fontWeight="700" textAnchor="middle">{w.one?"1-STY":"2-STY"}</text>
+        </g>); })}
+      {/* windward pressure (front wall: full height + parapet) */}
+      {(()=>{ const x=xAt(0), w=W[0], ty=topY(w), pty=ty-w.par*pxPerFt; return (<g>
+        {w.pw>0&&<g><line x1={x-aWall} y1={ty} x2={x-aWall} y2={wallBot} stroke={CY} strokeWidth="1"/>
+          {rows(ty,wallBot).map((y,k)=><line key={k} x1={x-aWall} y1={y} x2={x} y2={y} stroke={CY} strokeWidth=".7" markerEnd="url(#dArrM)"/>)}</g>}
+        {w.par>0&&w.q>0&&<g><line x1={x-aWind} y1={pty} x2={x-aWind} y2={ty} stroke={CY} strokeWidth="1"/>
+          {rows(pty,ty).map((y,k)=><line key={k} x1={x-aWind} y1={y} x2={x} y2={y} stroke={CY} strokeWidth=".7" markerEnd="url(#dArrM)"/>)}</g>}
+      </g>); })()}
+      {/* leeward parapet pressure (back wall) */}
+      {(()=>{ const x=xAt(last), w=W[last], ty=topY(w), pty=ty-w.par*pxPerFt; return (w.par>0&&w.q>0?
+        <g><line x1={x} y1={pty} x2={x} y2={ty} stroke={CY} strokeWidth="1"/>
+          {rows(pty,ty).map((y,k)=><line key={k} x1={x} y1={y} x2={x+aLee} y2={y} stroke={CY} strokeWidth=".7" markerEnd="url(#dArrM)"/>)}</g> : null); })()}
+      {/* (rev 41) 2-STORY BLOCK pressures — the windward upper-story + parapet (and the leeward parapet)
+          that feed the LEVEL-2 (roof) diaphragm. These were missing: the block walls drew as bare lines.
+          Windward face = the front-most 2-story wall (only its UPPER story + parapet see wind; the lower
+          story is shadowed by whatever is in front of it). Leeward face = the back-most 2-story wall
+          (parapet). When a block end coincides with the sequence front/back it is already drawn above. */}
+      {twoIdx.length>0 && (()=>{
+        const bw=twoIdx[0], bl=twoIdx[twoIdx.length-1];
+        const fw=W[bw], fx=xAt(bw), fTop=topY(fw), fFloor=wallBot-fw.H*pxPerFt, fpTop=fTop-fw.par*pxPerFt;
+        const fQ=num((seq[bw]||{}).qWind), aFp=aOf(fQ);          // block-front windward parapet pressure
+        const bwl=W[bl], bx=xAt(bl), bTop=topY(bwl), bpTop=bTop-bwl.par*pxPerFt;
+        const bQ=num((seq[bl]||{}).qLee), aBp=aOf(bQ);           // block-back leeward parapet pressure
+        return (<g>
+          {bw!==0 && fw.pw>0 && <g>{/* windward UPPER story (roof→floor of the block) — lower story shadowed */}
+            <line x1={fx-aWall} y1={fTop} x2={fx-aWall} y2={fFloor} stroke={CY} strokeWidth="1"/>
+            {rows(fTop,fFloor).map((y,k)=><line key={"bfu"+k} x1={fx-aWall} y1={y} x2={fx} y2={y} stroke={CY} strokeWidth=".7" markerEnd="url(#dArrM)"/>)}</g>}
+          {bw!==0 && fw.par>0 && fQ>0 && <g>{/* windward parapet */}
+            <line x1={fx-aFp} y1={fpTop} x2={fx-aFp} y2={fTop} stroke={CY} strokeWidth="1"/>
+            {rows(fpTop,fTop).map((y,k)=><line key={"bfp"+k} x1={fx-aFp} y1={y} x2={fx} y2={y} stroke={CY} strokeWidth=".7" markerEnd="url(#dArrM)"/>)}</g>}
+          {bl!==last && bwl.par>0 && bQ>0 && <g>{/* leeward parapet (arrows to the right) */}
+            <line x1={bx} y1={bpTop} x2={bx} y2={bTop} stroke={CY} strokeWidth="1"/>
+            {rows(bpTop,bTop).map((y,k)=><line key={"bbp"+k} x1={bx} y1={y} x2={bx+aBp} y2={y} stroke={CY} strokeWidth=".7" markerEnd="url(#dArrM)"/>)}</g>}
+        </g>);
+      })()}
+      {/* labels + diaphragm callouts */}
+      <text x={(xAt(0)+xAt(last))/2} y={wallBot+22} fill={GRY} fontSize="6.5" letterSpacing=".1em" textAnchor="middle">1ST FLOOR · FOUNDATION</text>
+      {twoIdx.length>0 && <g>
+        <line x1={xAt(twoIdx[twoIdx.length-1])} y1={yRoof} x2={calloutX-2} y2={yRoof} stroke={GOLD} strokeWidth=".7" strokeDasharray="2 2"/>
+        <text x={calloutX} y={yRoof-2.5} fill={GOLD} fontSize="6.8" fontWeight="700">Level 2 diaphragm</text>
+        <text x={calloutX} y={yRoof+7.5} fill={GOLD} fontSize="9.5" fontWeight="700">{fmt1(roofLL)} plf</text></g>}
+      <line x1={xAt(last)} y1={yF2} x2={calloutX-2} y2={yF2} stroke={GOLD} strokeWidth=".7" strokeDasharray="2 2"/>
+      <text x={calloutX} y={yF2-2.5} fill={GOLD} fontSize="6.8" fontWeight="700">Level 1 diaphragm</text>
+      <text x={calloutX} y={yF2+7.5} fill={GOLD} fontSize="9.5" fontWeight="700">{fmt1(floorLL)} plf</text>
+      {/* editable FRONT (windward) wall boxes */}
+      {(()=>{ const x=xAt(0), w=W[0], ty=topY(w), pty=ty-w.par*pxPerFt, y2=wallBot-w.H*pxPerFt; return (<g>
+        {w.pw>0&&<Box cx={x-aWall/2} cy={(ty+wallBot)/2} text={`${fmt1(w.pw)} psf`} color={C_DIMBOX} field="pw" prop="pw" rot={-90}/>}
+        <Box cx={x+13} cy={(y2+wallBot)/2} text={`${fmt1(w.H)} ft`} color={C_REACTBOX} field="H" prop="H"/>
+        {!w.one&&w.H2>0&&<Box cx={x+13} cy={(ty+y2)/2} text={`${fmt1(w.H2)} ft`} color={C_REACTBOX} field="H2" prop="H2"/>}
+        {w.par>0&&<Box cx={x-aWind/2} cy={(pty+ty)/2} text={`${fmt1(w.q)} psf`} color={C_DIMBOX} field="wQ" prop="qWind" rot={-90}/>}
+        {w.par>0&&<Box cx={x+13} cy={(pty+ty)/2} text={`${fmt1(w.par)} ft`} color={C_REACTBOX} field="wH" prop="parW"/>}
+      </g>); })()}
+      {/* editable BACK (leeward) parapet boxes */}
+      {(()=>{ const x=xAt(last), w=W[last], ty=topY(w), pty=ty-w.par*pxPerFt; return (w.par>0?<g>
+        {w.q>0&&<Box cx={x+aLee/2} cy={(pty+ty)/2} text={`${fmt1(w.q)} psf`} color={C_DIMBOX} field="lQ" prop="qLee" rot={-90}/>}
+        <Box cx={x-13} cy={(pty+ty)/2} text={`${fmt1(w.par)} ft`} color={C_REACTBOX} field="lH" prop="parL"/>
+      </g>:null); })()}
+      {/* (rev 42) editable INTERIOR 2-story BLOCK walls — height + pressure, written straight to each wall's
+          own props by key (front block = windward face: pw·H·H₂·par·qWind; back block = leeward face:
+          qLee·par·H·H₂). Only for block ends that are NOT the sequence front/back (those use the boxes above). */}
+      {twoIdx.length>0 && (()=>{
+        const bw=twoIdx[0], bl=twoIdx[twoIdx.length-1];
+        const fr = bw!==0 && (()=>{ const x=xAt(bw), w=W[bw], k=(seq[bw]||{}).key, ty=topY(w), fFloor=wallBot-w.H*pxPerFt, pty=ty-w.par*pxPerFt, qW=num((seq[bw]||{}).qWind);
+          return (<g>
+            {w.pw>0 && <Box cx={x-aWall/2} cy={(ty+fFloor)/2} text={`${fmt1(w.pw)} psf`} color={C_DIMBOX} prop="pw" wkey={k} rot={-90}/>}
+            <Box cx={x+13} cy={(fFloor+wallBot)/2} text={`${fmt1(w.H)} ft`} color={C_REACTBOX} prop="H" wkey={k}/>
+            <Box cx={x+13} cy={(ty+fFloor)/2}     text={`${fmt1(w.H2)} ft`} color={C_REACTBOX} prop="H2" wkey={k}/>
+            {w.par>0 && <Box cx={x+13}      cy={(pty+ty)/2} text={`${fmt1(w.par)} ft`} color={C_REACTBOX} prop="par" wkey={k}/>}
+            {w.par>0 && <Box cx={x-aOf(qW)/2} cy={(pty+ty)/2} text={`${fmt1(qW)} psf`} color={C_DIMBOX} prop="qWind" wkey={k} rot={-90}/>}
+          </g>); })();
+        const bk = bl!==last && (()=>{ const x=xAt(bl), w=W[bl], k=(seq[bl]||{}).key, ty=topY(w), fFloor=wallBot-w.H*pxPerFt, pty=ty-w.par*pxPerFt, qLv=num((seq[bl]||{}).qLee);
+          return (<g>
+            {w.par>0 && qLv>0 && <Box cx={x+aOf(qLv)/2} cy={(pty+ty)/2} text={`${fmt1(qLv)} psf`} color={C_DIMBOX} prop="qLee" wkey={k} rot={-90}/>}
+            {w.par>0 && <Box cx={x-13} cy={(pty+ty)/2} text={`${fmt1(w.par)} ft`} color={C_REACTBOX} prop="par" wkey={k}/>}
+            <Box cx={x-13} cy={(fFloor+wallBot)/2} text={`${fmt1(w.H)} ft`} color={C_REACTBOX} prop="H" wkey={k}/>
+            <Box cx={x-13} cy={(ty+fFloor)/2}     text={`${fmt1(w.H2)} ft`} color={C_REACTBOX} prop="H2" wkey={k}/>
+          </g>); })();
+        return (<g>{fr||null}{bk||null}</g>);
+      })()}
+    </svg>
+    {edit && (
+      <input autoFocus type="number" inputMode="decimal"
+        value={ edit.key ? (ebuf[`${edit.key}:${edit.prop}`] ?? String(seqVal(edit.key,edit.prop))) : (v[edit.field] ?? "") }
+        onChange={ edit.key
+          ? (e)=>{ const raw=e.target.value; setEbuf(p=>({ ...p, [`${edit.key}:${edit.prop}`]:raw })); commit(edit.key, edit.prop, num(raw)); }
+          : upd(edit.field, edit.prop) }
+        onBlur={()=>{ if(edit&&edit.key){ const kk=`${edit.key}:${edit.prop}`; setEbuf(p=>{ const n={...p}; delete n[kk]; return n; }); } setEdit(null); }}
+        onKeyDown={e=>{ if(e.key==="Enter"||e.key==="Escape") e.target.blur(); }}
+        style={{ position:"absolute", left:`${edit.l}%`, top:`${edit.t}%`, transform:"translate(-50%,-50%)",
+                 width:58, padding:"4px 6px", textAlign:"center",
+                 background:"#FFFFFF", color:"#9A6B1F", border:"1.5px solid #9A6B1F", borderRadius:3, font:"700 13px ui-monospace,Menlo,monospace", outline:"none", zIndex:6 }}/>
+    )}
+   </div>
+  );
+}
 
 /* masked label box (blue for dimensions, red for reactions) — readable over any line */
 function Tag({ x, y, text, box, S, rot=0, ts=1 }) {
@@ -829,7 +1187,10 @@ function Reaction({ r, tdir, S, ts=1 }) {
 }
 
 /* ═══════════════ WIND INPUT WINDOW ═══════════════ */
-function WindWindow({ section, setVals, onReverse, onClose, onRemove, twoStory }) {
+function WindWindow({ section, setVals, onReverse, onClose, onRemove, twoStory, oneStory=false }) {
+  // STEP 4: a wall tagged 1-story (in 2-story mode) reaches only the floor diaphragm, so its section
+  // cut is a SINGLE-story elevation + a single total line load — not the 2-story roof/floor split.
+  const twoStoryView = twoStory && !oneStory;
   const [v, setV] = useState({});
   // seed once per open (key carries section + leeward-partner identity) → decimals survive typing
   useEffect(() => {
@@ -855,17 +1216,44 @@ function WindWindow({ section, setVals, onReverse, onClose, onRemove, twoStory }
   const leePar  = num(v.lH) * num(v.lQ);
   const total = wallRes + windPar + leePar;
   // ── two-story diaphragm line loads (Step 3) — derived here in the UI, outside the frozen engine ──
-  // The 2nd-story wall (H₂) splits: upper ½ → roof diaphragm, lower ½ → 2nd-floor diaphragm.
+  // (rev 41) The UI now LABELS these "Level 2" (the upper/roof diaphragm — designs the level-2 walls) and
+  // "Level 1" (the lower/floor a.k.a. 2nd-floor diaphragm — designs the level-1 walls). The variable
+  // names keep the physical roof/floor terms; only the displayed labels changed (no value/engine change).
+  // The 2nd-story wall (H₂) splits: upper ½ → Level 2 (roof) diaphragm, lower ½ → Level 1 (floor) diaphragm.
   const wallRes2 = 0.5 * num(v.H2) * num(v.pw);        // ½·H₂·pw
-  const roofLL   = wallRes2 + windPar + leePar;        // roof diaphragm = ½·H₂·pw + parapets  → designs 2nd-floor walls
-  // 2nd-floor diaphragm carries ONLY the half-walls directly above and below it (½·H·pw + ½·H₂·pw).
-  // The roof diaphragm + parapets do NOT pour into the floor diaphragm — that load transfers DOWN
-  // through the 2nd-story shear wall into the 1st-story shear wall as a POINT load (stacked overturning
+  const roofLL   = wallRes2 + windPar + leePar;        // LEVEL 2 diaphragm = ½·H₂·pw + parapets  → designs level-2 (upper) walls
+  // Level 1 diaphragm carries ONLY the half-walls directly above and below it (½·H·pw + ½·H₂·pw).
+  // The Level 2 (roof) diaphragm + parapets do NOT pour into the Level 1 diaphragm — that load transfers
+  // DOWN through the level-2 shear wall into the level-1 shear wall as a POINT load (stacked overturning
   // / holdown, unchanged). So this is the floor-only line load, not roof+floor combined. (rev 34)
-  const floorLL  = wallRes + wallRes2;                 // 2nd-floor diaphragm = ½·H·pw + ½·H₂·pw  → designs 1st-floor walls
-  // Reverse flips the plan's wind direction; the window re-points to the new windward wall. With
-  // one parapet stored per physical wall, each wall keeps its own height — so the values simply
-  // swap windward/leeward roles, no copying needed, and they survive on split walls too.
+  const floorLL  = wallRes + wallRes2;                 // LEVEL 1 diaphragm = ½·H·pw + ½·H₂·pw  → designs level-1 (lower) walls
+  // (rev 40) OVERALL-BUILDING section from the ordered wall sequence the cut crosses. The type falls
+  // out of the 1/2-story pattern: 1·2·2·1 = A, 1·1 = B, 1·2·2 = C, 2·2·1 = C-reverse. Floor-independent.
+  const seq = (section && section.seq) || [];
+  const hasOne = seq.some(w=>w.one), hasTwo = seq.some(w=>!w.one);
+  const mixedSeq = !!(twoStory && hasOne && hasTwo && seq.length>=2);
+  // floor-diaphragm line load on the windward (front) wall — matches buildSecDataF1's baseOf:
+  //   1-story front → ½·H·pw + own parapet + ½·H₂·pw of the nearest 2-story behind (one face)
+  //   2-story front → ½·H·pw + ½·H₂·pw (its own)        … plus the leeward parapet if the BACK wall is 1-story.
+  const w0 = seq[0]||{}, wL = seq[seq.length-1]||{};
+  const seqAcc = w0.one ? (()=>{ const box=seq.find((w,i)=>i>0&&!w.one); return box?0.5*num(box.H2)*num(box.pw):0; })()
+                        : 0.5*num(v.H2)*num(v.pw);
+  const seqBase = 0.5*num(v.H)*num(v.pw) + (w0.one ? windPar : 0);
+  const seqLeePar = (wL && wL.one) ? num(v.lH)*num(v.lQ) : 0;
+  const floorLLmix = seqBase + seqLeePar + seqAcc;          // e.g. 478  (Level 1 diaphragm)
+  // (rev 41) LEVEL 2 (roof) diaphragm of the 2-story BLOCK — same shape as the uniform roofLL above,
+  // but read from the block's front/back walls (the schematic SECTION A's middle stack): ½·H₂·pw of the
+  // block + the block's windward parapet + its leeward parapet. The block's end walls usually come from
+  // the plan (interior, display-only); where a block end coincides with the editable sequence front/back
+  // (Section C / C-reverse) the live `v` value is used so edits flow through.
+  const twoIxSeq = seq.map((w,i)=>w.one?-1:i).filter(i=>i>=0);
+  const bfI = twoIxSeq[0], bbI = twoIxSeq[twoIxSeq.length-1];
+  const bf = (bfI!=null) ? seq[bfI] : null, bb = (bbI!=null) ? seq[bbI] : null;
+  const blkH2  = bfI===0 ? num(v.H2) : num((bf||{}).H2);
+  const blkPw  = bfI===0 ? num(v.pw) : num((bf||{}).pw);
+  const blkWPar= bfI===0 ? num(v.wH)*num(v.wQ) : num((bf||{}).par)*num((bf||{}).qWind);
+  const blkLPar= bbI===(seq.length-1) ? num(v.lH)*num(v.lQ) : num((bb||{}).par)*num((bb||{}).qLee);
+  const roofLLseq = bf ? (0.5*blkH2*blkPw + blkWPar + blkLPar) : 0;   // Level 2 diaphragm (block)
   const reverse = () => { onReverse(); };
   return (
     <div className="ovl" onPointerDown={(e)=>{ if(e.target.classList.contains("ovl")) onClose(); }}>
@@ -875,21 +1263,43 @@ function WindWindow({ section, setVals, onReverse, onClose, onRemove, twoStory }
           <button className="win-x" onClick={onClose} title="Close">×</button>
         </div>
         <div className="win-b">
-          <div style={{ marginBottom:12 }}>{twoStory ? <SecDiagram2 v={v} upd={upd} roofLL={roofLL} floorLL={floorLL}/> : <SecDiagram v={v} upd={upd} />}</div>
+          <div style={{ marginBottom:12 }}>{
+            mixedSeq ? <SecDiagramSeq seq={seq} v={v} upd={upd} floorLL={floorLLmix} roofLL={roofLLseq} commit={(key,prop,val)=>setVals(key,{[prop]:val})}/>
+            : twoStoryView ? <SecDiagram2 v={v} upd={upd} roofLL={roofLL} floorLL={floorLL}/>
+            : <SecDiagram v={v} upd={upd} />
+          }</div>
 
           <button className="rev" onClick={reverse} style={{ marginBottom:12 }}>
             ⇄ Reverse wind direction
           </button>
 
-          {twoStory ? (
+          {mixedSeq ? (
             <div className="tot">
-              <div className="lbl">Roof diaphragm line load <small>→ designs 2nd-floor shear walls</small></div>
+              <div className="lbl">Level 1 diaphragm line load <small>→ designs this {w0.one?"1-story":"2-story"} wall</small></div>
+              <div className="v">{fmt1(floorLLmix)} <small>plf</small></div>
+              <div style={{ marginTop:8, paddingTop:8, borderTop:"1px solid rgba(255,255,255,.08)" }}>
+                <div className="brk"><span>½·H·pw — front wall</span><b>{fmt1(0.5*num(v.H)*num(v.pw))} plf</b></div>
+                <div className="brk"><span>windward + leeward parapet</span><b>{fmt1((w0.one?windPar:0)+seqLeePar)} plf</b></div>
+                {seqAcc>0 && <div className="brk"><span>½·H₂·pw — 2-story block {w0.one?"behind (poured fwd)":"(own upper wall)"}</span><b>{fmt1(seqAcc)} plf</b></div>}
+              </div>
+              {roofLLseq>0 && <>
+                <div className="lbl" style={{ marginTop:14 }}>Level 2 diaphragm line load <small>→ designs the level-2 (2-story block) walls</small></div>
+                <div className="v">{fmt1(roofLLseq)} <small>plf</small></div>
+                <div style={{ marginTop:8, paddingTop:8, borderTop:"1px solid rgba(255,255,255,.08)" }}>
+                  <div className="brk"><span>½·H₂·pw — 2-story block (upper ½)</span><b>{fmt1(0.5*blkH2*blkPw)} plf</b></div>
+                  <div className="brk"><span>windward + leeward parapet (block)</span><b>{fmt1(blkWPar+blkLPar)} plf</b></div>
+                </div>
+              </>}
+            </div>
+          ) : twoStoryView ? (
+            <div className="tot">
+              <div className="lbl">Level 2 diaphragm line load <small>→ designs the level-2 (upper) shear walls</small></div>
               <div className="v">{fmt1(roofLL)} <small>plf</small></div>
               <div style={{ marginTop:8, paddingTop:8, borderTop:"1px solid rgba(255,255,255,.08)" }}>
                 <div className="brk"><span>½·H₂·pw — 2nd-story wall (upper ½)</span><b>{fmt1(wallRes2)} plf</b></div>
                 <div className="brk"><span>windward + leeward parapet</span><b>{fmt1(windPar+leePar)} plf</b></div>
               </div>
-              <div className="lbl" style={{ marginTop:14 }}>2nd-floor diaphragm line load <small>→ designs 1st-floor shear walls</small></div>
+              <div className="lbl" style={{ marginTop:14 }}>Level 1 diaphragm line load <small>→ designs the level-1 (lower) shear walls</small></div>
               <div className="v">{fmt1(floorLL)} <small>plf</small></div>
               <div style={{ marginTop:8, paddingTop:8, borderTop:"1px solid rgba(255,255,255,.08)" }}>
                 <div className="brk"><span>½·H₂·pw — 2nd-story wall (lower ½)</span><b>{fmt1(wallRes2)} plf</b></div>
@@ -927,6 +1337,8 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
   const [activeWall,setActiveWall]=useState(null);   // {axis,key} | null — wall being edited
   const [draft,    setDraft]    = useState(null);    // live cut line being drawn
   const [noSupport,setNoSupport]= useState(()=>new Set()); // edge keys NOT taking point load
+  const [oneStory, setOneStory] = useState(()=>new Set()); // (2-story mode) edge keys that are ONLY 1 story — they
+                                                           // touch the floor diaphragm but not the roof diaphragm.
   const [snapOn,   setSnapOn]   = useState(true);
   const [ortho,    setOrtho]    = useState(true);
   const [dims,     setDims]     = useState(true);
@@ -1081,6 +1493,8 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
     if(target==="lee"){
       const sign = sectionsRef.current[activeWall.axis] && sectionsRef.current[activeWall.axis].sign;
       key = findLeewardPartner(activeWall.key, activeWall.axis, sign, graphRef.current, activeWall.sAcross);
+    } else if(target && target!=="self"){
+      key = target;   // (rev 42) an explicit edge key → edit ANY wall the section cut crosses (interior block walls)
     }
     if(!key) return;
     setWallProps(m=>({ ...m, [key]:{ ...(m[key]||DEF_SECTION), ...patch } }));
@@ -1173,7 +1587,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
     if(!registerProject) return;
     registerProject({
       get: ()=>({ graph:graphRef.current,
-                  wallProps, noSupport:[...noSupport], sections, nextId:idc.current,
+                  wallProps, noSupport:[...noSupport], oneStory:[...oneStory], sections, nextId:idc.current,
                   // v2: the camera + working state, so a reopened file looks like where you left it
                   view:viewRef.current, selected:selRef.current,
                   drawMode:drawModeRef.current, panMode:panModeRef.current,
@@ -1183,6 +1597,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
         setGraph(s.graph);
         setWallProps(s.wallProps||{});
         setNoSupport(new Set(s.noSupport||[]));
+        setOneStory(new Set(s.oneStory||[]));   // old files lack it → no 1-story walls (unchanged behavior)
         setSections(s.sections||{h:null,v:null});
         idc.current = s.nextId || (Math.max(0,...s.graph.nodes.map(n=>n.id))+1);
         // transient editors never auto-reopen (modal wind window + inline dim editor)
@@ -1251,6 +1666,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
     snapshot();
     setGraph(newGraph);
     setNoSupport(s=>{ const pk=keyOf(edge); if(!s.has(pk)) return s; const n=new Set(s); n.delete(pk); n.add(keyOf(e1)); n.add(keyOf(e2)); return n; });
+    setOneStory(s=>{ const pk=keyOf(edge); if(!s.has(pk)) return s; const n=new Set(s); n.delete(pk); n.add(keyOf(e1)); n.add(keyOf(e2)); return n; });
     setWallProps(m=>{ const pk=keyOf(edge); if(!m[pk]) return m; const v=m[pk]; const n={...m}; n[keyOf(e1)]={...v}; n[keyOf(e2)]={...v}; delete n[pk]; return n; });
     setSelected(id);
   },[snap,snapshot]);
@@ -1546,6 +1962,9 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
 
   // per-orientation section render data + line load
   const isSup = useCallback((key)=>!noSupport.has(key),[noSupport]);
+  // (2-story mode) a wall tagged 1-story rises only to the floor diaphragm; it never reaches the roof.
+  // Step 1 is the tag + appearance only — the load/floor-view effects land in the following steps.
+  const isOneStory = useCallback((key)=> twoStory && oneStory.has(key), [twoStory, oneStory]);
   const propsFor = useCallback((key)=> mergeWallProps(wallProps[key]), [wallProps]);
   // In 2-story mode the on-plan loads/reactions reflect the SELECTED floor, by feeding buildSecData a
   // floor-specific EFFECTIVE wall height (engine untouched — it reads pr.H only in the line-load term):
@@ -1572,25 +1991,54 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
     const k=keyOf(edge);
     setNoSupport(s=>{ const n=new Set(s); n.has(k)?n.delete(k):n.add(k); return n; });
   },[]);
-  const secH = useMemo(()=>buildSecData(sections.h, graph, loop, isSup, propsForActive),[sections.h,graph,loop,isSup,propsForActive]);
-  const secV = useMemo(()=>buildSecData(sections.v, graph, loop, isSup, propsForActive),[sections.v,graph,loop,isSup,propsForActive]);
+  const toggleOneStory = useCallback((edge)=>{
+    const k=keyOf(edge);
+    setOneStory(s=>{ const n=new Set(s); n.has(k)?n.delete(k):n.add(k); return n; });
+  },[]);
+  // ── STEP 2: 2nd-floor (roof diaphragm) excludes 1-story walls ──
+  // A 1-story wall stops at the floor diaphragm, so it does NOT exist on the 2nd-floor (roof) plan.
+  // We feed buildSecData a FILTERED graph (full graph minus the 1-story walls + their now-orphaned
+  // nodes) for the 2nd-floor view. This drops 1-story walls from windward collection, the overlap-
+  // shadow test, AND lineReactions supports in ONE move — the guarded engine is untouched, it just
+  // receives a smaller graph. The full graph still RENDERS every wall (green ones drawn, load-less).
+  // Zeroing via propsFor would NOT work: a 1-story wall geometrically in front of the box would
+  // wrongly shadow it — removing the wall from the graph is the correct fix.
+  const twoStoryGraph = useMemo(()=>{
+    if(!twoStory || oneStory.size===0) return graph;
+    const keepE = graph.edges.filter(e=>!oneStory.has(keyOf(e)));
+    const used = new Set(); keepE.forEach(e=>{ used.add(e.a); used.add(e.b); });
+    return { nodes: graph.nodes.filter(n=>used.has(n.id)), edges: keepE };
+  },[twoStory, oneStory, graph]);
+  const twoStoryLoop = useMemo(()=>loopInfo(twoStoryGraph.nodes, twoStoryGraph.edges),[twoStoryGraph]);
+  // 2nd-floor (roof) → filtered graph; 1st-floor + 1-story mode → full graph (unchanged).
+  const roofView = twoStory && activeFloor===2;
+  // STEP 3: 1st-floor view with ≥1 tagged 1-story wall → the mixed-height accumulation builder.
+  const mixed1 = twoStory && activeFloor===1 && oneStory.size>0;
+  const secGraph = roofView ? twoStoryGraph : graph;
+  const secLoop  = roofView ? twoStoryLoop : loop;
+  const secH = useMemo(()=> mixed1
+        ? buildSecDataF1(sections.h, graph, loop, isSup, propsFor, isOneStory)
+        : buildSecData(sections.h, secGraph, secLoop, isSup, propsForActive),
+      [mixed1,sections.h,graph,loop,secGraph,secLoop,isSup,propsFor,propsForActive,isOneStory]);
+  const secV = useMemo(()=> mixed1
+        ? buildSecDataF1(sections.v, graph, loop, isSup, propsFor, isOneStory)
+        : buildSecData(sections.v, secGraph, secLoop, isSup, propsForActive),
+      [mixed1,sections.v,graph,loop,secGraph,secLoop,isSup,propsFor,propsForActive,isOneStory]);
+  // (2-story mode) warn when EVERY wall has been tagged 1-story — then the 2nd floor has no walls.
+  const allOneStory = useMemo(()=> twoStory && graph.edges.length>0
+        && graph.edges.every(e=>oneStory.has(keyOf(e))), [twoStory, graph.edges, oneStory]);
   useEffect(()=>{
     const po=pendingOpen.current; if(!po) return; pendingOpen.current=null;
     const ax=po.axis; const sc=ax==="h"?secH:secV;
-    if(!sc||!sc.windLoads.length) return;
-    let target=null;
-    if(po.key) target=sc.windLoads.find(w=>w.key===po.key);   // exact segment the cut crossed
-    if(!target && po.sAcross!=null){                           // reverse: same cut position
-      const sOf=p=> ax==="v"?p.x:p.y;
-      let bestD=Infinity;
-      sc.windLoads.forEach(w=>{
-        const s0=Math.min(sOf(w.wa),sOf(w.wb)), s1=Math.max(sOf(w.wa),sOf(w.wb));
-        const inside = po.sAcross>=s0-0.6 && po.sAcross<=s1+0.6;
-        const d=Math.abs((s0+s1)/2-po.sAcross) - (inside?1e6:0);
-        if(d<bestD){ bestD=d; target=w; }
-      });
-    }
-    setActiveWall({axis:ax, key:(target?target.key:sc.windLoads[0].key), sAcross:po.sAcross});
+    const sign = sectionsRef.current[ax] && sectionsRef.current[ax].sign;
+    // The section is an OVERALL-BUILDING cut: anchor its windward wall to the FULL graph at the cut
+    // position, so the SAME section shows on the 1st-floor and 2nd-floor plans (rev 40). Before, the
+    // 2nd-floor view's filtered windLoads dropped the 1-story windward wall → a different section.
+    const seq = sectionSequence(po.sAcross, ax, sign, graphRef.current, propsFor, isOneStory);
+    let key = po.key;
+    if((!key || !seq.some(w=>w.key===key)) && seq.length) key = seq[0].key;   // true windward wall
+    if(!key && sc && sc.windLoads.length) key = sc.windLoads[0].key;          // last-resort fallback
+    if(key) setActiveWall({axis:ax, key, sAcross:po.sAcross});
   },[secH,secV]);
 
   // The active windward wall's leeward (back) partner — resolves the specific back segment behind
@@ -1604,14 +2052,29 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
   const activeSection = activeWall ? (()=>{
     const self = propsFor(activeWall.key);
     const lee  = activeLeeKey ? propsFor(activeLeeKey) : null;
+    const sign = sections[activeWall.axis]&&sections[activeWall.axis].sign;
+    // (rev 39) for a 1-story cut wall, the nearest 2-story portion DOWNWIND of it (the box) → drives
+    // the stepped section drawing + the ½·H₂·pw accumulation shown in the window.
+    const behind = isOneStory(activeWall.key)
+      ? nearestTwoStoryBehind(activeWall.key, activeWall.axis, sign, graph, propsFor, (k)=>oneStory.has(k))
+      : null;
+    // (rev 40) the full ordered run of walls this overall-building cut crosses → drives SecDiagramSeq
+    // + the section type (A/B/C/C-rev). Floor-independent (always the full graph at the cut position).
+    const sAt = activeWall.sAcross!=null ? activeWall.sAcross
+              : (()=>{ const e=graph.edges.find(x=>keyOf(x)===activeWall.key); if(!e) return null;
+                       const a=graph.nodes.find(n=>n.id===e.a), b=graph.nodes.find(n=>n.id===e.b);
+                       return a&&b ? (activeWall.axis==="v"?(a.x+b.x)/2:(a.y+b.y)/2) : null; })();
+    const seq = sectionSequence(sAt, activeWall.axis, sign, graph, propsFor, isOneStory);
     return { H:self.H, pw:self.pw, qWind:self.qWind, qLee:self.qLee,
              par:self.par,                       // windward parapet = this wall's own
              H2:self.H2,                          // 2nd-story wall height (resolves to H when unset)
              leePar: lee ? lee.par : 0,          // leeward parapet  = back wall's own
              leeH:  lee ? lee.H   : 0,           // leeward wall height = back wall's own H (sloping roof)
              leeH2: lee ? lee.H2  : 0,           // leeward 2nd-story height = back wall's own H2 (2-story)
+             behind,                              // {H2,pw,par,…} of the nearest 2-story wall behind, or null
+             seq,                                 // ordered walls front→back (overall-building section)
              axis:activeWall.axis,
-             sign:(sections[activeWall.axis]&&sections[activeWall.axis].sign) };
+             sign };
   })() : null;
 
   // Build one shear-wall design line per point-load support wall and hand off to the Design tab:
@@ -1623,22 +2086,25 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
     // wall height (same substitution as propsForActive), and tag each line with the floor's DESIGN
     // height (floor 2 walls are H₂ tall, floor 1 walls are H tall) and its reaction.
     const buildFloor=(floor)=>{
+      const fg = (twoStory && floor===2) ? twoStoryGraph : graph;   // step 2: roof floor excludes 1-story walls
+      const fl = (twoStory && floor===2) ? twoStoryLoop  : loop;
+      const mixedF1 = twoStory && floor===1 && oneStory.size>0;       // step 3: mixed-height 1st-floor accumulation
       const pf=(key)=>{ const p=propsFor(key); if(!twoStory) return p; const H=p.H||0,H2=p.H2||0; return {...p, H: floor===2 ? H2 : H+2*H2}; };
-      const scH=buildSecData(sections.h, graph, loop, isSup, pf);
-      const scV=buildSecData(sections.v, graph, loop, isSup, pf);
+      const scH = mixedF1 ? buildSecDataF1(sections.h, fg, fl, isSup, propsFor, isOneStory) : buildSecData(sections.h, fg, fl, isSup, pf);
+      const scV = mixedF1 ? buildSecDataF1(sections.v, fg, fl, isSup, propsFor, isOneStory) : buildSecData(sections.v, fg, fl, isSup, pf);
       const lines=[];
       [["h",scH],["v",scV]].forEach(([ax,sc])=>{
         if(!sc) return;
         sc.reactions.forEach(r=>{
           if(!(r.kips>0)) return;
-          const e=graph.edges.find(x=>keyOf(x)===r.key); if(!e) return;
-          const ea=graph.nodes.find(n=>n.id===e.a), eb=graph.nodes.find(n=>n.id===e.b); if(!ea||!eb) return;
+          const e=fg.edges.find(x=>keyOf(x)===r.key); if(!e) return;
+          const ea=fg.nodes.find(n=>n.id===e.a), eb=fg.nodes.find(n=>n.id===e.b); if(!ea||!eb) return;
           const o=edgeAxis(ea,eb);
           const fixed = o==="h" ? ea.y : ea.x;
           let lo=Infinity, hi=-Infinity, Hmax=0;
-          graph.edges.forEach(e2=>{
+          fg.edges.forEach(e2=>{
             if(!isSup(keyOf(e2))) return;
-            const a2=graph.nodes.find(n=>n.id===e2.a), b2=graph.nodes.find(n=>n.id===e2.b); if(!a2||!b2) return;
+            const a2=fg.nodes.find(n=>n.id===e2.a), b2=fg.nodes.find(n=>n.id===e2.b); if(!a2||!b2) return;
             if(edgeAxis(a2,b2)!==o) return;
             const f2 = o==="h" ? (a2.y+b2.y)/2 : (a2.x+b2.x)/2;
             if(Math.abs(f2-fixed)>0.75) return;
@@ -1660,7 +2126,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
     const floors = twoStory ? [2,1] : [1];          // 2nd floor (roof load) + 1st floor (2nd-floor load)
     const byFloor={}; floors.forEach(f=> byFloor[f]=buildFloor(f));
     onDesignShearWalls(byFloor, {nodes:graph.nodes.map(n=>({...n})), edges:graph.edges.map(e=>({...e}))});
-  },[onDesignShearWalls, sections, graph, loop, isSup, propsFor, twoStory]);
+  },[onDesignShearWalls, sections, graph, loop, isSup, propsFor, twoStory, twoStoryGraph, twoStoryLoop, oneStory, isOneStory]);
 
   return (
     <div className="r">
@@ -1754,6 +2220,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
         <div className="canvascol">
         <div className="stage" ref={stageRef}>
           {twoStory && (<div className="floorbadge">Floor {activeFloor} <span>plan</span></div>)}
+          {allOneStory && (<div className="allonestory-warn">⚠ All walls are 1-story — the 2nd floor has no walls.</div>)}
           <svg ref={svgRef} className="cvs" style={drawMode?{cursor:"crosshair"}:(panMode||panCursor)?{cursor:panCursor?"grabbing":"grab"}:undefined}
                viewBox={`${view.x} ${view.y} ${view.w} ${view.h}`}
                onPointerDown={onBgLDown} onPointerMove={onMove} onPointerUp={onUp}
@@ -1777,9 +2244,10 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
               const L=dist(a,b), mx=(a.x+b.x)/2, my=(a.y+b.y)/2;
               const editing=dimEdit&&same(dimEdit.edge,ed);
               const noPL=!isSup(keyOf(ed));
+              const oneSty=isOneStory(keyOf(ed));   // (2-story mode) 1-story-only wall → green
               return(
                 <g key={`e${ed.a}-${ed.b}`}>
-                  <line x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke={C_WALL} strokeWidth={0.55*S} strokeLinecap="round"
+                  <line x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke={oneSty?C_ONESTORY:C_WALL} strokeWidth={0.55*S} strokeLinecap="round"
                         strokeDasharray={noPL?`${1.6*S} ${1.4*S}`:undefined} opacity={noPL?0.55:1}/>
                   <line x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke="transparent" strokeWidth={4*S} style={{cursor:"grab"}}
                         onPointerDown={e=>onWallLDown(ed,e)} onContextMenu={e=>openMenu(e,{kind:"wall",edge:ed})}/>
@@ -1814,7 +2282,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
                 back-wall node) — drawn from the windward face across to the leeward face.
                 rev 34: hidden in 2-story FLOOR-1 view — the floor diaphragm load is uniform along
                 each wall there (the parapet/leeward variation lives in the ROOF diaphragm only). */}
-            {!(twoStory&&activeFloor===1) && [secH,secV].filter(Boolean).flatMap(sc=>(sc.divides||[]).map((d,i)=>(
+            {!(twoStory&&activeFloor===1&&!mixed1) && [secH,secV].filter(Boolean).flatMap(sc=>(sc.divides||[]).map((d,i)=>(
               <line key={(sc.axis)+"div"+i} x1={d.x1} y1={d.y1} x2={d.x2} y2={d.y2}
                     stroke={C_LOAD} strokeWidth={0.18*S} strokeDasharray={`${1.4*S} ${1.4*S}`} opacity=".55"/>
             )))}
@@ -1823,10 +2291,10 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
                 FLOOR-1 view the label shows the FLOOR-only diaphragm plf (½·H·pw + ½·H₂·pw); the roof
                 load reaches the 1st floor through the shear walls as a point load, not the diaphragm. */}
             {secH&&secH.windLoads.map((wl,i)=><WindLoad key={"hL"+wl.key} load={wl} S={S} ts={markScale}
-                 displayPlf={twoStory&&activeFloor===1 ? floorDiaphragmPlf(wl.key) : null}
+                 displayPlf={twoStory&&activeFloor===1&&!mixed1 ? floorDiaphragmPlf(wl.key) : null}
                  onOpen={()=>setActiveWall({axis:"h",key:wl.key})}/>)}
             {secV&&secV.windLoads.map((wl,i)=><WindLoad key={"vL"+wl.key} load={wl} S={S} ts={markScale}
-                 displayPlf={twoStory&&activeFloor===1 ? floorDiaphragmPlf(wl.key) : null}
+                 displayPlf={twoStory&&activeFloor===1&&!mixed1 ? floorDiaphragmPlf(wl.key) : null}
                  onOpen={()=>setActiveWall({axis:"v",key:wl.key})}/>)}
 
             {/* aggregated reactions (a shared support wall sums contributions into one arrow) */}
@@ -1901,6 +2369,11 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
                   <button className="cmi" onClick={()=>{toggleSupport(menu.edge);closeMenu();}}>
                     {isSup(keyOf(menu.edge)) ? "✓ Takes point load" : "✕ No point load"}
                   </button>
+                  {twoStory && (
+                    <button className="cmi" onClick={()=>{toggleOneStory(menu.edge);closeMenu();}}>
+                      {oneStory.has(keyOf(menu.edge)) ? "↥ Switch to 2-story" : "↧ Switch to 1-story"}
+                    </button>
+                  )}
                   <button className="cmi" onClick={()=>{splitWall(menu.edge,menu.u);closeMenu();}}>Add node here</button>
                   <button className="cmi del" onClick={()=>{deleteEdge(menu.edge);closeMenu();}}>Delete wall</button>
                 </>
@@ -2007,7 +2480,8 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
       {activeWall&&activeSection&&(
         <WindWindow key={activeWall.key+"|"+(activeLeeKey||"")} section={activeSection}
                     setVals={setVals} onReverse={reverseWind}
-                    onClose={()=>setActiveWall(null)} onRemove={removeSection} twoStory={twoStory}/>
+                    onClose={()=>setActiveWall(null)} onRemove={removeSection}
+                    twoStory={twoStory} oneStory={isOneStory(activeWall.key)}/>
       )}
     </div>
   );
