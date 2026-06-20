@@ -15,7 +15,7 @@ import {
 //   • APP_VERSION (here)      — human-facing build number in the UI ("Version 1.00").
 //   • CURRENT_VERSION (~below)— save-file SCHEMA version; drives .wps migrations. Do NOT couple.
 //   • handoff "rev" number    — the dev changelog in PLAN_SKETCHER_SUITE_HANDOFF.md.
-const APP_BUILD = 123;                                                                 // +1 per release
+const APP_BUILD = 124;                                                                 // +1 per release
 const APP_VERSION = `${Math.floor(APP_BUILD / 100)}.${String(APP_BUILD % 100).padStart(2, "0")}`;  // "1.00"
 
 // ── geometry space: 1 unit = 1 ft ──────────────────────────────────────────
@@ -48,7 +48,7 @@ const fmt2    = (n)       => Math.round(n*100)/100;
 // text rotation that keeps labels parallel to a wall and upright (-90..90]
 const wallAng = (dx,dy)=>{ let a=Math.atan2(dy,dx)*180/Math.PI; a=((a+90)%180+180)%180-90; return a; };
 // a section now stores its own shared values (per wind direction)
-const DEF_SECTION = { H:13, pw:16, qWind:32, qLee:22, par:5, H2:null };  // `par` = this wall's own parapet; `H2` = 2nd-story wall ht (2-story mode), null → equals H
+const DEF_SECTION = { H:10, pw:16, qWind:32, qLee:22, par:5, H2:null };  // (rev 44) default wall H=10ft, parapet=5ft. `par` = this wall's own parapet; `H2` = 2nd-story wall ht (2-story mode), null → equals H
 // Normalize one stored wall-prop entry: migrate the legacy `parW` field, then MERGE ONTO
 // DEF_SECTION so a saved entry that predates a future field still resolves every key (no NaN
 // from an `undefined` pressure term). Behavior-identical for current entries (they override
@@ -1056,11 +1056,16 @@ function SecDiagramSeq({ seq, v, upd, floorLL, roofLL, commit }){
         {w.par>0&&<Box cx={x-aWind/2} cy={(pty+ty)/2} text={`${fmt1(w.q)} psf`} color={C_DIMBOX} field="wQ" prop="qWind" rot={-90}/>}
         {w.par>0&&<Box cx={x+13} cy={(pty+ty)/2} text={`${fmt1(w.par)} ft`} color={C_REACTBOX} field="wH" prop="parW"/>}
       </g>); })()}
-      {/* editable BACK (leeward) parapet boxes */}
-      {(()=>{ const x=xAt(last), w=W[last], ty=topY(w), pty=ty-w.par*pxPerFt; return (w.par>0?<g>
-        {w.q>0&&<Box cx={x+aLee/2} cy={(pty+ty)/2} text={`${fmt1(w.q)} psf`} color={C_DIMBOX} field="lQ" prop="qLee" rot={-90}/>}
-        <Box cx={x-13} cy={(pty+ty)/2} text={`${fmt1(w.par)} ft`} color={C_REACTBOX} field="lH" prop="parL"/>
-      </g>:null); })()}
+      {/* (rev 44) editable BACK (leeward-most) wall — its HEIGHT (and H₂ if 2-story) is ALWAYS editable
+          for correct geometry, even though this wall carries no diaphragm load (mirrors the 1-story's
+          editable leeward HR, which tilts the roof line without contributing to the wall load). Its
+          parapet height + leeward parapet pressure stay editable too. leeH/leeH2 route to the back wall. */}
+      {(()=>{ const x=xAt(last), w=W[last], ty=topY(w), pty=ty-w.par*pxPerFt, y2=wallBot-w.H*pxPerFt; return (<g>
+        <Box cx={x-13} cy={(y2+wallBot)/2} text={`${fmt1(w.H)} ft`} color={C_REACTBOX} field="leeH" prop="leeH"/>
+        {!w.one && w.H2>0 && <Box cx={x-13} cy={(ty+y2)/2} text={`${fmt1(w.H2)} ft`} color={C_REACTBOX} field="leeH2" prop="leeH2"/>}
+        {w.par>0 && w.q>0 && <Box cx={x+aLee/2} cy={(pty+ty)/2} text={`${fmt1(w.q)} psf`} color={C_DIMBOX} field="lQ" prop="qLee" rot={-90}/>}
+        {w.par>0 && <Box cx={x-13} cy={(pty+ty)/2} text={`${fmt1(w.par)} ft`} color={C_REACTBOX} field="lH" prop="parL"/>}
+      </g>); })()}
       {/* (rev 42) editable INTERIOR 2-story BLOCK walls — height + pressure, written straight to each wall's
           own props by key (front block = windward face: pw·H·H₂·par·qWind; back block = leeward face:
           qLee·par·H·H₂). Only for block ends that are NOT the sequence front/back (those use the boxes above). */}
