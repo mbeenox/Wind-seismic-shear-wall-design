@@ -15,7 +15,7 @@ import {
 //   • APP_VERSION (here)      — human-facing build number in the UI ("Version 1.00").
 //   • CURRENT_VERSION (~below)— save-file SCHEMA version; drives .wps migrations. Do NOT couple.
 //   • handoff "rev" number    — the dev changelog in PLAN_SKETCHER_SUITE_HANDOFF.md.
-const APP_BUILD = 124;                                                                 // +1 per release
+const APP_BUILD = 125;                                                                 // +1 per release
 const APP_VERSION = `${Math.floor(APP_BUILD / 100)}.${String(APP_BUILD % 100).padStart(2, "0")}`;  // "1.00"
 
 // ── geometry space: 1 unit = 1 ft ──────────────────────────────────────────
@@ -3667,16 +3667,35 @@ function DesignTab({ g, setGl, shape, lines, linesByFloor, segsByLine, setSegsBy
   },[lines, segsByLine]);
 
   const optimizeAll = () => {
-    const next={}; let okCount=0, failNames=[];
-    lines.forEach(ln=>{
+    // Design EVERY wall across BOTH floors — not only the floor currently in view — and MERGE the
+    // result onto the existing layouts. The old code built `next` from just the viewed floor's
+    // `lines` and then WHOLESALE-replaced segsByLine, which WIPED the other floor's segments: in a
+    // mixed 2-story + 1-story building the two floors have different line sets (Level 2 excludes the
+    // 1-story walls), so after optimizing on one floor, a wall present only on the OTHER floor lost
+    // its layout and read as empty → FAIL on a Level 1 ↔ Level 2 switch until you re-optimized.
+    // A 2-story wall shares one id (ax|key) and ONE segment layout across both floors, so it is
+    // designed ONCE against its GOVERNING floor (the larger reaction, then the taller height) so the
+    // shared layout serves the heavier story.
+    const floorLines = (twoStory && linesByFloor)
+      ? [ ...(linesByFloor[1]||[]), ...(linesByFloor[2]||[]) ]
+      : lines;
+    const byId = new Map();
+    floorLines.forEach(ln=>{
+      const cur = byId.get(ln.id);
+      if(!cur || ln.forceLbs > cur.forceLbs ||
+         (ln.forceLbs === cur.forceLbs && ln.heightFt > cur.heightFt)) byId.set(ln.id, ln);
+    });
+    const next = { ...segsByLine };            // merge — never drop another floor's lines
+    let okCount=0, failNames=[]; const total = byId.size;
+    byId.forEach(ln=>{
       const out = generateDesign({ ...g, wWind: ln.forceLbs }, { ...d, lineLength: ln.lengthFt, height: ln.heightFt });
       if(out){ next[ln.id]=out.segs.map(s=>({...s})); okCount++; }
       else { next[ln.id]=[]; failNames.push(`${fmt(ln.forceLbs/1000,1)}k/${fmt(ln.lengthFt,0)}′ line`); }
     });
     setSegsByLine(next);
     setGenMsg(failNames.length
-      ? { ok:false, text:`Optimized ${okCount}/${lines.length} lines. No passing configuration for: ${failNames.join(", ")} — relax max segment length/count or allow type 3.` }
-      : { ok:true, text:`Optimized all ${lines.length} line${lines.length>1?"s":""}.` });
+      ? { ok:false, text:`Optimized ${okCount}/${total} lines. No passing configuration for: ${failNames.join(", ")} — relax max segment length/count or allow type 3.` }
+      : { ok:true, text:`Optimized all ${total} line${total>1?"s":""}.` });
   };
 
   const setOv = (lineId, idx, key, val) => ovSet(lineId, idx, key, val);
