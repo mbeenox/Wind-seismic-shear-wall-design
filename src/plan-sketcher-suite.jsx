@@ -745,7 +745,7 @@ function SecDiagram({ v, upd }) {
           onChange={upd(edit.field, edit.prop)} onBlur={()=>setEdit(null)}
           onKeyDown={e=>{ if(e.key==="Enter"||e.key==="Escape") setEdit(null); }}
           style={{ position:"absolute", left:`${edit.l}%`, top:`${edit.t}%`, transform:"translate(-50%,-50%)",
-                   width:58, padding:"4px 6px", textAlign:"center", border:"1.5px solid #2ad4e8", borderRadius:5,
+                   width:58, padding:"4px 6px", textAlign:"center",
                    background:"#FFFFFF", color:"#9A6B1F", border:"1.5px solid #9A6B1F", borderRadius:3, font:"700 13px ui-monospace,Menlo,monospace", outline:"none", zIndex:6 }}/>
       )}
     </div>
