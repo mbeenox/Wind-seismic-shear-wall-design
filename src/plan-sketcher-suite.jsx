@@ -15,7 +15,7 @@ import {
 //   • APP_VERSION (here)      — human-facing build number in the UI ("Version 1.00").
 //   • CURRENT_VERSION (~below)— save-file SCHEMA version; drives .wps migrations. Do NOT couple.
 //   • handoff "rev" number    — the dev changelog in PLAN_SKETCHER_SUITE_HANDOFF.md.
-const APP_BUILD = 125;                                                                 // +1 per release
+const APP_BUILD = 126;                                                                 // +1 per release
 const APP_VERSION = `${Math.floor(APP_BUILD / 100)}.${String(APP_BUILD % 100).padStart(2, "0")}`;  // "1.00"
 
 // ── geometry space: 1 unit = 1 ft ──────────────────────────────────────────
@@ -2145,6 +2145,18 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
     };
     const floors = twoStory ? [2,1] : [1];          // 2nd floor (roof load) + 1st floor (2nd-floor load)
     const byFloor={}; floors.forEach(f=> byFloor[f]=buildFloor(f));
+    // STACK ALIGNMENT (rev 47): a stacked wall in a MIXED building has a SHORTER 2nd-floor line (the
+    // 2-story segment, built on twoStoryGraph) than its full-wall 1st-floor line. Both floors share ONE
+    // segment array (keyed by id) drawn anchored to each floor's own line start, so different
+    // origins/lengths desync the stack and let a floor-1 layout overflow the shorter floor-2 line.
+    // Reconcile: the 1st-floor line ADOPTS its 2nd-floor partner's extent (a/b/lengthFt = the 2-story
+    // segment) while KEEPING its own 1st-floor reaction + design height. Both floors then share one
+    // origin + bound, so segments stack/align and ALL placement (drag + optimize) is confined to the
+    // 2-story segment. Uniform 2-story walls already match → no-op; 1-story-only lines have no partner.
+    if(twoStory && byFloor[2]){
+      const up = new Map(byFloor[2].map(l=>[l.id,l]));
+      byFloor[1] = byFloor[1].map(l=>{ const u=up.get(l.id); return u ? { ...l, a:u.a, b:u.b, lengthFt:u.lengthFt } : l; });
+    }
     onDesignShearWalls(byFloor, {nodes:graph.nodes.map(n=>({...n})), edges:graph.edges.map(e=>({...e}))});
   },[onDesignShearWalls, sections, graph, loop, isSup, propsFor, twoStory, twoStoryGraph, twoStoryLoop, oneStory, isOneStory]);
 
@@ -3369,6 +3381,49 @@ function stackedLineResults(line1, line2, segs, g, d) {
   });
 }
 
+// 1st-floor-CONTROLLED stacked optimizer (rev 47). A stacked wall shares ONE segment layout across
+// both floors, so its length is governed by the heavier 1st-floor COMBINED (arm-aware) demand, not the
+// lighter 2nd floor. This mirrors generateDesign's (N, Ls) search but scores every candidate through
+// the SAME validators the Design tab displays — stackedLineResults (1st-floor combined) AND the 2nd
+// floor's own lineResults — and BOUNDS every layout to the 2-story segment (cap = the shared
+// reconciled extent). It returns the shortest passing layout, so when the 2nd floor alone would take
+// 6 ft but the stacked holdown/post can't pass at 6 ft, it grows the wall (e.g. 10 ft, up to the
+// segment) — and that one length is used on both floors. If nothing passes within the segment it
+// returns null → the line reports FAIL (never spills past the 2-story segment). calcCore.js is
+// untouched: this only composes its exported primitives (calcSegment/baseDesignSeg via lineResults).
+function generateStackedDesign(line1, line2, g, d) {
+  const cap = Math.max(0, Math.min(line2.lengthFt, line1.lengthFt));   // 2-story-segment length bound
+  const snap = Math.max(0.25, d.snap || 0.5);
+  const maxN = Math.max(1, Math.min(6, Math.floor(d.maxSegments)));
+  const rnd = (x) => Math.round(x * 4) / 4;
+  const mkSegs = (N, Ls) => { const gap = (cap - N*Ls)/(N+1);
+    return Array.from({ length:N }, (_,i)=>({ start: rnd(gap + i*(Ls+gap)), length: Ls })); };
+  const evalC = (segs) => {
+    const stk = stackedLineResults(line1, line2, segs, g, d);   // combined 1st-floor demand (governs)
+    const top = lineResults(line2, segs, g, d);                 // 2nd floor's own shear / aspect
+    const ok = stk.length > 0 && stk.every(r=>!r.failed) && top.every(r=>!r.failed);
+    const T = xMax(...stk.map(r=>isNum(r.selType) ? r.selType : 0));
+    return { ok, T };
+  };
+  const solutions = [];
+  for (let N = 1; N <= maxN; N++) {
+    const maxLs = Math.min(d.maxSegLen, cap / N);
+    if (maxLs < d.minSegLen - 1e-9) continue;
+    const start = Math.ceil(d.minSegLen / snap) * snap;
+    for (let Ls = start; Ls <= maxLs + 1e-9; Ls = +(Ls + snap).toFixed(4)) {
+      const segs = mkSegs(N, Ls);
+      const ev = evalC(segs);
+      if (ev.ok) { solutions.push({ N, Ls, total: N*Ls, T: ev.T, segs }); break; }
+    }
+  }
+  if (!solutions.length) return null;
+  solutions.sort((a, b) => d.objective === "nailing"
+    ? a.T - b.T || a.total - b.total || a.N - b.N
+    : a.total - b.total || a.N - b.N || a.T - b.T);
+  const best = solutions[0];
+  return { segs: best.segs.map(s=>({...s})), meta:{ type: best.T, N: best.N, Ls: best.Ls, total: best.total, stacked:true } };
+}
+
 // Shearwall schedule reference table — shown at the bottom of the Design tab
 // (same data as the Calculation Sheet's reference section)
 function SwScheduleRef({ grade }) {
@@ -3667,30 +3722,32 @@ function DesignTab({ g, setGl, shape, lines, linesByFloor, segsByLine, setSegsBy
   },[lines, segsByLine]);
 
   const optimizeAll = () => {
-    // Design EVERY wall across BOTH floors — not only the floor currently in view — and MERGE the
-    // result onto the existing layouts. The old code built `next` from just the viewed floor's
-    // `lines` and then WHOLESALE-replaced segsByLine, which WIPED the other floor's segments: in a
-    // mixed 2-story + 1-story building the two floors have different line sets (Level 2 excludes the
-    // 1-story walls), so after optimizing on one floor, a wall present only on the OTHER floor lost
-    // its layout and read as empty → FAIL on a Level 1 ↔ Level 2 switch until you re-optimized.
-    // A 2-story wall shares one id (ax|key) and ONE segment layout across both floors, so it is
-    // designed ONCE against its GOVERNING floor (the larger reaction, then the taller height) so the
-    // shared layout serves the heavier story.
-    const floorLines = (twoStory && linesByFloor)
-      ? [ ...(linesByFloor[1]||[]), ...(linesByFloor[2]||[]) ]
-      : lines;
-    const byId = new Map();
-    floorLines.forEach(ln=>{
-      const cur = byId.get(ln.id);
-      if(!cur || ln.forceLbs > cur.forceLbs ||
-         (ln.forceLbs === cur.forceLbs && ln.heightFt > cur.heightFt)) byId.set(ln.id, ln);
-    });
+    // Design EVERY wall across BOTH floors and MERGE onto the existing layouts (never wipe another
+    // floor's lines — rev 46). A wall that exists on BOTH floors (same id) is a STACKED wall: its one
+    // shared layout is governed by the heavier 1st-floor COMBINED demand, so it goes through
+    // generateStackedDesign (1st floor controls; the chosen length is reused on the 2nd floor, bounded
+    // by the 2-story segment — rev 47). A wall on only one floor (a 1-story wall, or a single-story
+    // building) keeps the standalone generateDesign on its own reaction/length/height.
+    const f1 = (linesByFloor && linesByFloor[1]) || (twoStory ? [] : lines);
+    const f2 = (twoStory && linesByFloor && linesByFloor[2]) || [];
+    const lower = new Map(f1.map(l=>[l.id,l]));
+    const upper = new Map(f2.map(l=>[l.id,l]));
+    const ids = new Set([...lower.keys(), ...upper.keys()]);
     const next = { ...segsByLine };            // merge — never drop another floor's lines
-    let okCount=0, failNames=[]; const total = byId.size;
-    byId.forEach(ln=>{
-      const out = generateDesign({ ...g, wWind: ln.forceLbs }, { ...d, lineLength: ln.lengthFt, height: ln.heightFt });
-      if(out){ next[ln.id]=out.segs.map(s=>({...s})); okCount++; }
-      else { next[ln.id]=[]; failNames.push(`${fmt(ln.forceLbs/1000,1)}k/${fmt(ln.lengthFt,0)}′ line`); }
+    let okCount=0, failNames=[]; const total = ids.size;
+    ids.forEach(id=>{
+      const l1 = lower.get(id), l2 = upper.get(id);
+      let out, label;
+      if(l1 && l2){                            // stacked → 1st-floor-controlled, segment-bounded
+        out = generateStackedDesign(l1, l2, g, d);
+        label = `${fmt(l1.forceLbs/1000,1)}k/${fmt(Math.min(l1.lengthFt,l2.lengthFt),0)}′ stacked line`;
+      } else {                                 // 1-story-only / single-story → standalone
+        const ln = l1 || l2;
+        out = generateDesign({ ...g, wWind: ln.forceLbs }, { ...d, lineLength: ln.lengthFt, height: ln.heightFt });
+        label = `${fmt(ln.forceLbs/1000,1)}k/${fmt(ln.lengthFt,0)}′ line`;
+      }
+      if(out){ next[id]=out.segs.map(s=>({...s})); okCount++; }
+      else { next[id]=[]; failNames.push(label); }
     });
     setSegsByLine(next);
     setGenMsg(failNames.length
