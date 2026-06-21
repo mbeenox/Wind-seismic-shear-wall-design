@@ -15,7 +15,7 @@ import {
 //   • APP_VERSION (here)      — human-facing build number in the UI ("Version 1.00").
 //   • CURRENT_VERSION (~below)— save-file SCHEMA version; drives .wps migrations. Do NOT couple.
 //   • handoff "rev" number    — the dev changelog in PLAN_SKETCHER_SUITE_HANDOFF.md.
-const APP_BUILD = 126;                                                                 // +1 per release
+const APP_BUILD = 127;                                                                 // +1 per release
 const APP_VERSION = `${Math.floor(APP_BUILD / 100)}.${String(APP_BUILD % 100).padStart(2, "0")}`;  // "1.00"
 
 // ── geometry space: 1 unit = 1 ft ──────────────────────────────────────────
@@ -2145,17 +2145,42 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
     };
     const floors = twoStory ? [2,1] : [1];          // 2nd floor (roof load) + 1st floor (2nd-floor load)
     const byFloor={}; floors.forEach(f=> byFloor[f]=buildFloor(f));
-    // STACK ALIGNMENT (rev 47): a stacked wall in a MIXED building has a SHORTER 2nd-floor line (the
-    // 2-story segment, built on twoStoryGraph) than its full-wall 1st-floor line. Both floors share ONE
-    // segment array (keyed by id) drawn anchored to each floor's own line start, so different
-    // origins/lengths desync the stack and let a floor-1 layout overflow the shorter floor-2 line.
-    // Reconcile: the 1st-floor line ADOPTS its 2nd-floor partner's extent (a/b/lengthFt = the 2-story
-    // segment) while KEEPING its own 1st-floor reaction + design height. Both floors then share one
-    // origin + bound, so segments stack/align and ALL placement (drag + optimize) is confined to the
-    // 2-story segment. Uniform 2-story walls already match → no-op; 1-story-only lines have no partner.
-    if(twoStory && byFloor[2]){
-      const up = new Map(byFloor[2].map(l=>[l.id,l]));
-      byFloor[1] = byFloor[1].map(l=>{ const u=up.get(l.id); return u ? { ...l, a:u.a, b:u.b, lengthFt:u.lengthFt } : l; });
+    // STACK ALIGNMENT (rev 47 → rev 48): a stacked wall's 1st-floor line spans the FULL wall (built on
+    // the full graph) while its 2nd-floor line spans only the 2-story sub-segment (twoStoryGraph). They
+    // do NOT necessarily share an id: the collinear-support cluster (see ~line 201) keys each line to
+    // its LONGEST collinear edge, which for the 1st floor is often the 1-STORY portion — so id-based
+    // pairing (rev 47) missed them and left TWO independent lines. Result the user saw: the two floors'
+    // shear walls didn't share a segment array (length/position edits on one floor didn't reach the
+    // other) and centered in different spans (the wall "shifted" on a floor switch). Pair them
+    // GEOMETRICALLY instead — each 2nd-floor line adopts the collinear 1st-floor line that contains it
+    // (same orientation + wind axis + fixed coordinate; tightest span that covers the 2-story segment)
+    // — then that 1st-floor line takes the 2nd floor's id + extent (a/b/lengthFt) while KEEPING its own
+    // 1st-floor reaction + design height. Both floors then share ONE id (→ one segsByLine entry, so they
+    // move + stretch together) and ONE geometry (→ aligned, centered identically, confined to the 2-story
+    // segment). Uniform 2-story walls already coincide → pairing is an identity; 1-story-only lines find
+    // no 2-story partner and are left untouched.
+    if(twoStory && byFloor[1] && byFloor[2]){
+      const fixedOf=(l)=> l.o==="h" ? l.a.y : l.a.x;
+      const spanOf =(l)=> l.o==="h" ? [Math.min(l.a.x,l.b.x),Math.max(l.a.x,l.b.x)]
+                                    : [Math.min(l.a.y,l.b.y),Math.max(l.a.y,l.b.y)];
+      const claimed=new Set(), paired=new Map();
+      byFloor[2].forEach(u=>{
+        const [ulo,uhi]=spanOf(u);
+        let best=null, bestScore=-Infinity;
+        byFloor[1].forEach(l=>{
+          if(claimed.has(l) || l.o!==u.o || l.windAxis!==u.windAxis) return;
+          if(Math.abs(fixedOf(l)-fixedOf(u))>0.75) return;
+          const [llo,lhi]=spanOf(l);
+          const overlap=Math.min(lhi,uhi)-Math.max(llo,ulo);
+          if(overlap<=0.5) return;
+          const contains = llo<=ulo+0.5 && lhi>=uhi-0.5;
+          const score=(contains?1e6:0) + overlap - l.lengthFt*0.001;   // prefer a containing, tightest line
+          if(score>bestScore){ best=l; bestScore=score; }
+        });
+        if(best){ claimed.add(best); paired.set(best,u); }
+      });
+      byFloor[1]=byFloor[1].map(l=>{ const u=paired.get(l);
+        return u ? { ...l, id:u.id, key:u.key, a:u.a, b:u.b, lengthFt:u.lengthFt } : l; });
     }
     onDesignShearWalls(byFloor, {nodes:graph.nodes.map(n=>({...n})), edges:graph.edges.map(e=>({...e}))});
   },[onDesignShearWalls, sections, graph, loop, isSup, propsFor, twoStory, twoStoryGraph, twoStoryLoop, oneStory, isOneStory]);
