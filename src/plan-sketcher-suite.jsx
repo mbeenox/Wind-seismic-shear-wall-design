@@ -15,7 +15,7 @@ import {
 //   • APP_VERSION (here)      — human-facing build number in the UI ("Version 1.00").
 //   • CURRENT_VERSION (~below)— save-file SCHEMA version; drives .wps migrations. Do NOT couple.
 //   • handoff "rev" number    — the dev changelog in PLAN_SKETCHER_SUITE_HANDOFF.md.
-const APP_BUILD = 129;                                                                 // +1 per release
+const APP_BUILD = 131;                                                                 // +1 per release
 const APP_VERSION = `${Math.floor(APP_BUILD / 100)}.${String(APP_BUILD % 100).padStart(2, "0")}`;  // "1.00"
 
 // ── geometry space: 1 unit = 1 ft ──────────────────────────────────────────
@@ -1732,6 +1732,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
         if("markScale" in s) setMarkScale(Number(s.markScale)||1);
         else if("textScale" in s) setMarkScale(Number(s.textScale)||1);   // rev 30 key — back-compat
         history.current=[]; future.current=[];
+        setPushedSig(null);                          // rev 130: New/Open → no stale-push warning until the next push (a loaded file is in sync with its own saved design)
       },
       // rev 24: let the Design tab rebuild geometry-less (stale) lines straight from the restored
       // plan. `rerun` is runDesignHandoff (regenerates geometry-complete lines from the live graph);
@@ -2198,8 +2199,14 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
   // Build one shear-wall design line per point-load support wall and hand off to the Design tab:
   // full collinear extent (even when the support is split), max wall height H along it, and the
   // reaction kips it carries. Parapets are irrelevant to the shear-wall calc and are not sent.
-  const runDesignHandoff = useCallback(()=>{
-    if(!onDesignShearWalls) return;
+  // rev 130 — STALE-PUSH INDICATOR (Plan→Design). `pushedSig` = the handoff signature
+  // captured the last time the user pressed "Design shear walls". It is null until a push
+  // (so the button is only ever red AFTER a push, per spec) and is reset on New/Open below.
+  const [pushedSig, setPushedSig] = useState(null);
+  // `computeHandoff` is the OLD runDesignHandoff body with NO side effect — it just returns
+  // `byFloor`. The actual push (runDesignHandoff) calls it then hands off; the live signature
+  // memo calls it on every relevant plan change to detect divergence. (Not a guarded engine fn.)
+  const computeHandoff = useCallback(()=>{
     // Build the design lines for ONE floor: re-run the frozen wind engine with that floor's effective
     // wall height (same substitution as propsForActive), and tag each line with the floor's DESIGN
     // height (floor 2 walls are H₂ tall, floor 1 walls are H tall) and its reaction.
@@ -2289,8 +2296,23 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
       byFloor[1]=byFloor[1].map(l=>{ const u=paired.get(l);
         return u ? { ...l, id:u.id, key:u.key, a:u.a, b:u.b, lengthFt:u.lengthFt } : l; });
     }
+    return byFloor;
+  },[sections, graph, loop, isSup, propsFor, twoStory, twoStoryGraph, twoStoryLoop, oneStory, isOneStory]);
+
+  // Live signature of what a push WOULD send right now. Recomputes whenever any handoff input
+  // changes (computeHandoff's identity changes with its deps). Pure-view edits (zoom, markup
+  // scale, selection, snap/ortho/dims) are NOT in computeHandoff's deps, so they never trip it.
+  const liveHandoffSig = useMemo(()=> JSON.stringify(computeHandoff()), [computeHandoff]);
+  // RED when: we have pushed at least once AND re-pushing would change the Design tab's lines.
+  const designStaleHint = pushedSig !== null && liveHandoffSig !== pushedSig;
+  // The actual push: build the lines, hand them to the Design tab, and snapshot the signature
+  // so the button returns to normal until the next upstream edit that would change the result.
+  const runDesignHandoff = useCallback(()=>{
+    if(!onDesignShearWalls) return;
+    const byFloor = computeHandoff();
     onDesignShearWalls(byFloor, {nodes:graph.nodes.map(n=>({...n})), edges:graph.edges.map(e=>({...e}))});
-  },[onDesignShearWalls, sections, graph, loop, isSup, propsFor, twoStory, twoStoryGraph, twoStoryLoop, oneStory, isOneStory]);
+    setPushedSig(JSON.stringify(byFloor));
+  },[onDesignShearWalls, computeHandoff, graph]);
 
   return (
     <div className="r">
@@ -2371,10 +2393,12 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
         <div className="rgroup">
           <div className="rlabel">Analyze</div>
           <div className="rbtns">
-            <button className="rbtn raccent" title="Send point-load walls to the shear-wall designer"
+            <button className="rbtn raccent"
+              title={designStaleHint ? "Plan changed since you last sent it — click to update the Design tab" : "Send point-load walls to the shear-wall designer"}
               disabled={!((secH&&secH.reactions.length)||(secV&&secV.reactions.length))}
+              style={(designStaleHint && ((secH&&secH.reactions.length)||(secV&&secV.reactions.length))) ? STALE_BTN : undefined}
               onClick={runDesignHandoff}>
-              ⚡ Design shear walls
+              {designStaleHint && WARN}⚡ Design shear walls
             </button>
           </div>
         </div>
@@ -2600,9 +2624,13 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
                 </div>
               ):null)}
               {onDesignShearWalls && (secH&&secH.reactions.length || secV&&secV.reactions.length) ? (
-                <button className="btn" style={{width:"100%",marginTop:6,background:"#23577F",borderColor:"#23577F",color:"#FFFFFF",fontWeight:700}}
+                <button className="btn"
+                  title={designStaleHint ? "Plan changed since you last sent it — click to update the Design tab" : undefined}
+                  style={{width:"100%",marginTop:6,fontWeight:700,
+                          ...(designStaleHint ? {background:STALE_BTN.background,borderColor:STALE_BTN.borderColor,color:STALE_BTN.color}
+                                              : {background:"#23577F",borderColor:"#23577F",color:"#FFFFFF"})}}
                   onClick={runDesignHandoff}>
-                  Design shear walls →
+                  {designStaleHint && WARN}Design shear walls →
                 </button>
               ):null}
             </div>
@@ -2788,6 +2816,53 @@ const swBtn = (primary) => ({
   border:`1.5px solid ${primary ? SW.accent : SW.rule}`, background: primary ? SW.accent : SW.panel,
   color: primary ? "#FFFFFF" : SW.ink, cursor:"pointer", borderRadius:4,
 });
+
+/* ── STALE-PUSH INDICATOR (rev 130) ──────────────────────────────────────────
+   A "push data" button (Plan→Design ⚡, Design→Calc →) goes red when the upstream
+   inputs have changed since the LAST time you pushed, so re-pushing would change
+   the downstream tab. The red look masks the button text in red (+ a pale-red
+   wash and red border so the red text stays legible over any base fill). Applied
+   inline so it overrides whatever base style/class the button already carries. */
+const STALE_BTN = { color:"#C0271F", background:"#FDECEC", border:"1.5px solid #D9483B", borderColor:"#D9483B", fontWeight:700 };
+
+// Signature of exactly what `applyToCalc` would push to the Calculation Sheet for a
+// given design line: the segment lengths, the line's force/height/tributary, the
+// per-segment selected schedule types, and the constraint fields the sheet seeds
+// from. Two calls are equal iff re-sending would produce the same sheet — so an edit
+// that wouldn't change the push (or an edit-then-revert) leaves the signature alone.
+// (g is App-level shared state, read live by the calc sheet, so it is NOT part of the
+//  push and is intentionally excluded — except via selType, which the sheet snapshots.)
+function calcPushSig(line, segs, res, dC){
+  return JSON.stringify({
+    f: Math.round((line && line.forceLbs) || 0),
+    h: line ? line.heightFt : null,
+    rt: (line && line.roofTrib != null)  ? line.roofTrib  : (dC ? dC.roofTrib  : null),
+    ft: (line && line.floorTrib != null) ? line.floorTrib : (dC ? dC.floorTrib : null),
+    segs: (segs || []).map(s => s.length),
+    types: (res || []).map(r => (r && isNum(r.selType)) ? Math.min(r.selType, 3) : 1),
+    d: dC ? [dC.hdDist, dC.thickness, dC.anchor, dC.ftgWidth, dC.ftgThick] : [],
+  });
+}
+
+// rev 130b — the caution sign prefixed to a stale button's label. U+FE0E (text-presentation
+// selector) forces a MONOCHROME triangle that inherits the button's red text color (rather than the
+// yellow emoji), so it reads as part of the red "stale" styling. It sits INLINE to the left of the
+// label with a trailing space, so it never overlaps or obstructs the text (swap to "⚠️ " for the
+// classic yellow emoji if preferred).
+const WARN = "\u26A0\uFE0E ";
+
+// Signature of the inputs the Design-tab "⚡ Optimize design" optimizer (optimizeAll) consumes, so the
+// button can go red when re-optimizing would produce a different design. Covers every line's
+// force/height/length/tributary across BOTH floors + the framing/code (g) + the design constraints (d).
+// g.wWind is EXCLUDED — optimizeAll overrides it per-line with the line's own force (so a calc-sheet
+// push that sets g.wWind must NOT mark Optimize stale); g.line is a cosmetic label, also excluded.
+function optimizeSig(linesByFloor, lines, twoStory, g, d){
+  const f1 = (linesByFloor && linesByFloor[1]) || (twoStory ? [] : (lines || [])) || [];
+  const f2 = (twoStory && linesByFloor && linesByFloor[2]) || [];
+  const key = (l) => [l.id, Math.round(l.forceLbs || 0), l.heightFt, l.lengthFt, l.roofTrib, l.floorTrib];
+  const gKey = { ...(g || {}) }; delete gKey.wWind; delete gKey.line;
+  return JSON.stringify({ f1: f1.map(key), f2: f2.map(key), g: gKey, d: d || {} });
+}
 
 /* ────────────────────────────────────────────────────────────────────────
    LIGHT THEME — Calculation Sheet only. 1:1 port of the standalone
@@ -3839,7 +3914,7 @@ function SwCtxMenu({ ctx, lines, segsByLine, resultsByLine, setOv, onRemove, onC
 }
 
 // ---------- DESIGN TAB ----------
-function DesignTab({ g, setGl, shape, lines, linesByFloor, segsByLine, setSegsByLine, ovSet, d, setDk, applyToCalc, selLine, setSelLine, twoStory, activeFloor, setActiveFloor, stale, onRebuild }) {
+function DesignTab({ g, setGl, shape, lines, linesByFloor, segsByLine, setSegsByLine, ovSet, d, setDk, applyToCalc, selLine, setSelLine, twoStory, activeFloor, setActiveFloor, stale, onRebuild, calcPush, optimizePush, setOptimizePush }) {
   const [ctx, setCtx] = useState(null);
   const [genMsg, setGenMsg] = useState(null);
   const [showTags, setShowTags] = useState(false);   // rev 13: SW marks no longer auto-show on the plan
@@ -3897,6 +3972,7 @@ function DesignTab({ g, setGl, shape, lines, linesByFloor, segsByLine, setSegsBy
       else { next[id]=[]; failNames.push(label); }
     });
     setSegsByLine(next);
+    setOptimizePush && setOptimizePush(optimizeSig(linesByFloor, lines, twoStory, g, d));   // rev 130b: remember the inputs this Optimize ran on
     setGenMsg(failNames.length
       ? { ok:false, text:`Optimized ${okCount}/${total} lines. No passing configuration for: ${failNames.join(", ")} — relax max segment length/count or allow type 3.` }
       : { ok:true, text:`Optimized all ${total} line${total>1?"s":""}.` });
@@ -3917,6 +3993,15 @@ function DesignTab({ g, setGl, shape, lines, linesByFloor, segsByLine, setSegsBy
   const sel = lines.find(l=>l.id===selLine);
   const selSegs = sel ? (segsByLine[sel.id]||[]) : [];
   const selRes  = sel ? (resultsByLine[sel.id]||[]) : [];
+  // rev 130: the "Send line to calculation sheet" button goes red when the line CURRENTLY in the
+  // sheet (calcPush.lineId) is the one selected AND its pushable data has changed since it was sent.
+  // Selecting a DIFFERENT line is not "stale" — that's a fresh push, so the button stays normal.
+  const calcStaleHint = !!(calcPush && sel && calcPush.lineId === sel.id && calcPush.sig !== calcPushSig(sel, selSegs, selRes, d));
+  // rev 130b: the ⚡ Optimize design button produces the tab's design output; it goes red when an input
+  // it consumes (any line's force/height/length/trib across both floors, or g / d) has changed since the
+  // last Optimize. optimizePush is null until the first Optimize (so it's only red AFTER you've optimized).
+  const optimizeLiveSig = optimizeSig(linesByFloor, lines, twoStory, g, d);
+  const optimizeStaleHint = optimizePush != null && optimizePush !== optimizeLiveSig;
   const allPass = lines.length>0 && lines.every(ln=>{
     const rs=resultsByLine[ln.id]||[]; return rs.length>0 && rs.every(r=>!r.failed);
   });
@@ -4019,7 +4104,9 @@ function DesignTab({ g, setGl, shape, lines, linesByFloor, segsByLine, setSegsBy
             <PinCard title="Other constraints" cols={1}>
               <PinRow label="Objective" grow><select value={d.objective} onChange={(e)=>setDk("objective",e.target.value)} style={{ ...pinSelS, width:"100%", flex:"1 1 auto", minWidth:0 }}><option value="length">Min. wall length</option><option value="nailing">Min. nailing (type)</option></select></PinRow>
               <PinRow label="Anchored into" grow><select value={d.anchor} onChange={(e)=>setDk("anchor",e.target.value)} style={{ ...pinSelS, width:"100%", flex:"1 1 auto", minWidth:0 }}><option>Concrete</option><option>Masonry</option><option>Wood</option></select></PinRow>
-              <button style={{ ...swBtn(true), gridColumn:"1 / -1", marginTop:2, padding:"0 12px", height:PIN_H, boxSizing:"border-box", fontSize:11 }} onClick={optimizeAll}>⚡ Optimize design</button>
+              <button style={{ ...swBtn(true), gridColumn:"1 / -1", marginTop:2, padding:"0 12px", height:PIN_H, boxSizing:"border-box", fontSize:11, ...(optimizeStaleHint ? STALE_BTN : {}) }}
+                title={optimizeStaleHint ? "Design inputs changed since you last optimized — re-optimize to update the design" : undefined}
+                onClick={optimizeAll}>{optimizeStaleHint && WARN}⚡ Optimize design</button>
             </PinCard>
           </div>
         </div>
@@ -4082,7 +4169,9 @@ function DesignTab({ g, setGl, shape, lines, linesByFloor, segsByLine, setSegsBy
             right={
               <div style={{ display:"flex", gap:8 }}>
                 <button style={swBtn(false)} onClick={()=>addSeg(sel.id)} disabled={selSegs.length>=6}>+ Add wall</button>
-                <button style={swBtn(false)} onClick={()=>applyToCalc(sel, selSegs, selRes, d)}>Send line to calculation sheet →</button>
+                <button style={calcStaleHint ? {...swBtn(false), ...STALE_BTN} : swBtn(false)}
+                  title={calcStaleHint ? "This line changed since you last sent it — click to update the Calculation Sheet" : undefined}
+                  onClick={()=>applyToCalc(sel, selSegs, selRes, d)}>{calcStaleHint && WARN}Send line to calculation sheet →</button>
               </div>
             }>
             Selected line — {sel.windAxis==="h"?"E–W":"N–S"} wind · {fmt(sel.forceLbs/1000,2)}k · {fmt(sel.lengthFt,1)} ft · H {fmt(sel.heightFt,1)} ft
@@ -4350,6 +4439,16 @@ export default function App() {
   const setDk = (k, v) => setD((p) => ({ ...p, [k]: v }));
   const [selLine, setSelLine] = useState(null);   // selected design line — lifted from DesignTab so save/load restores it
   const [designStale, setDesignStale] = useState(false);  // rev 24: a loaded file had geometry-less lines → prompt rebuild. Derived on load, NOT serialized (a re-save heals to the valid subset).
+  // rev 130: what was last pushed to the Calculation Sheet — { lineId, sig }. Drives the red
+  // "stale" look on the Design tab's "Send line to calculation sheet" button when the currently
+  // selected line is the one in the sheet AND its pushable data has since changed. Live-session
+  // only (NOT serialized): reset on New/Open so a loaded file is treated as in sync.
+  const [calcPush, setCalcPush] = useState(null);
+  // rev 130b: signature of the inputs the Design-tab ⚡ Optimize design optimizer last ran on. The
+  // Optimize button (which produces the tab's design output) goes red when an input has changed since.
+  // Lives in App (not DesignTab) so it survives the Design tab unmounting on a tab switch. Live-session
+  // only; reset on New/Open. A Plan→Design re-push brings new lines → the signature diverges → red.
+  const [optimizePush, setOptimizePush] = useState(null);
 
   const onDesignShearWalls = (byFloor, shape) => {
     setDesignLinesByFloor(byFloor);
@@ -4401,6 +4500,8 @@ export default function App() {
                       setSelLine(L.design.selLine); }
         if(p.calc){ if(L.calc.g) setG(L.calc.g); if(L.calc.segments) setSegments(L.calc.segments); }
         setDesignStale(L.design.stale);                   // rev 24: flag if any saved line lacked geometry
+        setCalcPush(null);                                // rev 130: a loaded file's calc sheet is in sync; re-arms on the next send
+        setOptimizePush(null);                            // rev 130b: a loaded file's design is in sync; re-arms on the next Optimize
         // v2 drops you back where you left; v1 files (no ui slice) open on the Plan tab as before
         setHlSel(L.ui.hlSel);
         setTwoStory(L.ui.twoStory);
@@ -4415,6 +4516,8 @@ export default function App() {
     if(projectRef.current) projectRef.current.set({ graph:{nodes:[],edges:[]}, wallProps:{},
       noSupport:[], sections:{h:null,v:null}, nextId:0 });
     setDesignLinesByFloor({}); setDesignShape(null); setSegsByLine({}); setDesignStale(false);
+    setCalcPush(null);                              // rev 130: clear stale-calc memory on New
+    setOptimizePush(null);                          // rev 130b: clear stale-optimize memory on New
     setTwoStory(false); setActiveFloor(1);
   },[]);
   // rev 24: the Design-tab stale banner rebuilds geometry-less lines from the restored plan. If the
@@ -4444,6 +4547,7 @@ export default function App() {
     }));
     setSegments(next);
     setGl("wWind", Math.round(line.forceLbs));
+    setCalcPush({ lineId: line.id, sig: calcPushSig(line, segs, res, dC) });   // rev 130: remember what this push produced
     setTab("calc");
   };
 
@@ -4513,7 +4617,8 @@ export default function App() {
                      d={d} setDk={setDk} applyToCalc={applyToCalc} setGl={setGl}
                      selLine={selLine} setSelLine={setSelLine}
                      twoStory={twoStory} activeFloor={activeFloor} setActiveFloor={setActiveFloor}
-                     stale={designStale} onRebuild={onRebuildDesign}/>
+                     stale={designStale} onRebuild={onRebuildDesign} calcPush={calcPush}
+                     optimizePush={optimizePush} setOptimizePush={setOptimizePush}/>
           <div style={{ marginTop:24, fontSize:10, color:SW.faint, lineHeight:1.6, borderTop:`1px solid ${SW.rule}`, paddingTop:10 }}>
             Faithful port of the source spreadsheet, including its exact formulas and thresholds (e.g. the wind end-post compression denominator and uplift &lt; 625 lbs → "neglect"). The Design tab optimizer verifies every candidate through this same engine. Allowable values per the embedded schedule; holdowns/anchors per Simpson HDU / SSTB / STHD / MST capacities tabulated in the workbook. END OF CALC.
           </div>
