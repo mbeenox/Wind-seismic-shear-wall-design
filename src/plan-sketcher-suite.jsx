@@ -15,7 +15,7 @@ import {
 //   • APP_VERSION (here)      — human-facing build number in the UI ("Version 1.00").
 //   • CURRENT_VERSION (~below)— save-file SCHEMA version; drives .wps migrations. Do NOT couple.
 //   • handoff "rev" number    — the dev changelog in PLAN_SKETCHER_SUITE_HANDOFF.md.
-const APP_BUILD = 128;                                                                 // +1 per release
+const APP_BUILD = 129;                                                                 // +1 per release
 const APP_VERSION = `${Math.floor(APP_BUILD / 100)}.${String(APP_BUILD % 100).padStart(2, "0")}`;  // "1.00"
 
 // ── geometry space: 1 unit = 1 ft ──────────────────────────────────────────
@@ -1365,9 +1365,12 @@ function WindWindow({ section, setVals, onReverse, onClose, onRemove, twoStory, 
 // values are written straight onto wallProps[key] via setVals(key, patch) (rev-42
 // explicit-key path), so they persist in the .wps session and flow to the Design tab
 // (per line, per floor) and on to the Calculation sheet.
-function DLTributaryWindow({ wprops, twoStory, activeFloor, onSet, onClose }) {
-  const [lvl, setLvl] = React.useState(twoStory && activeFloor === 2 ? 2 : 1);
-  const isF2  = twoStory && lvl === 2;
+function DLTributaryWindow({ wprops, twoStory, activeFloor, oneStory, onSet, onClose }) {
+  // (rev 50) oneStory = this wall is tagged 1-story inside 2-Story mode → it reaches the floor diaphragm
+  // but never the roof, so it has NO 2nd-floor wall. The Level 2 control is greyed/disabled and the
+  // level is pinned to 1 so no 2nd-floor trib can be entered for it.
+  const [lvl, setLvl] = React.useState(!oneStory && twoStory && activeFloor === 2 ? 2 : 1);
+  const isF2  = twoStory && !oneStory && lvl === 2;
   const rKey  = isF2 ? "roofTrib2"  : "roofTrib";
   const fKey  = isF2 ? "floorTrib2" : "floorTrib";
   const num   = (s) => Math.max(0, parseFloat(s) || 0);
@@ -1380,8 +1383,9 @@ function DLTributaryWindow({ wprops, twoStory, activeFloor, onSet, onClose }) {
     setBuf((b) => ({ ...b, [which]: raw }));
     onSet({ [which === "f" ? fKey : rKey]: num(raw) });
   };
-  const lvlLabel = twoStory ? (lvl === 2 ? "Level 2 · 2nd-floor wall" : "Level 1 · 1st-floor wall")
-                            : "single-story wall";
+  const lvlLabel = !twoStory ? "single-story wall"
+                 : oneStory  ? "Level 1 · 1-story wall"
+                 : (lvl === 2 ? "Level 2 · 2nd-floor wall" : "Level 1 · 1st-floor wall");
   const inputS = { width:96, padding:"6px 8px", border:"1px solid var(--line)", borderRadius:4,
                    fontSize:13, textAlign:"right", color:"var(--ink)" };
   return (
@@ -1393,20 +1397,31 @@ function DLTributaryWindow({ wprops, twoStory, activeFloor, onSet, onClose }) {
         </div>
         <div className="win-b">
           {twoStory && (
-            <div style={{ display:"flex", gap:6, marginBottom:12 }}>
-              {[1,2].map((L)=>(
-                <button key={L} onClick={()=>setLvl(L)}
-                  style={{ flex:1, padding:"7px 0", borderRadius:0, cursor:"pointer", fontWeight:700, fontSize:12,
-                           border:`1.5px solid ${lvl===L ? "var(--accent)" : "var(--line)"}`,
-                           background: lvl===L ? "var(--accent)" : "#FFFFFF",
-                           color: lvl===L ? "#FFFFFF" : "var(--ink)" }}>
-                  {L===1 ? "1st floor" : "2nd floor"}
-                </button>
-              ))}
+            <div style={{ display:"flex", gap:6, marginBottom: oneStory ? 6 : 12 }}>
+              {[1,2].map((L)=>{
+                const dis = oneStory && L === 2;        // a 1-story wall has no 2nd floor
+                const on  = lvl === L;
+                return (
+                  <button key={L} disabled={dis} onClick={()=>{ if(!dis) setLvl(L); }}
+                    title={dis ? "This wall is tagged 1-story — it has no 2nd floor" : undefined}
+                    style={{ flex:1, padding:"7px 0", borderRadius:0, fontWeight:700, fontSize:12,
+                             cursor: dis ? "not-allowed" : "pointer", opacity: dis ? 0.65 : 1,
+                             border:`1.5px solid ${on && !dis ? "var(--accent)" : "var(--line)"}`,
+                             background: dis ? "var(--bg)" : (on ? "var(--accent)" : "#FFFFFF"),
+                             color: dis ? "var(--muted)" : (on ? "#FFFFFF" : "var(--ink)") }}>
+                    {L === 1 ? "1st floor" : "2nd floor"}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+          {twoStory && oneStory && (
+            <div style={{ fontSize:11, color:"var(--hot)", marginBottom:12, lineHeight:1.4 }}>
+              This wall is tagged <b>1-story</b> — Level 2 is greyed out (it has no 2nd floor).
             </div>
           )}
           <div style={{ fontSize:11, color:"var(--muted)", marginBottom:12, lineHeight:1.4 }}>
-            Dead-load tributary widths for this wall{twoStory ? ` on the ${lvl===2 ? "2nd" : "1st"} floor` : ""}.
+            Dead-load tributary widths for this wall{twoStory && !oneStory ? ` on the ${lvl === 2 ? "2nd" : "1st"} floor` : ""}.
             They combine with the global Roof / Floor DL (psf) to set the wall self-weight that resists
             uplift. These feed the Design tab and are sent to the Calculation sheet.
           </div>
@@ -2635,8 +2650,8 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
       )}
 
       {dlEdit&&(
-        <DLTributaryWindow key={dlEdit+"|"+activeFloor} wprops={propsFor(dlEdit)}
-                    twoStory={twoStory} activeFloor={activeFloor}
+        <DLTributaryWindow key={dlEdit+"|"+activeFloor+"|"+(isOneStory(dlEdit)?"1s":"2s")} wprops={propsFor(dlEdit)}
+                    twoStory={twoStory} activeFloor={activeFloor} oneStory={isOneStory(dlEdit)}
                     onSet={(patch)=>setVals(dlEdit, patch)} onClose={()=>setDlEdit(null)}/>
       )}
     </div>
