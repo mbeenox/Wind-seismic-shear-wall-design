@@ -15,7 +15,7 @@ import {
 //   • APP_VERSION (here)      — human-facing build number in the UI ("Version 1.00").
 //   • CURRENT_VERSION (~below)— save-file SCHEMA version; drives .wps migrations. Do NOT couple.
 //   • handoff "rev" number    — the dev changelog in PLAN_SKETCHER_SUITE_HANDOFF.md.
-const APP_BUILD = 127;                                                                 // +1 per release
+const APP_BUILD = 128;                                                                 // +1 per release
 const APP_VERSION = `${Math.floor(APP_BUILD / 100)}.${String(APP_BUILD % 100).padStart(2, "0")}`;  // "1.00"
 
 // ── geometry space: 1 unit = 1 ft ──────────────────────────────────────────
@@ -48,7 +48,16 @@ const fmt2    = (n)       => Math.round(n*100)/100;
 // text rotation that keeps labels parallel to a wall and upright (-90..90]
 const wallAng = (dx,dy)=>{ let a=Math.atan2(dy,dx)*180/Math.PI; a=((a+90)%180+180)%180-90; return a; };
 // a section now stores its own shared values (per wind direction)
-const DEF_SECTION = { H:10, pw:16, qWind:32, qLee:22, par:5, H2:null };  // (rev 44) default wall H=10ft, parapet=5ft. `par` = this wall's own parapet; `H2` = 2nd-story wall ht (2-story mode), null → equals H
+const DEF_SECTION = { H:10, pw:16, qWind:32, qLee:22, par:5, H2:null,
+                      // (rev 49) DEAD-LOAD TRIBUTARY — now a per-wall, per-floor property entered on the
+                      // plan (right-click wall → "DL Tributary"), replacing the old GLOBAL Design-tab
+                      // Roof/Floor trib boxes. floorTrib/roofTrib = 1st-floor (and 1-story) values;
+                      // floorTrib2/roofTrib2 = 2nd-floor values (used when designing/viewing floor 2 of a
+                      // 2-story building, so a stacked wall can carry a different trib on each floor).
+                      // Defaults match the old global default (roof 2 ft, floor 0 ft) → untouched walls
+                      // behave exactly as before. mergeWallProps fills these from DEF_SECTION, so old .wps
+                      // files inherit them automatically (not part of the loadProject schema tripwire).
+                      roofTrib:2, floorTrib:0, roofTrib2:2, floorTrib2:0 };  // (rev 44) default wall H=10ft, parapet=5ft. `par` = this wall's own parapet; `H2` = 2nd-story wall ht (2-story mode), null → equals H
 // Normalize one stored wall-prop entry: migrate the legacy `parW` field, then MERGE ONTO
 // DEF_SECTION so a saved entry that predates a future field still resolves every key (no NaN
 // from an `undefined` pressure term). Behavior-identical for current entries (they override
@@ -1347,10 +1356,81 @@ function WindWindow({ section, setVals, onReverse, onClose, onRemove, twoStory, 
   );
 }
 
+// ── DL TRIBUTARY WINDOW (rev 49) ─────────────────────────────────────────────
+// A small plan-side modal for entering a wall's DEAD-LOAD tributary widths (the
+// values that feed the gravity self-weight resisting uplift). Opened from the wall
+// right-click menu. In 2-story mode it carries an in-window Level 1 / Level 2 switch
+// so the user can enter DIFFERENT trib for the 1st- and 2nd-floor walls of the same
+// (stacked) wall without leaving the window; the header always names the level. The
+// values are written straight onto wallProps[key] via setVals(key, patch) (rev-42
+// explicit-key path), so they persist in the .wps session and flow to the Design tab
+// (per line, per floor) and on to the Calculation sheet.
+function DLTributaryWindow({ wprops, twoStory, activeFloor, onSet, onClose }) {
+  const [lvl, setLvl] = React.useState(twoStory && activeFloor === 2 ? 2 : 1);
+  const isF2  = twoStory && lvl === 2;
+  const rKey  = isF2 ? "roofTrib2"  : "roofTrib";
+  const fKey  = isF2 ? "floorTrib2" : "floorTrib";
+  const num   = (s) => Math.max(0, parseFloat(s) || 0);
+  // string buffers so a partial decimal (e.g. "2.") survives typing; re-seed on level switch
+  const [buf, setBuf] = React.useState({});
+  React.useEffect(() => {
+    setBuf({ f: String(wprops[fKey] ?? 0), r: String(wprops[rKey] ?? 0) });
+  }, [lvl]); // eslint-disable-line react-hooks/exhaustive-deps
+  const write = (which, raw) => {
+    setBuf((b) => ({ ...b, [which]: raw }));
+    onSet({ [which === "f" ? fKey : rKey]: num(raw) });
+  };
+  const lvlLabel = twoStory ? (lvl === 2 ? "Level 2 · 2nd-floor wall" : "Level 1 · 1st-floor wall")
+                            : "single-story wall";
+  const inputS = { width:96, padding:"6px 8px", border:"1px solid var(--line)", borderRadius:4,
+                   fontSize:13, textAlign:"right", color:"var(--ink)" };
+  return (
+    <div className="ovl" onPointerDown={(e)=>{ if(e.target.classList.contains("ovl")) onClose(); }}>
+      <div className="win" style={{ width:"min(380px,97vw)" }}>
+        <div className="win-h">
+          <div className="win-t">DL Tributary — {lvlLabel}</div>
+          <button className="win-x" onClick={onClose} title="Close">×</button>
+        </div>
+        <div className="win-b">
+          {twoStory && (
+            <div style={{ display:"flex", gap:6, marginBottom:12 }}>
+              {[1,2].map((L)=>(
+                <button key={L} onClick={()=>setLvl(L)}
+                  style={{ flex:1, padding:"7px 0", borderRadius:0, cursor:"pointer", fontWeight:700, fontSize:12,
+                           border:`1.5px solid ${lvl===L ? "var(--accent)" : "var(--line)"}`,
+                           background: lvl===L ? "var(--accent)" : "#FFFFFF",
+                           color: lvl===L ? "#FFFFFF" : "var(--ink)" }}>
+                  {L===1 ? "1st floor" : "2nd floor"}
+                </button>
+              ))}
+            </div>
+          )}
+          <div style={{ fontSize:11, color:"var(--muted)", marginBottom:12, lineHeight:1.4 }}>
+            Dead-load tributary widths for this wall{twoStory ? ` on the ${lvl===2 ? "2nd" : "1st"} floor` : ""}.
+            They combine with the global Roof / Floor DL (psf) to set the wall self-weight that resists
+            uplift. These feed the Design tab and are sent to the Calculation sheet.
+          </div>
+          {[["f","Floor tributary"],["r","Roof tributary"]].map(([w,label])=>(
+            <div key={w} style={{ display:"flex", alignItems:"center", justifyContent:"space-between", gap:10, marginBottom:10 }}>
+              <label style={{ fontSize:13, fontWeight:600, color:"var(--ink)" }}>{label}</label>
+              <div style={{ display:"flex", alignItems:"center", gap:6 }}>
+                <input type="number" step={0.5} min={0} value={buf[w] ?? ""}
+                       onChange={(e)=>write(w, e.target.value)} style={inputS}/>
+                <span style={{ fontSize:12, color:"var(--muted)" }}>ft</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, setTwoStory, activeFloor, setActiveFloor }) {
   const [graph,    setGraph]    = useState(INIT.graph);
   const [selected, setSelected] = useState(null);
   const [menu,     setMenu]     = useState(null);
+  const [dlEdit,   setDlEdit]   = useState(null);   // (rev 49) edge key whose DL-tributary window is open, or null
   const [dimEdit,  setDimEdit]  = useState(null);
   const [sections, setSections] = useState({h:null, v:null}); // {axis,sign} per orientation
   const [wallProps,setWallProps]= useState({});      // edge key -> {H,pw,qWind,qLee,parW,parL}
@@ -1508,13 +1588,16 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
   // target "lee" = its back (leeward) wall, resolved live so a split back wall takes the segment
   // sitting behind this cut. One parapet per wall means no cross-syncing is needed.
   const setVals = useCallback((target, patch)=>{
-    if(!activeWall) return;
-    let key = activeWall.key;
+    // (rev 49) An EXPLICIT edge key (the DL-tributary window, or a section-cut interior block wall)
+    // edits that wall directly and does NOT require an open section cut. "self"/"lee" are relative to
+    // the active windward wall, so they still do. (Pre-rev-49 this early-returned on no activeWall,
+    // which would have silently dropped the DL writes opened straight from the wall menu.)
+    const explicit = target && target!=="self" && target!=="lee";
+    if(!explicit && !activeWall) return;
+    let key = explicit ? target : activeWall.key;
     if(target==="lee"){
       const sign = sectionsRef.current[activeWall.axis] && sectionsRef.current[activeWall.axis].sign;
       key = findLeewardPartner(activeWall.key, activeWall.axis, sign, graphRef.current, activeWall.sAcross);
-    } else if(target && target!=="self"){
-      key = target;   // (rev 42) an explicit edge key → edit ANY wall the section cut crosses (interior block walls)
     }
     if(!key) return;
     setWallProps(m=>({ ...m, [key]:{ ...(m[key]||DEF_SECTION), ...patch } }));
@@ -1621,7 +1704,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
         setSections(s.sections||{h:null,v:null});
         idc.current = s.nextId || (Math.max(0,...s.graph.nodes.map(n=>n.id))+1);
         // transient editors never auto-reopen (modal wind window + inline dim editor)
-        setActiveWall(null); setDimEdit(null); setMenu(null); setDrawPrev(null); setDrawAnchor(null);
+        setActiveWall(null); setDimEdit(null); setMenu(null); setDrawPrev(null); setDrawAnchor(null); setDlEdit(null);
         // v2 restores the saved camera + toggles + selection; v1/New (no view) reverts to auto-fit + defaults
         setUserView(s.view || null); setFrozenView(null);
         setSelected("selected" in s ? s.selected : null);
@@ -1701,10 +1784,10 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
     snapshot();
     const r=buildFrom(PRESETS[name],idc.current);
     idc.current=r.nextId;
-    setGraph(r.graph); setSelected(null); setDimEdit(null); setSections({h:null,v:null}); setActiveWall(null); setWallProps({});
+    setGraph(r.graph); setSelected(null); setDimEdit(null); setSections({h:null,v:null}); setActiveWall(null); setWallProps({}); setDlEdit(null);
     setUserView(null);   // frame the new preset (zoom-to-extents)
   };
-  const clearAll=()=>{ snapshot(); setGraph({nodes:[],edges:[]}); setSelected(null); setDimEdit(null); setSections({h:null,v:null}); setActiveWall(null); setWallProps({}); setUserView(null); };
+  const clearAll=()=>{ snapshot(); setGraph({nodes:[],edges:[]}); setSelected(null); setDimEdit(null); setSections({h:null,v:null}); setActiveWall(null); setWallProps({}); setUserView(null); setDlEdit(null); };
 
   const removeSection = ()=>{ if(activeWin){ setSections(s=>({...s,[activeWin]:null})); setActiveWall(null); } };
   // reverse wind: flip the section's travel direction and re-point the elevation window to the
@@ -1762,7 +1845,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
           else { setDrawMode(false); setDrawPrev(null); }
           return;
         }
-        setSelected(null);setMenu(null);setDimEdit(null);setActiveWall(null);setPanMode(false);
+        setSelected(null);setMenu(null);setDimEdit(null);setActiveWall(null);setPanMode(false);setDlEdit(null);
       }
       else if((e.key==="Delete"||e.key==="Backspace")&&selRef.current!==null){ e.preventDefault(); deleteNode(selRef.current); }
       else if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==="z"&&e.shiftKey){e.preventDefault();redo();}
@@ -2137,8 +2220,17 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
           if(!(hi>lo)) return;
           const a = o==="h" ? {x:lo,y:fixed} : {x:fixed,y:lo};
           const b = o==="h" ? {x:hi,y:fixed} : {x:fixed,y:hi};
+          // (rev 49) carry this line's DEAD-LOAD tributary from the keyed support wall, picking the
+          // floor-appropriate pair so a stacked wall can use a different trib on each floor. The rev-48
+          // geometric pairing below spreads ...l, so a 1st-floor line keeps ITS trib after adopting the
+          // 2nd floor's geometry. ?? falls back to the base pair for any wall missing the 2nd-floor keys.
+          const wp = propsFor(r.key);
+          const f2 = twoStory && floor===2;
+          const roofTrib  = f2 ? (wp.roofTrib2  ?? wp.roofTrib)  : wp.roofTrib;
+          const floorTrib = f2 ? (wp.floorTrib2 ?? wp.floorTrib) : wp.floorTrib;
           lines.push({ id:ax+"|"+r.key, key:r.key, windAxis:ax, o, a, b,
-                       lengthFt:hi-lo, heightFt:Hmax||13, forceLbs:r.kips*1000 });
+                       lengthFt:hi-lo, heightFt:Hmax||13, forceLbs:r.kips*1000,
+                       roofTrib, floorTrib });
         });
       });
       return lines;
@@ -2431,6 +2523,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
                       {oneStory.has(keyOf(menu.edge)) ? "↥ Switch to 2-story" : "↧ Switch to 1-story"}
                     </button>
                   )}
+                  <button className="cmi" onClick={()=>{ setDlEdit(keyOf(menu.edge)); closeMenu(); }}>⬚ DL Tributary…</button>
                   <button className="cmi" onClick={()=>{splitWall(menu.edge,menu.u);closeMenu();}}>Add node here</button>
                   <button className="cmi del" onClick={()=>{deleteEdge(menu.edge);closeMenu();}}>Delete wall</button>
                 </>
@@ -2539,6 +2632,12 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
                     setVals={setVals} onReverse={reverseWind}
                     onClose={()=>setActiveWall(null)} onRemove={removeSection}
                     twoStory={twoStory} oneStory={isOneStory(activeWall.key)}/>
+      )}
+
+      {dlEdit&&(
+        <DLTributaryWindow key={dlEdit+"|"+activeFloor} wprops={propsFor(dlEdit)}
+                    twoStory={twoStory} activeFloor={activeFloor}
+                    onSet={(patch)=>setVals(dlEdit, patch)} onClose={()=>setDlEdit(null)}/>
       )}
     </div>
   );
@@ -3248,7 +3347,14 @@ function lineResults(line, segs, g, d) {
   const gL = { ...g, wWind: line.forceLbs };
   const totalL = segs.reduce((a, s) => a + s.length, 0);
   return segs.map((s) => {
-    const base = { ...baseDesignSeg({ ...d, height: line.heightFt }), length: s.length };
+    // (rev 49) DL tributary now rides on the LINE (per wall, per floor — set in runDesignHandoff from
+    // wallProps), replacing the old global d.roofTrib/d.floorTrib. Only the INPUT SOURCE changed; the
+    // engine's dead-load formula (calcCore.js: wdl = roofTrib·roofDL + floorTrib·floorDL + wallDL·h) is
+    // byte-identical. ?? d.* keeps any pre-rev-49 / trib-less line working. Per-floor matters for stacked
+    // walls: stackedLineResults runs floor 1 and floor 2 each through here with their own line.*.
+    const base = { ...baseDesignSeg({ ...d, height: line.heightFt,
+                     roofTrib:  line.roofTrib  ?? d.roofTrib,
+                     floorTrib: line.floorTrib ?? d.floorTrib }), length: s.length };
     const r1 = calcSegment({ ...base, selType: 1 }, gL, totalL);
     let autoType = 1;
     if (r1.active && isNum(r1.sugS) && isNum(r1.sugW)) autoType = Math.max(r1.sugS, r1.sugW);
@@ -3768,7 +3874,8 @@ function DesignTab({ g, setGl, shape, lines, linesByFloor, segsByLine, setSegsBy
         label = `${fmt(l1.forceLbs/1000,1)}k/${fmt(Math.min(l1.lengthFt,l2.lengthFt),0)}′ stacked line`;
       } else {                                 // 1-story-only / single-story → standalone
         const ln = l1 || l2;
-        out = generateDesign({ ...g, wWind: ln.forceLbs }, { ...d, lineLength: ln.lengthFt, height: ln.heightFt });
+        out = generateDesign({ ...g, wWind: ln.forceLbs }, { ...d, lineLength: ln.lengthFt, height: ln.heightFt,
+                               roofTrib: ln.roofTrib ?? d.roofTrib, floorTrib: ln.floorTrib ?? d.floorTrib });  // (rev 49) per-wall trib
         label = `${fmt(ln.forceLbs/1000,1)}k/${fmt(ln.lengthFt,0)}′ line`;
       }
       if(out){ next[id]=out.segs.map(s=>({...s})); okCount++; }
@@ -3868,8 +3975,9 @@ function DesignTab({ g, setGl, shape, lines, linesByFloor, segsByLine, setSegsBy
               <PinRow label="Roof DL" unit="psf"><input type="number" step={1} value={g.roofDL} onChange={(e)=>setGl("roofDL",parseFloat(e.target.value)||0)} style={pinNumS}/></PinRow>
               <PinRow label="Floor DL" unit="psf"><input type="number" step={1} value={g.floorDL} onChange={(e)=>setGl("floorDL",parseFloat(e.target.value)||0)} style={pinNumS}/></PinRow>
               <PinRow label="Wall self" unit="psf"><input type="number" step={1} value={g.wallDL} onChange={(e)=>setGl("wallDL",parseFloat(e.target.value)||0)} style={pinNumS}/></PinRow>
-              <PinRow label="Roof trib" unit="ft"><input type="number" step={0.5} value={d.roofTrib} onChange={(e)=>setDk("roofTrib",parseFloat(e.target.value)||0)} style={pinNumS}/></PinRow>
-              <PinRow label="Floor trib" unit="ft"><input type="number" step={0.5} value={d.floorTrib} onChange={(e)=>setDk("floorTrib",parseFloat(e.target.value)||0)} style={pinNumS}/></PinRow>
+              {/* (rev 49) Roof/Floor TRIBUTARY moved out — it is now a per-wall, per-floor value entered on
+                  the plan (right-click a wall → "DL Tributary"). d.roofTrib/d.floorTrib remain as the
+                  silent fallback for any line that has no per-wall trib. */}
             </PinCard>
           </div>
           <div style={{ flex:"1.4 1 280px", minWidth:240 }}>
@@ -4312,7 +4420,9 @@ export default function App() {
   const applyToCalc = (line, segs, res, dC) => {
     const next = Array.from({ length: 6 }, (_, i) => ({
       length: segs[i] ? segs[i].length : 0,
-      height: line.heightFt, roofTrib: dC.roofTrib, floorTrib: dC.floorTrib,
+      // (rev 49) send THIS line's per-wall/per-floor DL trib to the calc sheet (was the global dC.*);
+      // every sent segment seeds with it, still editable per-segment on the sheet afterward.
+      height: line.heightFt, roofTrib: line.roofTrib ?? dC.roofTrib, floorTrib: line.floorTrib ?? dC.floorTrib,
       hdDist: dC.hdDist, thickness: dC.thickness, anchor: dC.anchor,
       selType: res[i] && isNum(res[i].selType) ? Math.min(res[i].selType, 3) : 1,
       ftgWidth: dC.ftgWidth, ftgThick: dC.ftgThick,
