@@ -15,7 +15,7 @@ import {
 //   • APP_VERSION (here)      — human-facing build number in the UI ("Version 1.00").
 //   • CURRENT_VERSION (~below)— save-file SCHEMA version; drives .wps migrations. Do NOT couple.
 //   • handoff "rev" number    — the dev changelog in PLAN_SKETCHER_SUITE_HANDOFF.md.
-const APP_BUILD = 131;                                                                 // +1 per release
+const APP_BUILD = 132;                                                                 // +1 per release
 const APP_VERSION = `${Math.floor(APP_BUILD / 100)}.${String(APP_BUILD % 100).padStart(2, "0")}`;  // "1.00"
 
 // ── geometry space: 1 unit = 1 ft ──────────────────────────────────────────
@@ -2917,6 +2917,14 @@ const LT_CSS = `
     .sw-collapse-body { animation: swFade 0.15s ease-out; }
     @keyframes swFade { from { opacity: 0.4; } to { opacity: 1; } }
   }
+  /* rev 132 — Calculation Sheet sub-tab bar (Chrome-style) */
+  .calctab { transition: background .12s, color .12s; }
+  .calctab:not(.is-active):hover { background: #F1F4F6; color: #1C2733; }
+  .calctab-x { opacity: 0; transition: opacity .12s, background .12s; }
+  .calctab:hover .calctab-x, .calctab.is-active .calctab-x { opacity: .6; }
+  .calctab-x:hover { opacity: 1 !important; background: #E2E6E9; color: #1C2733; }
+  .calc-add { transition: background .12s; }
+  .calc-add:hover { background: #EDF1F4; }
   @media print {
     .no-print { display: none !important; }
     .sw-scroll { overflow: visible; border: none; }
@@ -2978,7 +2986,11 @@ function LtRow({ label, unit, tip, cells, render }) {
   );
 }
 
-function LtSegHeader({ segments }) {
+// (rev 132) `marks` (when present) maps a segment index → the SAME wall mark the Design tab shows
+// (e.g. "A","B"), so a wall pushed from Design reads identically here ("SW-A", not "SW-1"). A manual
+// sub-tab has no Design line → marks is null → falls back to the 1-based numbering, unchanged.
+const swMark = (marks, i) => "SW-" + ((marks && marks[i] != null && marks[i] !== "") ? marks[i] : i + 1);
+function LtSegHeader({ segments, marks }) {
   const { sel, setSel } = React.useContext(HL);
   return (
     <thead>
@@ -2991,7 +3003,7 @@ function LtSegHeader({ segments }) {
             style={{ padding: "4px 8px", fontSize: 11, fontFamily: MONO, cursor: "pointer", color: (s.length ?? s) > 0 ? LT.blue : LT.faint }}
             title="Click to highlight this wall in all tables"
           >
-            SW-{i + 1}
+            {swMark(marks, i)}
           </th>
         ))}
       </tr>
@@ -3032,7 +3044,7 @@ function LtNumInput({ value, onChange, step = 1, width = 64 }) {
 
 const ltSel = { padding: "3px 4px", border: `1px solid ${LT.rule}`, borderRadius: 4, fontSize: 11, fontFamily: MONO, color: LT.blue, fontWeight: 600, background: "#FDFDFB", outline: "none" };
 
-function LtComplianceBanner({ segments, results }) {
+function LtComplianceBanner({ segments, results, marks }) {
   const { sel, setSel } = React.useContext(HL);
   const act = results.map((r, i) => ({ r, i })).filter((x) => x.r.active);
   if (!act.length) return null;
@@ -3055,14 +3067,14 @@ function LtComplianceBanner({ segments, results }) {
             color: sel === i ? "#FFF" : r.pass ? LT.green : LT.red,
           }}
         >
-          SW-{i + 1} {r.pass ? "✓" : "✕"}
+          {swMark(marks, i)} {r.pass ? "✓" : "✕"}
         </button>
       ))}
     </div>
   );
 }
 
-function LtElevation({ segments, results }) {
+function LtElevation({ segments, results, marks }) {
   const { sel, setSel } = React.useContext(HL);
   const active = segments.map((s, i) => ({ ...s, r: results[i], i })).filter((s) => s.length > 0);
   if (!active.length) return null;
@@ -3084,7 +3096,7 @@ function LtElevation({ segments, results }) {
             <rect x="0" y={H - 18 - h} width={w} height={h} fill={failed ? LT.redSoft : LT.blueSoft} stroke={failed ? LT.red : LT.blue} strokeWidth={isSel ? 3 : 1.5} />
             <line x1="0" y1={H - 18 - h} x2={w} y2={H - 18} stroke={failed ? LT.red : LT.blue} strokeWidth="0.75" opacity="0.5" />
             <line x1={w} y1={H - 18 - h} x2="0" y2={H - 18} stroke={failed ? LT.red : LT.blue} strokeWidth="0.75" opacity="0.5" />
-            <text x={w / 2} y={H - 18 - h / 2 - 4} textAnchor="middle" fontSize="11" fontWeight="700" fill={failed ? LT.red : LT.blue} fontFamily={MONO}>SW-{s.i + 1}</text>
+            <text x={w / 2} y={H - 18 - h / 2 - 4} textAnchor="middle" fontSize="11" fontWeight="700" fill={failed ? LT.red : LT.blue} fontFamily={MONO}>{swMark(marks, s.i)}</text>
             <text x={w / 2} y={H - 18 - h / 2 + 9} textAnchor="middle" fontSize="9" fill={LT.faint} fontFamily={MONO}>{s.length}′ × {s.height}′</text>
             <text x={w / 2} y={H - 5} textAnchor="middle" fontSize="9" fill={LT.faint} fontFamily={MONO}>{failed ? "✕" : "✓"} type {s.selType}</text>
           </g>
@@ -3131,7 +3143,7 @@ function Elevation({ segments, results }) {
 }
 
 // ---------- CALCULATION SHEET TAB — logic & structure unchanged; dark restyle ----------
-function CalcSheet({ g, setGl, segments, setSegments, results, totalL }) {
+function CalcSheet({ g, setGl, segments, setSegments, results, totalL, marks }) {
   const setSeg = (i, key, val) =>
     setSegments((prev) => prev.map((s, j) => (j === i ? { ...s, [key]: val } : s)));
   const E_seis = (0.7 * g.vSeismic) / g.R;
@@ -3147,7 +3159,7 @@ function CalcSheet({ g, setGl, segments, setSegments, results, totalL }) {
 
   return (
     <div>
-      <LtComplianceBanner segments={segments} results={results} />
+      <LtComplianceBanner segments={segments} results={results} marks={marks} />
 
       <LtCollapse title="Design loads">
         <div style={{ display: "flex", flexWrap: "wrap", gap: 16 }}>
@@ -3192,14 +3204,14 @@ function CalcSheet({ g, setGl, segments, setSegments, results, totalL }) {
       </LtCollapse>
 
       <LtCollapse title={`Wall line elevation — total length ${fmt(totalL, 1)} ft`}>
-        <LtElevation segments={segments} results={results} />
+        <LtElevation segments={segments} results={results} marks={marks} />
         <div style={{ fontSize: 10, color: LT.faint, marginTop: 4 }}>Click a wall to highlight its column in every table below.</div>
       </LtCollapse>
 
       <LtCollapse title="Wall segments — inputs">
         <div className="sw-scroll">
           <table className="sw-table">
-            <LtSegHeader segments={segments} />
+            <LtSegHeader segments={segments} marks={marks} />
             <tbody>
               {[
                 ["length", "Length", "ft", 0.5],
@@ -3256,7 +3268,7 @@ function CalcSheet({ g, setGl, segments, setSegments, results, totalL }) {
       <LtCollapse title="Demand / capacity summary" badge={failBadge(anyFail.shear || anyFail.post || anyFail.hd)}>
         <div className="sw-scroll">
           <table className="sw-table">
-            <LtSegHeader segments={segments} />
+            <LtSegHeader segments={segments} marks={marks} />
             <tbody>
               <LtRow label="Wind shear D/C" tip="vW ÷ schedule wind allowable at the selected type" cells={results} render={(r) => <LtUtilBar ratio={r.utilW} />} />
               <LtRow label="Seismic shear D/C" tip="vS ÷ (2w/l factor × schedule seismic allowable at the selected type)" cells={results} render={(r) => <LtUtilBar ratio={r.utilS} />} />
@@ -3272,7 +3284,7 @@ function CalcSheet({ g, setGl, segments, setSegments, results, totalL }) {
       <LtCollapse title="Seismic design" badge={failBadge(results.some((r) => r.active && r.sugS === "FAILED!!!"))} defaultOpen={false}>
         <div className="sw-scroll">
           <table className="sw-table">
-            <LtSegHeader segments={segments} />
+            <LtSegHeader segments={segments} marks={marks} />
             <tbody>
               <LtRow label="F" unit="lbs" tip="E23: F = E · L / ΣL" cells={results} render={(r) => <LtChip v={r.Fs} d={2} />} />
               <LtRow label="Shear v" unit="plf" tip="E24: v = F / L" cells={results} render={(r) => <LtChip v={r.vS} d={2} />} />
@@ -3294,7 +3306,7 @@ function CalcSheet({ g, setGl, segments, setSegments, results, totalL }) {
       <LtCollapse title="Wind design" badge={failBadge(results.some((r) => r.active && r.sugW === "FAILED!!!"))} defaultOpen={false}>
         <div className="sw-scroll">
           <table className="sw-table">
-            <LtSegHeader segments={segments} />
+            <LtSegHeader segments={segments} marks={marks} />
             <tbody>
               <LtRow label="F" unit="lbs" tip="E37: F = Fwind · L / ΣL" cells={results} render={(r) => <LtChip v={r.Fw} d={0} />} />
               <LtRow label="Shear v" unit="plf" tip="E38" cells={results} render={(r) => <LtChip v={r.vW} d={1} />} />
@@ -3312,7 +3324,7 @@ function CalcSheet({ g, setGl, segments, setSegments, results, totalL }) {
       <LtCollapse title="End posts & holdowns" badge={failBadge(anyFail.post || anyFail.hd)}>
         <div className="sw-scroll">
           <table className="sw-table">
-            <LtSegHeader segments={segments} />
+            <LtSegHeader segments={segments} marks={marks} />
             <tbody>
               <LtRow label="Max end post compression" unit="lbs" tip="E47" cells={results} render={(r) => <LtChip v={r.maxComp} d={0} />} />
               <LtRow label="Recommended minimum end post" tip="E48 — vs NDS column capacities" cells={results} render={(r) => <LtChip v={r.post} />} />
@@ -3345,7 +3357,7 @@ function CalcSheet({ g, setGl, segments, setSegments, results, totalL }) {
       <LtCollapse title="Deflection & type check">
         <div className="sw-scroll">
           <table className="sw-table">
-            <LtSegHeader segments={segments} />
+            <LtSegHeader segments={segments} marks={marks} />
             <tbody>
               <LtRow label="Δ seismic" unit="in" tip="Q2: bending + nail slip (Ga) + rotation terms" cells={results} render={(r) => <LtChip v={isFinite(r.deflS) ? r.deflS : "—"} d={3} />} />
               <LtRow label="Δ wind" unit="in" tip="Q3" cells={results} render={(r) => <LtChip v={isFinite(r.deflW) ? r.deflW : "—"} d={3} />} />
@@ -3358,7 +3370,7 @@ function CalcSheet({ g, setGl, segments, setSegments, results, totalL }) {
       <LtCollapse title="Holdown footing estimate" defaultOpen={false}>
         <div className="sw-scroll">
           <table className="sw-table">
-            <LtSegHeader segments={segments} />
+            <LtSegHeader segments={segments} marks={marks} />
             <tbody>
               <tr style={{ borderBottom: `1px solid ${LT.rule}` }}>
                 <td style={{ padding: "5px 10px", fontSize: 12 }}>Footing width <span style={{ color: LT.faint, fontSize: 11 }}>(ft)</span></td>
@@ -3942,6 +3954,19 @@ function DesignTab({ g, setGl, shape, lines, linesByFloor, segsByLine, setSegsBy
     return m;
   },[lines, segsByLine]);
 
+  // (rev 132) Per-line display name: the direction PLUS an incrementing index WITHIN that direction,
+  // since several lines can share a direction — "E–W-1", "E–W-2", "N–S-1", … The full chip/title
+  // label appends force + length. This name is what is sent to the Calculation Sheet as the sub-tab
+  // title, so the two tabs identify the same wall identically. Positional (like the SW marks): it
+  // tracks a line's position in this floor's list, not a persisted id.
+  const lineNames = useMemo(()=>{
+    const m={}, cnt={};
+    lines.forEach(ln=>{ const dir = ln.windAxis==="h" ? "E–W" : "N–S";
+      cnt[dir] = (cnt[dir]||0) + 1; m[ln.id] = `${dir}-${cnt[dir]}`; });
+    return m;
+  },[lines]);
+  const lineLabel = (ln) => `${lineNames[ln.id]} · ${fmt(ln.forceLbs/1000,2)}k · ${fmt(ln.lengthFt,0)}′`;
+
   const optimizeAll = () => {
     // Design EVERY wall across BOTH floors and MERGE onto the existing layouts (never wipe another
     // floor's lines — rev 46). A wall that exists on BOTH floors (same id) is a STACKED wall: its one
@@ -4157,7 +4182,7 @@ function DesignTab({ g, setGl, shape, lines, linesByFloor, segsByLine, setSegsBy
                        border:`1.5px solid ${isSel?SW.accent:SW.rule}`,
                        background:isSel?SW.accentSoft:SW.panel,
                        color: rs.length? (pass?SW.green:SW.red) : SW.faint }}>
-              {ln.windAxis==="h"?"E–W":"N–S"} · {fmt(ln.forceLbs/1000,2)}k · {fmt(ln.lengthFt,0)}′ {rs.length? (pass?"✓":"✕") : "·"}
+              {lineNames[ln.id]} · {fmt(ln.forceLbs/1000,2)}k · {fmt(ln.lengthFt,0)}′ {rs.length? (pass?"✓":"✕") : "·"}
             </button>
           );
         })}
@@ -4171,10 +4196,10 @@ function DesignTab({ g, setGl, shape, lines, linesByFloor, segsByLine, setSegsBy
                 <button style={swBtn(false)} onClick={()=>addSeg(sel.id)} disabled={selSegs.length>=6}>+ Add wall</button>
                 <button style={calcStaleHint ? {...swBtn(false), ...STALE_BTN} : swBtn(false)}
                   title={calcStaleHint ? "This line changed since you last sent it — click to update the Calculation Sheet" : undefined}
-                  onClick={()=>applyToCalc(sel, selSegs, selRes, d)}>{calcStaleHint && WARN}Send line to calculation sheet →</button>
+                  onClick={()=>applyToCalc(sel, selSegs, selRes, d, lineLabel(sel), selSegs.map((_,i)=>wallMarks[sel.id+"|"+i]))}>{calcStaleHint && WARN}Send line to calculation sheet →</button>
               </div>
             }>
-            Selected line — {sel.windAxis==="h"?"E–W":"N–S"} wind · {fmt(sel.forceLbs/1000,2)}k · {fmt(sel.lengthFt,1)} ft · H {fmt(sel.heightFt,1)} ft
+            Selected line — {lineNames[sel.id]} · {sel.windAxis==="h"?"E–W":"N–S"} wind · {fmt(sel.forceLbs/1000,2)}k · {fmt(sel.lengthFt,1)} ft · H {fmt(sel.heightFt,1)} ft
           </SectionTitle>
           {selSegs.length === 0 ? (
             <div style={{ padding:20, border:`1px dashed ${SW.rule}`, borderRadius:8, color:SW.faint, fontSize:12 }}>
@@ -4392,11 +4417,32 @@ function loadProject(raw){
   const sblIn    = design.segsByLine || {};
   const segsByLine = {};
   for(const k in sblIn) segsByLine[k] = (Array.isArray(sblIn[k]) ? sblIn[k] : []).map(s => ({ ...DEFAULT_PLACED, ...s }));
+  // calc sub-tabs (rev 132): prefer the tab model; fall back to a legacy single `calc.segments` wrapped
+  // into one tab; else null (handler keeps the running state). Each tab's segments are merged onto
+  // SEG_DEFAULTS and padded to 6 columns (the sheet's fixed width). wWind defaults to the saved g.wWind.
+  const seg6 = (arr) => Array.from({ length:6 }, (_, i) => ({ ...SEG_DEFAULTS, ...((Array.isArray(arr) ? arr : [])[i] || {}) }));
+  const gW = (calc.g && Number.isFinite(calc.g.wWind)) ? calc.g.wWind : DEFAULT_G.wWind;
+  let calcTabs = null, activeCalcId = null;
+  if (Array.isArray(calc.tabs) && calc.tabs.length) {
+    calcTabs = calc.tabs.map((t, i) => ({
+      id:      (t && t.id) || ("calc-" + (i + 1)),
+      name:    (t && typeof t.name === "string" && t.name) || ("Wall " + (i + 1)),
+      lineId:  (t && t.lineId != null) ? t.lineId : null,
+      marks:   (t && Array.isArray(t.marks)) ? t.marks : null,
+      segments: seg6(t && t.segments),
+      wWind:   (t && Number.isFinite(t.wWind)) ? t.wWind : gW,
+    }));
+    activeCalcId = calcTabs.find((t) => t.id === calc.activeCalcId) ? calc.activeCalcId : calcTabs[0].id;
+  } else if (Array.isArray(calc.segments)) {
+    calcTabs = [{ id:"calc-1", name:"Wall 1", lineId:null, marks:null, segments: seg6(calc.segments), wWind: gW }];
+    activeCalcId = "calc-1";
+  }
   return {
     newer, project,
     calc: {
       g:        calc.g        ? { ...DEFAULT_G, ...calc.g }                    : undefined,
       segments: calc.segments ? calc.segments.map(s => ({ ...SEG_DEFAULTS, ...s })) : undefined,
+      tabs: calcTabs, activeCalcId,
     },
     design: {
       linesByFloor, stale, segsByLine,
@@ -4416,14 +4462,78 @@ export default function App() {
   const setGl = (key, val) => setG((p) => ({ ...p, [key]: val }));
 
   const mkSeg = (length, roofTrib) => ({ ...SEG_DEFAULTS, length, roofTrib });
-  const [segments, setSegments] = useState([ mkSeg(5,2), mkSeg(5,2), mkSeg(0,10), mkSeg(0,10), mkSeg(0,10), mkSeg(0,10) ]);
+  // ── CALCULATION-SHEET SUB-TABS (rev 132) ──
+  // The Calculation Sheet is now a Chrome-style tabbed surface: each sub-tab is one shear-wall LINE
+  // (its own 6-segment layout + its own wind force `wWind`). A tab carries:
+  //   { id, name, lineId, marks, segments, wWind }
+  // `lineId` ties an auto sub-tab to the Design line it came from (re-pushing that line UPDATES the
+  // same tab instead of duplicating). `lineId:null` = a MANUAL tab added with the "+" button, run
+  // independently of the Design tab's Optimize. `marks` mirrors the Design tab's wall marks so the
+  // per-segment "SW-A / SW-B" labels match across tabs. Building-wide config (code/species/grade/
+  // seismic/dead loads) stays in the shared `g`; only `wWind` is per-tab (each wall a different force).
+  const mkCalcSegs = () => [ mkSeg(5,2), mkSeg(5,2), mkSeg(0,10), mkSeg(0,10), mkSeg(0,10), mkSeg(0,10) ];
+  const calcSeq = useRef(2);                                  // next manual id counter ("calc-2", …)
+  const newCalcId = () => "calc-" + (calcSeq.current++);
+  const [calcTabs, setCalcTabs] = useState(() => [
+    { id:"calc-1", name:"Wall 1", lineId:null, marks:null, segments:mkCalcSegs(), wWind:DEFAULT_G.wWind },
+  ]);
+  const [activeCalcId, setActiveCalcId] = useState("calc-1");
+  const activeCalc = calcTabs.find((t) => t.id === activeCalcId) || calcTabs[0] || null;
+  const segments = activeCalc ? activeCalc.segments : mkCalcSegs();
+  const calcMarks = activeCalc ? activeCalc.marks : null;
+  // effective globals for the ACTIVE tab = shared g with this tab's own wind force spliced in
+  const gEff = useMemo(() => (activeCalc ? { ...g, wWind: activeCalc.wWind } : g), [g, activeCalc]);
+  // CalcSheet edits a segment in the ACTIVE tab; supports both function- and value-style updates.
+  const setSegments = (updater) => setCalcTabs((prev) => prev.map((t) => t.id === activeCalcId
+    ? { ...t, segments: typeof updater === "function" ? updater(t.segments) : updater } : t));
+  // CalcSheet's globals editor: `wWind` is per-tab, everything else is the shared building config.
+  const setGlCalc = (key, val) => {
+    if (key === "wWind") setCalcTabs((prev) => prev.map((t) => t.id === activeCalcId ? { ...t, wWind: val } : t));
+    else setGl(key, val);
+  };
   const totalL = segments.reduce((a, s) => a + s.length, 0);
-  const results = useMemo(() => segments.map((s) => calcSegment(s, g, totalL)), [segments, g, totalL]);
+  const results = useMemo(() => segments.map((s) => calcSegment(s, gEff, totalL)), [segments, gEff, totalL]);
   // light calc sheet consumes util-augmented results (engine untouched)
   const resultsU = useMemo(() => results.map((r, i) => withUtil(r, segments[i], g.grade)), [results, segments, g.grade]);
   const actU = resultsU.filter((r) => r.active);
   const calcOK = actU.length > 0 && actU.every((r) => r.pass);
+  // Per-tab pass/fail for the sub-tab dots: run the (untouched) engine once per tab with that tab's
+  // own wind force. Tabs are few, so this is cheap. "none" = no active wall on that tab yet.
+  const calcTabStatus = useMemo(() => {
+    const m = {};
+    calcTabs.forEach((t) => {
+      const tl = t.segments.reduce((a, s) => a + s.length, 0);
+      const ge = { ...g, wWind: t.wWind };
+      const rs = t.segments.map((s) => withUtil(calcSegment(s, ge, tl), s, g.grade)).filter((r) => r.active);
+      m[t.id] = rs.length ? (rs.every((r) => r.pass) ? "ok" : "fail") : "none";
+    });
+    return m;
+  }, [calcTabs, g]);
   const [hlSel, setHlSel] = useState(null); // column highlight (calc sheet)
+  // Switch the visible sub-tab (clears the cross-table column highlight, which is per-tab).
+  const selectCalcTab = (id) => { setActiveCalcId(id); setHlSel(null); };
+  // "+" button — a fresh manual calc, independent of the Design tab's Optimize.
+  const addCalcTab = () => {
+    const id = newCalcId();
+    const n = calcTabs.filter((t) => !t.lineId).length + 1;
+    setCalcTabs((prev) => [...prev, { id, name:`Custom ${n}`, lineId:null, marks:null, segments:mkCalcSegs(), wWind:DEFAULT_G.wWind }]);
+    selectCalcTab(id);
+    setTab("calc");
+  };
+  // Close a sub-tab; if it was active, fall to a neighbour. The bar always keeps ≥1 tab.
+  const closeCalcTab = (id) => setCalcTabs((prev) => {
+    if (prev.length <= 1) return prev;                        // never empty the bar
+    const idx = prev.findIndex((t) => t.id === id);
+    const next = prev.filter((t) => t.id !== id);
+    if (id === activeCalcId) selectCalcTab((next[idx] || next[idx - 1] || next[0]).id);
+    return next;
+  });
+  // Rename a MANUAL tab (auto tabs mirror their Design line and are renamed on re-push).
+  const renameCalcTab = (id) => {
+    const t = calcTabs.find((x) => x.id === id); if (!t || t.lineId) return;
+    const name = window.prompt("Rename this calculation tab", t.name);
+    if (name && name.trim()) setCalcTabs((prev) => prev.map((x) => x.id === id ? { ...x, name:name.trim() } : x));
+  };
   // ── TWO-STORY MODE (Step 1: UI scaffold only — no second plan, no calc change yet) ──
   const [twoStory, setTwoStory]     = useState(false);   // false = single story (today's behavior, untouched)
   const [activeFloor, setActiveFloor] = useState(1);     // sketcher view: 1 = 1st floor, 2 = 2nd floor
@@ -4473,14 +4583,16 @@ export default function App() {
     const sk = projectRef.current ? projectRef.current.get() : null;
     const proj = { app:"plan-sketcher-suite", version:CURRENT_VERSION, savedAt:new Date().toISOString(),
                    sketcher:sk, design:{ linesByFloor:designLinesByFloor, shape:designShape, segsByLine, d, selLine },
-                   calc:{ g, segments }, ui:{ tab, hlSel, twoStory, activeFloor } };
+                   // calc.tabs is the rev-132 sub-tab model; calc.segments is kept (= active tab) so a
+                   // pre-132 build can still open the file and show at least the active wall.
+                   calc:{ g, segments, tabs:calcTabs, activeCalcId }, ui:{ tab, hlSel, twoStory, activeFloor } };
     const blob = new Blob([JSON.stringify(proj,null,1)], {type:"application/json"});
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
     a.download = "plan-project.wps";
     a.click();
     URL.revokeObjectURL(a.href);
-  },[designLinesByFloor, designShape, segsByLine, d, g, segments, tab, hlSel, selLine, twoStory, activeFloor]);
+  },[designLinesByFloor, designShape, segsByLine, d, g, segments, calcTabs, activeCalcId, tab, hlSel, selLine, twoStory, activeFloor]);
   const onOpen = useCallback(()=>{ fileInputRef.current && fileInputRef.current.click(); },[]);
   const onFileChosen = useCallback((e)=>{
     const f = e.target.files && e.target.files[0];
@@ -4498,7 +4610,15 @@ export default function App() {
         if(p.design){ setDesignLinesByFloor(L.design.linesByFloor); setDesignShape(L.design.shape);
                       setSegsByLine(L.design.segsByLine); if(L.design.d) setD(L.design.d);
                       setSelLine(L.design.selLine); }
-        if(p.calc){ if(L.calc.g) setG(L.calc.g); if(L.calc.segments) setSegments(L.calc.segments); }
+        if(p.calc){ if(L.calc.g) setG(L.calc.g);
+                    if(L.calc.tabs){                       // rev 132: restore the sub-tab set
+                      setCalcTabs(L.calc.tabs);
+                      setActiveCalcId(L.calc.activeCalcId);
+                      // reseed the id counter past any loaded "calc-N" so new tabs can't collide
+                      let mx = 1; L.calc.tabs.forEach(t => { const m = /calc-(\d+)/.exec(t.id||""); if(m) mx = Math.max(mx, +m[1]); });
+                      calcSeq.current = mx + 1;
+                      setHlSel(null);
+                    } else if(L.calc.segments) setSegments(L.calc.segments); }
         setDesignStale(L.design.stale);                   // rev 24: flag if any saved line lacked geometry
         setCalcPush(null);                                // rev 130: a loaded file's calc sheet is in sync; re-arms on the next send
         setOptimizePush(null);                            // rev 130b: a loaded file's design is in sync; re-arms on the next Optimize
@@ -4534,8 +4654,11 @@ export default function App() {
     setSegsByLine(prev => ({ ...prev, [lineId]: prev[lineId].map((s,j)=> j!==idx ? s :
       key===null ? { start:s.start, length:s.length } : { ...s, ov:{ ...(s.ov||{}), [key]:val||undefined } }) }));
 
-  // Design → calc sheet: this line's segments + force become the sheet
-  const applyToCalc = (line, segs, res, dC) => {
+  // Design → calc sheet: this line's segments + force become a SUB-TAB. Pushing a line the sheet
+  // already has (matched by `line.id`) UPDATES that tab in place (current optimized design + force +
+  // name + marks); a new line opens a new tab. `name`/`marks` come from the Design tab so the sub-tab
+  // title and the per-segment SW-marks read identically across both tabs. (rev 132)
+  const applyToCalc = (line, segs, res, dC, name, marks) => {
     const next = Array.from({ length: 6 }, (_, i) => ({
       length: segs[i] ? segs[i].length : 0,
       // (rev 49) send THIS line's per-wall/per-floor DL trib to the calc sheet (was the global dC.*);
@@ -4545,8 +4668,19 @@ export default function App() {
       selType: res[i] && isNum(res[i].selType) ? Math.min(res[i].selType, 3) : 1,
       ftgWidth: dC.ftgWidth, ftgThick: dC.ftgThick,
     }));
-    setSegments(next);
-    setGl("wWind", Math.round(line.forceLbs));
+    const wWind = Math.round(line.forceLbs);
+    const tabName = name || `${line.windAxis === "h" ? "E–W" : "N–S"} · ${fmt(line.forceLbs/1000,2)}k · ${fmt(line.lengthFt,0)}′`;
+    const marksArr = Array.isArray(marks) ? marks : null;
+    const existing = calcTabs.find((t) => t.lineId === line.id);
+    if (existing) {
+      setCalcTabs((prev) => prev.map((t) => t.id === existing.id
+        ? { ...t, name:tabName, marks:marksArr, segments:next, wWind } : t));
+      selectCalcTab(existing.id);
+    } else {
+      const id = newCalcId();
+      setCalcTabs((prev) => [...prev, { id, name:tabName, lineId:line.id, marks:marksArr, segments:next, wWind }]);
+      selectCalcTab(id);
+    }
     setCalcPush({ lineId: line.id, sig: calcPushSig(line, segs, res, dC) });   // rev 130: remember what this push produced
     setTab("calc");
   };
@@ -4628,8 +4762,52 @@ export default function App() {
   );
 
   // ── LIGHT SHEET — Calculation Sheet, 1:1 with the standalone calculator ──
+  // rev 132 — Chrome-style sub-tab bar for the Calculation Sheet. One tab per shear-wall line (or
+  // manual calc), pinned below the suite tab bar. Active tab is raised/white and merges into the sheet.
+  const calcTabBar = (
+    <div className="no-print" style={{ maxWidth:1100, margin:"0 auto 0" }}>
+      <div style={{ position:"sticky", top:"var(--tabbar-h,42px)", zIndex:35,
+                    display:"flex", alignItems:"flex-end", gap:4, padding:"6px 2px 0",
+                    background:LT.paper, borderBottom:`1px solid ${LT.rule}`, overflowX:"auto" }}>
+        {calcTabs.map((t) => {
+          const active = t.id === activeCalcId;
+          const st = calcTabStatus[t.id];
+          const dot = st === "ok" ? LT.green : st === "fail" ? LT.red : LT.faint;
+          return (
+            <div key={t.id} className={"calctab" + (active ? " is-active" : "")}
+              onClick={() => selectCalcTab(t.id)} onDoubleClick={() => renameCalcTab(t.id)}
+              title={t.lineId ? "Sent from the Design tab — re-send that line to update this tab" : "Custom calc — double-click to rename"}
+              style={{ display:"flex", alignItems:"center", gap:7, cursor:"pointer", flex:"0 0 auto",
+                       padding:"7px 8px 8px 12px", maxWidth:260, marginBottom:-1,
+                       border:`1px solid ${LT.rule}`, borderBottom:`1px solid ${active ? LT.sheet : LT.rule}`,
+                       borderTopLeftRadius:9, borderTopRightRadius:9,
+                       background: active ? LT.sheet : LT.zebra, color: active ? LT.ink : LT.faint,
+                       fontFamily:MONO, fontSize:11.5, fontWeight: active ? 700 : 500, whiteSpace:"nowrap",
+                       boxShadow: active ? `inset 0 2px 0 ${LT.blue}` : "none" }}>
+              <span style={{ width:7, height:7, borderRadius:"50%", background:dot, flex:"0 0 auto" }}
+                    title={st === "ok" ? "All walls pass" : st === "fail" ? "Has a failing wall" : "No wall sized yet"} />
+              <span style={{ overflow:"hidden", textOverflow:"ellipsis" }}>{t.name}</span>
+              {calcTabs.length > 1 && (
+                <button className="calctab-x" onClick={(e) => { e.stopPropagation(); closeCalcTab(t.id); }}
+                  title="Close this calc" aria-label="Close tab"
+                  style={{ border:"none", background:"none", cursor:"pointer", color:LT.faint, fontSize:15,
+                           lineHeight:1, padding:"0 3px", borderRadius:4, flex:"0 0 auto" }}>×</button>
+              )}
+            </div>
+          );
+        })}
+        <button className="calc-add" onClick={addCalcTab} aria-label="Add calculation tab"
+          title="New blank calculation (run a wall independently of the Design tab)"
+          style={{ display:"flex", alignItems:"center", justifyContent:"center", flex:"0 0 auto",
+                   width:30, height:30, marginBottom:4, marginLeft:2, border:"none", borderRadius:7,
+                   background:"transparent", color:LT.blue, fontSize:21, lineHeight:1, cursor:"pointer" }}>+</button>
+      </div>
+    </div>
+  );
+
   const calcSheetPage = (
-    <div className="paper-desk lt-root" style={{ minHeight:"calc(100vh - 46px)", color:LT.ink, fontFamily:"'IBM Plex Sans','Helvetica Neue',Arial,sans-serif", padding:"24px 16px" }}>
+    <div className="paper-desk lt-root" style={{ minHeight:"calc(100vh - 46px)", color:LT.ink, fontFamily:"'IBM Plex Sans','Helvetica Neue',Arial,sans-serif", padding:"10px 16px 24px" }}>
+      {calcTabBar}
       <div style={{ maxWidth:1100, margin:"0 auto", background:LT.sheet, border:`1.5px solid ${LT.ink}`, boxShadow:"0 1px 1px rgba(28,39,51,.04), 0 10px 24px -14px rgba(28,39,51,.30), 4px 4px 0 rgba(28,39,51,.10)" }}>
         {/* ===== TITLE BLOCK ===== */}
         <div style={{ display:"flex", flexWrap:"wrap", borderBottom:`1.5px solid ${LT.ink}` }}>
@@ -4665,7 +4843,7 @@ export default function App() {
         </div>
         <div style={{ padding:"8px 20px 28px" }}>
           <HL.Provider value={{ sel: hlSel, setSel: setHlSel }}>
-            <CalcSheet g={g} setGl={setGl} segments={segments} setSegments={setSegments} results={resultsU} totalL={totalL}/>
+            <CalcSheet g={gEff} setGl={setGlCalc} segments={segments} setSegments={setSegments} results={resultsU} totalL={totalL} marks={calcMarks}/>
           </HL.Provider>
           <div style={{ marginTop:24, fontSize:10, color:LT.faint, lineHeight:1.6, borderTop:`1px solid ${LT.rule}`, paddingTop:10 }}>
             Faithful port of the source spreadsheet, including its exact formulas and thresholds (e.g. the wind end-post compression denominator and uplift &lt; 625 lbs → "neglect"). Hover a row label for its source-cell reference. The Design tab optimizer verifies every candidate through this same engine. Allowable values per the embedded schedule; holdowns/anchors per Simpson HDU / SSTB / STHD / MST capacities tabulated in the workbook. END OF CALC.
