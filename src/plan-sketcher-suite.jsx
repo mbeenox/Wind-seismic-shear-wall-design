@@ -15,7 +15,7 @@ import {
 //   • APP_VERSION (here)      — human-facing build number in the UI ("Version 1.00").
 //   • CURRENT_VERSION (~below)— save-file SCHEMA version; drives .wps migrations. Do NOT couple.
 //   • handoff "rev" number    — the dev changelog in PLAN_SKETCHER_SUITE_HANDOFF.md.
-const APP_BUILD = 132;                                                                 // +1 per release
+const APP_BUILD = 133;                                                                 // +1 per release
 const APP_VERSION = `${Math.floor(APP_BUILD / 100)}.${String(APP_BUILD % 100).padStart(2, "0")}`;  // "1.00"
 
 // ── geometry space: 1 unit = 1 ft ──────────────────────────────────────────
@@ -3709,6 +3709,11 @@ function DesignPlan({ shape, lines, segsByLine, setSegsByLine, resultsByLine, se
   }, [shape]);
   const S = Math.max(vb.w, vb.h) / 110;   // graphic scale (matches sketcher's S idiom)
   const band = 1.2*S;                      // shear-wall band half-width (rev 13: halved — thin-band drafting symbol)
+  // (rev 54) when a line is SELECTED in the Design tab, its shear walls turn YELLOW on the plan as an
+  // immediate "this is the selected wall" indicator (overrides the pass/fail blue/red on the plan only;
+  // pass/fail stays visible in the chips + results table).
+  const SEL_STROKE = "#B8860B";            // selection gold/yellow — readable on the white plan
+  const SEL_FILL   = "#FFF3C4";            // pale-yellow band fill
 
   const lineGeom = (ln) => {
     const ux=(ln.b.x-ln.a.x)/ln.lengthFt, uy=(ln.b.y-ln.a.y)/ln.lengthFt;     // along the line
@@ -3776,14 +3781,14 @@ function DesignPlan({ shape, lines, segsByLine, setSegsByLine, resultsByLine, se
           <g key={ln.id}>
             {/* line highlight (click selects) — force/length shown in the chips below the plan */}
             <line x1={ln.a.x} y1={ln.a.y} x2={ln.b.x} y2={ln.b.y}
-                  stroke={isSel ? SW.accent : SW.faint} strokeWidth={(isSel?0.5:0.3)*S}
+                  stroke={isSel ? SEL_STROKE : SW.faint} strokeWidth={(isSel?0.5:0.3)*S}
                   strokeDasharray={`${1.6*S} ${1.2*S}`} opacity={isSel?0.9:0.45}
                   style={{cursor:"pointer"}} onClick={()=>setSelLine(ln.id)}/>
             {/* shear-wall segments — distinct hatched band over the wall line */}
             {segs.map((s,i)=>{
               const r=res[i]||{};
-              const stroke = r.failed ? SW.red : SW.accent;
-              const fill   = r.failed ? SW.redSoft : SW.accentSoft;
+              const stroke = isSel ? SEL_STROKE : (r.failed ? SW.red : SW.accent);
+              const fill   = isSel ? SEL_FILL   : (r.failed ? SW.redSoft : SW.accentSoft);
               const p0=at(s.start), p1=at(s.start+s.length);
               const corners=[ at(s.start,-band), at(s.start+s.length,-band), at(s.start+s.length,band), at(s.start,band) ];
               const mid = s.start + s.length/2;
@@ -4475,7 +4480,7 @@ export default function App() {
   const calcSeq = useRef(2);                                  // next manual id counter ("calc-2", …)
   const newCalcId = () => "calc-" + (calcSeq.current++);
   const [calcTabs, setCalcTabs] = useState(() => [
-    { id:"calc-1", name:"Wall 1", lineId:null, marks:null, segments:mkCalcSegs(), wWind:DEFAULT_G.wWind },
+    { id:"calc-1", name:"Wall-1 (default)", lineId:null, marks:null, segments:mkCalcSegs(), wWind:DEFAULT_G.wWind },
   ]);
   const [activeCalcId, setActiveCalcId] = useState("calc-1");
   const activeCalc = calcTabs.find((t) => t.id === activeCalcId) || calcTabs[0] || null;
@@ -4528,12 +4533,20 @@ export default function App() {
     if (id === activeCalcId) selectCalcTab((next[idx] || next[idx - 1] || next[0]).id);
     return next;
   });
-  // Rename a MANUAL tab (auto tabs mirror their Design line and are renamed on re-push).
-  const renameCalcTab = (id) => {
-    const t = calcTabs.find((x) => x.id === id); if (!t || t.lineId) return;
-    const name = window.prompt("Rename this calculation tab", t.name);
-    if (name && name.trim()) setCalcTabs((prev) => prev.map((x) => x.id === id ? { ...x, name:name.trim() } : x));
+  // Inline rename of a MANUAL tab (auto tabs mirror their Design line and are renamed on re-send).
+  // Double-click → the tab title becomes an editable input (no pop-up); Enter/blur commits, Esc cancels.
+  const [editingCalcId, setEditingCalcId] = useState(null);
+  const [editName, setEditName] = useState("");
+  const startRenameCalc = (id) => {
+    const t = calcTabs.find((x) => x.id === id); if (!t || t.lineId) return;   // manual tabs only
+    setEditName(t.name); setEditingCalcId(id);
   };
+  const commitRenameCalc = () => {
+    const nm = editName.trim();
+    if (editingCalcId != null && nm) setCalcTabs((prev) => prev.map((x) => x.id === editingCalcId ? { ...x, name:nm } : x));
+    setEditingCalcId(null);
+  };
+  const cancelRenameCalc = () => setEditingCalcId(null);
   // ── TWO-STORY MODE (Step 1: UI scaffold only — no second plan, no calc change yet) ──
   const [twoStory, setTwoStory]     = useState(false);   // false = single story (today's behavior, untouched)
   const [activeFloor, setActiveFloor] = useState(1);     // sketcher view: 1 = 1st floor, 2 = 2nd floor
@@ -4763,21 +4776,22 @@ export default function App() {
 
   // ── LIGHT SHEET — Calculation Sheet, 1:1 with the standalone calculator ──
   // rev 132 — Chrome-style sub-tab bar for the Calculation Sheet. One tab per shear-wall line (or
-  // manual calc), pinned below the suite tab bar. Active tab is raised/white and merges into the sheet.
+  // manual calc). rev 54: pinned via sticky INSIDE the tall page wrapper (which also holds the sheet),
+  // so it stays visible the whole way down the page — mirroring the Plan Sketcher ribbon.
   const calcTabBar = (
-    <div className="no-print" style={{ maxWidth:1100, margin:"0 auto 0" }}>
-      <div style={{ position:"sticky", top:"var(--tabbar-h,42px)", zIndex:35,
-                    display:"flex", alignItems:"flex-end", gap:4, padding:"6px 2px 0",
-                    background:LT.paper, borderBottom:`1px solid ${LT.rule}`, overflowX:"auto" }}>
+    <div className="no-print" style={{ position:"sticky", top:"var(--tabbar-h,42px)", zIndex:35,
+                  display:"flex", alignItems:"flex-end", gap:4, padding:"6px 2px 0",
+                  background:LT.paper, borderBottom:`1px solid ${LT.rule}`, overflowX:"auto" }}>
         {calcTabs.map((t) => {
           const active = t.id === activeCalcId;
+          const editing = editingCalcId === t.id;
           const st = calcTabStatus[t.id];
           const dot = st === "ok" ? LT.green : st === "fail" ? LT.red : LT.faint;
           return (
             <div key={t.id} className={"calctab" + (active ? " is-active" : "")}
-              onClick={() => selectCalcTab(t.id)} onDoubleClick={() => renameCalcTab(t.id)}
-              title={t.lineId ? "Sent from the Design tab — re-send that line to update this tab" : "Custom calc — double-click to rename"}
-              style={{ display:"flex", alignItems:"center", gap:7, cursor:"pointer", flex:"0 0 auto",
+              onClick={() => !editing && selectCalcTab(t.id)} onDoubleClick={() => startRenameCalc(t.id)}
+              title={editing ? "" : (t.lineId ? "Sent from the Design tab — re-send that line to update this tab" : "Custom calc — double-click to rename")}
+              style={{ display:"flex", alignItems:"center", gap:7, cursor: editing ? "text" : "pointer", flex:"0 0 auto",
                        padding:"7px 8px 8px 12px", maxWidth:260, marginBottom:-1,
                        border:`1px solid ${LT.rule}`, borderBottom:`1px solid ${active ? LT.sheet : LT.rule}`,
                        borderTopLeftRadius:9, borderTopRightRadius:9,
@@ -4786,8 +4800,19 @@ export default function App() {
                        boxShadow: active ? `inset 0 2px 0 ${LT.blue}` : "none" }}>
               <span style={{ width:7, height:7, borderRadius:"50%", background:dot, flex:"0 0 auto" }}
                     title={st === "ok" ? "All walls pass" : st === "fail" ? "Has a failing wall" : "No wall sized yet"} />
-              <span style={{ overflow:"hidden", textOverflow:"ellipsis" }}>{t.name}</span>
-              {calcTabs.length > 1 && (
+              {editing ? (
+                <input autoFocus value={editName}
+                  onClick={(e) => e.stopPropagation()} onPointerDown={(e) => e.stopPropagation()}
+                  onChange={(e) => setEditName(e.target.value)}
+                  onBlur={commitRenameCalc}
+                  onKeyDown={(e) => { if (e.key === "Enter") commitRenameCalc(); else if (e.key === "Escape") cancelRenameCalc(); }}
+                  style={{ width:Math.max(80, Math.min(220, editName.length*7+24)), fontFamily:MONO, fontSize:11.5,
+                           fontWeight:700, color:LT.ink, border:`1px solid ${LT.blue}`, borderRadius:4,
+                           padding:"1px 4px", outline:"none", background:"#FFF" }} />
+              ) : (
+                <span style={{ overflow:"hidden", textOverflow:"ellipsis" }}>{t.name}</span>
+              )}
+              {calcTabs.length > 1 && !editing && (
                 <button className="calctab-x" onClick={(e) => { e.stopPropagation(); closeCalcTab(t.id); }}
                   title="Close this calc" aria-label="Close tab"
                   style={{ border:"none", background:"none", cursor:"pointer", color:LT.faint, fontSize:15,
@@ -4801,14 +4826,14 @@ export default function App() {
           style={{ display:"flex", alignItems:"center", justifyContent:"center", flex:"0 0 auto",
                    width:30, height:30, marginBottom:4, marginLeft:2, border:"none", borderRadius:7,
                    background:"transparent", color:LT.blue, fontSize:21, lineHeight:1, cursor:"pointer" }}>+</button>
-      </div>
     </div>
   );
 
   const calcSheetPage = (
     <div className="paper-desk lt-root" style={{ minHeight:"calc(100vh - 46px)", color:LT.ink, fontFamily:"'IBM Plex Sans','Helvetica Neue',Arial,sans-serif", padding:"10px 16px 24px" }}>
+      <div style={{ maxWidth:1100, margin:"0 auto" }}>
       {calcTabBar}
-      <div style={{ maxWidth:1100, margin:"0 auto", background:LT.sheet, border:`1.5px solid ${LT.ink}`, boxShadow:"0 1px 1px rgba(28,39,51,.04), 0 10px 24px -14px rgba(28,39,51,.30), 4px 4px 0 rgba(28,39,51,.10)" }}>
+      <div style={{ background:LT.sheet, border:`1.5px solid ${LT.ink}`, boxShadow:"0 1px 1px rgba(28,39,51,.04), 0 10px 24px -14px rgba(28,39,51,.30), 4px 4px 0 rgba(28,39,51,.10)" }}>
         {/* ===== TITLE BLOCK ===== */}
         <div style={{ display:"flex", flexWrap:"wrap", borderBottom:`1.5px solid ${LT.ink}` }}>
           <div style={{ flex:"2 1 320px", padding:"16px 20px", borderRight:`1px solid ${LT.rule}` }}>
@@ -4849,6 +4874,7 @@ export default function App() {
             Faithful port of the source spreadsheet, including its exact formulas and thresholds (e.g. the wind end-post compression denominator and uplift &lt; 625 lbs → "neglect"). Hover a row label for its source-cell reference. The Design tab optimizer verifies every candidate through this same engine. Allowable values per the embedded schedule; holdowns/anchors per Simpson HDU / SSTB / STHD / MST capacities tabulated in the workbook. END OF CALC.
           </div>
         </div>
+      </div>
       </div>
     </div>
   );
