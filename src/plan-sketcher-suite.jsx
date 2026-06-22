@@ -15,7 +15,7 @@ import {
 //   • APP_VERSION (here)      — human-facing build number in the UI ("Version 1.00").
 //   • CURRENT_VERSION (~below)— save-file SCHEMA version; drives .wps migrations. Do NOT couple.
 //   • handoff "rev" number    — the dev changelog in PLAN_SKETCHER_SUITE_HANDOFF.md.
-const APP_BUILD = 133;                                                                 // +1 per release
+const APP_BUILD = 134;                                                                 // +1 per release
 const APP_VERSION = `${Math.floor(APP_BUILD / 100)}.${String(APP_BUILD % 100).padStart(2, "0")}`;  // "1.00"
 
 // ── geometry space: 1 unit = 1 ft ──────────────────────────────────────────
@@ -3709,11 +3709,10 @@ function DesignPlan({ shape, lines, segsByLine, setSegsByLine, resultsByLine, se
   }, [shape]);
   const S = Math.max(vb.w, vb.h) / 110;   // graphic scale (matches sketcher's S idiom)
   const band = 1.2*S;                      // shear-wall band half-width (rev 13: halved — thin-band drafting symbol)
-  // (rev 54) when a line is SELECTED in the Design tab, its shear walls turn YELLOW on the plan as an
-  // immediate "this is the selected wall" indicator (overrides the pass/fail blue/red on the plan only;
-  // pass/fail stays visible in the chips + results table).
+  // (rev 54/55) when a line is SELECTED in the Design tab, only its dashed CENTERLINE turns yellow as
+  // an immediate "this is the selected wall" indicator. The shear-wall band keeps its pass/fail blue/red
+  // so selection never masks a red FAIL.
   const SEL_STROKE = "#B8860B";            // selection gold/yellow — readable on the white plan
-  const SEL_FILL   = "#FFF3C4";            // pale-yellow band fill
 
   const lineGeom = (ln) => {
     const ux=(ln.b.x-ln.a.x)/ln.lengthFt, uy=(ln.b.y-ln.a.y)/ln.lengthFt;     // along the line
@@ -3787,8 +3786,10 @@ function DesignPlan({ shape, lines, segsByLine, setSegsByLine, resultsByLine, se
             {/* shear-wall segments — distinct hatched band over the wall line */}
             {segs.map((s,i)=>{
               const r=res[i]||{};
-              const stroke = isSel ? SEL_STROKE : (r.failed ? SW.red : SW.accent);
-              const fill   = isSel ? SEL_FILL   : (r.failed ? SW.redSoft : SW.accentSoft);
+              // (rev 55) shear-wall band keeps its PASS/FAIL color (blue/red) even when selected — only
+              // the dashed centerline turns yellow (below), so selection never masks a red FAIL.
+              const stroke = r.failed ? SW.red : SW.accent;
+              const fill   = r.failed ? SW.redSoft : SW.accentSoft;
               const p0=at(s.start), p1=at(s.start+s.length);
               const corners=[ at(s.start,-band), at(s.start+s.length,-band), at(s.start+s.length,band), at(s.start,band) ];
               const mid = s.start + s.length/2;
