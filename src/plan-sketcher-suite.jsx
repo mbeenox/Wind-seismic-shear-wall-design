@@ -15,7 +15,7 @@ import {
 //   • APP_VERSION (here)      — human-facing build number in the UI ("Version 1.00").
 //   • CURRENT_VERSION (~below)— save-file SCHEMA version; drives .wps migrations. Do NOT couple.
 //   • handoff "rev" number    — the dev changelog in PLAN_SKETCHER_SUITE_HANDOFF.md.
-const APP_BUILD = 137;                                                                 // +1 per release
+const APP_BUILD = 138;                                                                 // +1 per release
 const APP_VERSION = `${Math.floor(APP_BUILD / 100)}.${String(APP_BUILD % 100).padStart(2, "0")}`;  // "1.00"
 
 // ── geometry space: 1 unit = 1 ft ──────────────────────────────────────────
@@ -1176,7 +1176,7 @@ function Field({ label, unit, value, onChange }) {
 }
 
 /* ═══════════════ WINDWARD LINE-LOAD (static, CAD style) ═══════════════ */
-function WindLoad({ load, onOpen, S=1, ts=1, displayPlf=null }) {
+function WindLoad({ load, onOpen, S=1, ts=1, displayPlf=null, prec=1 }) {
   const { nx, ny } = load;
   // one group per leeward sub-region (split where the back wall's parapet changes). Adjacent
   // sub-regions that resolve to the SAME plf are merged into one span here so the wall shows a
@@ -1222,7 +1222,7 @@ function WindLoad({ load, onOpen, S=1, ts=1, displayPlf=null }) {
               <line key={a.k} x1={a.x1} y1={a.y1} x2={a.x2} y2={a.y2} stroke={C_LOAD} strokeWidth={0.16*S*ts} markerEnd="url(#loadArr)"/>
             ))}
             <text x={lx} y={ly} fill={C_LOAD} fontSize={1.35*S*ts} fontWeight="600" textAnchor="middle" dominantBaseline="central"
-                  transform={wallVert?`rotate(-90,${lx},${ly})`:undefined}>{fmt1(total)} plf</text>
+                  transform={wallVert?`rotate(-90,${lx},${ly})`:undefined}>{(prec===2?fmt2:fmt1)(total)} plf</text>
           </g>
         );
       })}
@@ -1570,6 +1570,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
   const [ortho,    setOrtho]    = useState(true);
   const [dims,     setDims]     = useState(true);
   const [markScale,setMarkScale]= useState(1);       // on-plan MARKUP scale (toolbar ▸ Markup): scales text labels, load/reaction arrows, AND nodes together — 1 / .75 / .5 / .25 — so markup doesn't blanket a zoomed-out plan
+  const [loadCase, setLoadCase] = useState("wind");  // (rev 59) on-plan load VIEW: "wind" (section-cut wind loads) or "seismic" (V/extent boundary loads, both directions)
   const [panMode,  setPanMode]  = useState(false);   // left-drag "hand" pan tool (from canvas menu)
   const [zoomEnabled,setZoomEnabled]=useState(true); // wheel-zoom master switch (canvas-menu light)
   const [panCursor,setPanCursor]=useState(false);    // true while a pan gesture is live (grab cursor)
@@ -1821,7 +1822,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
                   // v2: the camera + working state, so a reopened file looks like where you left it
                   view:viewRef.current, selected:selRef.current,
                   drawMode:drawModeRef.current, panMode:panModeRef.current,
-                  zoomEnabled:zoomEnabledRef.current, snapOn, ortho, dims, markScale }),
+                  zoomEnabled:zoomEnabledRef.current, snapOn, ortho, dims, markScale, loadCase }),
       set: (s)=>{
         if(!s||!s.graph) return;
         setGraph(s.graph);
@@ -1842,6 +1843,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
         if("ortho" in s) setOrtho(!!s.ortho);
         if("dims" in s) setDims(!!s.dims);
         if("markScale" in s) setMarkScale(Number(s.markScale)||1);
+        if("loadCase" in s) setLoadCase(s.loadCase==="seismic"?"seismic":"wind");
         else if("textScale" in s) setMarkScale(Number(s.textScale)||1);   // rev 30 key — back-compat
         history.current=[]; future.current=[];
         setPushedSig(null);                          // rev 130: New/Open → no stale-push warning until the next push (a loaded file is in sync with its own saved design)
@@ -2309,6 +2311,34 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
   // (2-story mode) warn when EVERY wall has been tagged 1-story — then the 2nd floor has no walls.
   const allOneStory = useMemo(()=> twoStory && graph.edges.length>0
         && graph.edges.every(e=>oneStory.has(keyOf(e))), [twoStory, graph.edges, oneStory]);
+  // (rev 59, Step 3) SEISMIC distribution. V = Cs·W_total spread as a uniform line load along the
+  // boundary faces perpendicular to each direction: w = V / (projected extent perpendicular to the
+  // force). Force X (axis "h") → extent = Y-span (D), loads the Y-running faces; Force Y (axis "v") →
+  // extent = X-span (B), loads the X-running faces. Reuses the generalized buildSecData (Option B) with
+  // a uniform load model { base:()=>w, lee:()=>0 }, so the windward-collection + across-wind shadow +
+  // lineReactions geometry distributes V (conserving it — the shadow filter keeps a face set whose
+  // transverse projections tile the extent once) and yields wall reactions exactly like wind.
+  const Cs = Number(g&&g.Cs)||0;
+  const Vfull = (!twoStory) ? Cs*sw.Wtotal : 0;        // design base shear V (lbs); 1-story only for now
+  const seisExtent = useMemo(()=>{
+    const ns=graph.nodes; if(!ns.length) return {dx:0,dy:0};
+    let mnX=Infinity,mnY=Infinity,mxX=-Infinity,mxY=-Infinity;
+    ns.forEach(p=>{mnX=Math.min(mnX,p.x);mnY=Math.min(mnY,p.y);mxX=Math.max(mxX,p.x);mxY=Math.max(mxY,p.y);});
+    return { dx:mxX-mnX, dy:mxY-mnY };
+  },[graph.nodes]);
+  const wSeisX = seisExtent.dy>0 ? Vfull/seisExtent.dy : 0;   // force-X plf (on the Y-running faces)
+  const wSeisY = seisExtent.dx>0 ? Vfull/seisExtent.dx : 0;   // force-Y plf (on the X-running faces)
+  const seisOn = loadCase==="seismic" && Vfull>0 && !!loop;
+  const seisModelH = useMemo(()=>({ base:()=>wSeisX, lee:()=>0 }),[wSeisX]);
+  const seisModelV = useMemo(()=>({ base:()=>wSeisY, lee:()=>0 }),[wSeisY]);
+  const secSeisH = useMemo(()=> seisOn ? buildSecData({axis:"h",sign:-1}, graph, loop, isSup, propsFor, seisModelH) : null,
+        [seisOn, graph, loop, isSup, propsFor, seisModelH]);
+  const secSeisV = useMemo(()=> seisOn ? buildSecData({axis:"v",sign:-1}, graph, loop, isSup, propsFor, seisModelV) : null,
+        [seisOn, graph, loop, isSup, propsFor, seisModelV]);
+  // what the canvas draws: wind sections, or the seismic ones when the Load-case toggle is on Seismic
+  const showSeis = loadCase==="seismic";
+  const dispH = showSeis ? secSeisH : secH;
+  const dispV = showSeis ? secSeisV : secV;
   useEffect(()=>{
     const po=pendingOpen.current; if(!po) return; pendingOpen.current=null;
     const ax=po.axis; const sc=ax==="h"?secH:secV;
@@ -2554,6 +2584,18 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
         </div>
         <div className="rsep"/>
         <div className="rgroup">
+          <div className="rlabel">Load case</div>
+          <div className="rbtns">
+            <div className={"storypill"+(loadCase==="seismic"?" two":"")}
+                 title="Show wind loads or the seismic base-shear loads on the plan">
+              <span className="storythumb"/>
+              <button className={"storyopt"+(loadCase==="wind"?" on":"")} onClick={()=>setLoadCase("wind")}>Wind</button>
+              <button className={"storyopt"+(loadCase==="seismic"?" on":"")} onClick={()=>setLoadCase("seismic")}>Seismic</button>
+            </div>
+          </div>
+        </div>
+        <div className="rsep"/>
+        <div className="rgroup">
           <div className="rlabel">Analyze</div>
           <div className="rbtns">
             <button className="rbtn raccent"
@@ -2641,19 +2683,21 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
             {/* windward line-load graphics — one per windward wall (all legs). rev 34: in 2-story
                 FLOOR-1 view the label shows the FLOOR-only diaphragm plf (½·H·pw + ½·H₂·pw); the roof
                 load reaches the 1st floor through the shear walls as a point load, not the diaphragm. */}
-            {secH&&secH.windLoads.map((wl,i)=><WindLoad key={"hL"+wl.key} load={wl} S={S} ts={markScale}
-                 displayPlf={twoStory&&activeFloor===1&&!mixed1 ? floorDiaphragmPlf(wl.key) : null}
-                 onOpen={()=>setActiveWall({axis:"h",key:wl.key})}/>)}
-            {secV&&secV.windLoads.map((wl,i)=><WindLoad key={"vL"+wl.key} load={wl} S={S} ts={markScale}
-                 displayPlf={twoStory&&activeFloor===1&&!mixed1 ? floorDiaphragmPlf(wl.key) : null}
-                 onOpen={()=>setActiveWall({axis:"v",key:wl.key})}/>)}
+            {dispH&&dispH.windLoads.map((wl,i)=><WindLoad key={(showSeis?"shL":"hL")+wl.key} load={wl} S={S} ts={markScale}
+                 prec={showSeis?2:1}
+                 displayPlf={!showSeis && twoStory&&activeFloor===1&&!mixed1 ? floorDiaphragmPlf(wl.key) : null}
+                 onOpen={showSeis ? undefined : ()=>setActiveWall({axis:"h",key:wl.key})}/>)}
+            {dispV&&dispV.windLoads.map((wl,i)=><WindLoad key={(showSeis?"svL":"vL")+wl.key} load={wl} S={S} ts={markScale}
+                 prec={showSeis?2:1}
+                 displayPlf={!showSeis && twoStory&&activeFloor===1&&!mixed1 ? floorDiaphragmPlf(wl.key) : null}
+                 onOpen={showSeis ? undefined : ()=>setActiveWall({axis:"v",key:wl.key})}/>)}
 
             {/* aggregated reactions (a shared support wall sums contributions into one arrow) */}
-            {secH&&secH.reactions.map((r,i)=><Reaction key={"hR"+i} r={r} tdir={secH.tdir} S={S} ts={markScale}/>)}
-            {secV&&secV.reactions.map((r,i)=><Reaction key={"vR"+i} r={r} tdir={secV.tdir} S={S} ts={markScale}/>)}
+            {dispH&&dispH.reactions.map((r,i)=><Reaction key={(showSeis?"shR":"hR")+i} r={r} tdir={dispH.tdir} S={S} ts={markScale}/>)}
+            {dispV&&dispV.reactions.map((r,i)=><Reaction key={(showSeis?"svR":"vR")+i} r={r} tdir={dispV.tdir} S={S} ts={markScale}/>)}
 
             {/* load-imbalance flags */}
-            {[secH,secV].filter(Boolean).flatMap(sc=>(sc.windLoads||[]).filter(w=>w.imbalance).map((w,i)=>{
+            {[dispH,dispV].filter(Boolean).flatMap(sc=>(sc.windLoads||[]).filter(w=>w.imbalance).map((w,i)=>{
               const mx=(w.wa.x+w.wb.x)/2, my=(w.wa.y+w.wb.y)/2;
               return <text key={(sc.axis)+i} x={mx+w.nx*4*S} y={my+w.ny*4*S} fill="#B23A2A" fontSize={1.35*S*markScale}
                            fontWeight="700" textAnchor="middle" dominantBaseline="middle">⚠ imbalance</text>;
@@ -2805,7 +2849,16 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
                 <small style={{color:"var(--muted)"}}>psf</small>
               </span>
             </div>
-            <p className="hint" style={{marginTop:6,marginBottom:0}}>Used for seismic weight (this tab) and wall uplift resistance (Design/Calc).</p>
+            <div className="row" style={{borderTop:"1px solid var(--line)",marginTop:4,paddingTop:6}}>
+              <span>Seismic C<sub>s</sub></span>
+              <span style={{display:"flex",alignItems:"center",gap:6}}>
+                <input type="number" step={0.005} min={0} value={g?(g.Cs ?? 0):0}
+                  onChange={(e)=>setGl&&setGl("Cs",parseFloat(e.target.value)||0)}
+                  style={{width:64,padding:"4px 6px",border:"1px solid var(--line)",borderRadius:4,fontSize:13,textAlign:"right",color:"var(--ink)",background:"#FFFFFF"}}/>
+                <small style={{color:"var(--muted)",width:26}}>coef</small>
+              </span>
+            </div>
+            <p className="hint" style={{marginTop:6,marginBottom:0}}>Roof/Floor/Wall DL feed the seismic weight (this tab) and wall uplift resistance (Design/Calc). C<sub>s</sub> sets the base shear V = C<sub>s</sub>·W.</p>
           </div>
 
           {!twoStory ? (
@@ -2822,6 +2875,13 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
                 <span>Base shear V = Cs·W <span style={{color:"var(--muted)"}}>(Cs {Number(g&&g.Cs)||0})</span></span>
                 <b style={{color:"var(--hot)"}}>{Math.round((Number(g&&g.Cs)||0)*sw.Wtotal).toLocaleString()}<small>lbs</small></b>
               </div>
+              <div className="row" style={{fontSize:11,color:"var(--muted)",marginTop:2}}>
+                <span>X-dir face load (⟂ {Math.round(seisExtent.dy)}′)</span><b style={{color:"var(--ink)"}}>{fmt2(wSeisX)}<small>plf</small></b>
+              </div>
+              <div className="row" style={{fontSize:11,color:"var(--muted)"}}>
+                <span>Y-dir face load (⟂ {Math.round(seisExtent.dx)}′)</span><b style={{color:"var(--ink)"}}>{fmt2(wSeisY)}<small>plf</small></b>
+              </div>
+              <p className="hint" style={{marginTop:6,marginBottom:0}}>Toggle <b>Load case → Seismic</b> (top toolbar) to map these onto the plan boundary as plf line loads + wall reactions.</p>
               {sw.profiles.length>0 && (
                 <div style={{marginTop:8}}>
                   <div style={{fontSize:10.5,fontWeight:800,letterSpacing:".04em",textTransform:"uppercase",color:"var(--muted)",marginBottom:4}}>By parapet profile</div>
@@ -4349,14 +4409,13 @@ function DesignTab({ g, setGl, shape, lines, linesByFloor, segsByLine, setSegsBy
         <div style={{ display:"flex", flexWrap:"wrap", gap:8, alignItems:"flex-start" }}>
           <div style={{ flex:"1.4 1 280px", minWidth:240 }}>
             <PinCard title="Seismic" cols={2}>
-              <PinRow label="Cs"><input type="number" step={0.005} min={0} value={g.Cs ?? 0} onChange={(e)=>setGl("Cs",parseFloat(e.target.value)||0)} style={pinNumS}/></PinRow>
+              <PinRow label="Cs"><span style={{fontSize:12,fontWeight:600}}>{g.Cs ?? 0}</span></PinRow>
               <PinRow label="V = Cs·W" unit="lbs"><span style={{fontSize:12,fontWeight:700,color:SW.accent}}>{wTotal!=null ? Math.round((Number(g.Cs)||0)*wTotal).toLocaleString() : "—"}</span></PinRow>
-              {/* (rev 58) Seismic Response Coefficient Cs (g.Cs) + design base shear V = Cs·W_total.
-                  W_total is the 1-story seismic weight computed on the Plan tab and lifted to App as
-                  `wTotal` (null in 2-Story mode → "—", pending a later step). The Roof/Floor/Wall DL
-                  inputs now ALL live on the Plan tab (side panel → Dead Loads); the values stay in the
-                  shared `g`, so the Design/Calc uplift formula in calcCore.js
-                  (wdl = roofTrib·roofDL + floorTrib·floorDL + wallDL·h) reads them exactly as before. */}
+              {/* (rev 59) Cs is now an INPUT on the Plan tab (side panel → Dead Loads, with the dead loads);
+                  shown here READ-ONLY alongside the resulting design base shear V = Cs·W_total. W_total is
+                  the 1-story seismic weight lifted from the Plan tab as `wTotal` (null in 2-Story → "—").
+                  The Roof/Floor/Wall DL inputs also live on the Plan tab; all values stay in shared `g`,
+                  so the Design/Calc uplift formula reads them exactly as before. */}
             </PinCard>
           </div>
           <div style={{ flex:"1.4 1 280px", minWidth:240 }}>
