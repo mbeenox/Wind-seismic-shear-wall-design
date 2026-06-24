@@ -15,7 +15,7 @@ import {
 //   • APP_VERSION (here)      — human-facing build number in the UI ("Version 1.00").
 //   • CURRENT_VERSION (~below)— save-file SCHEMA version; drives .wps migrations. Do NOT couple.
 //   • handoff "rev" number    — the dev changelog in PLAN_SKETCHER_SUITE_HANDOFF.md.
-const APP_BUILD = 135;                                                                 // +1 per release
+const APP_BUILD = 137;                                                                 // +1 per release
 const APP_VERSION = `${Math.floor(APP_BUILD / 100)}.${String(APP_BUILD % 100).padStart(2, "0")}`;  // "1.00"
 
 // ── geometry space: 1 unit = 1 ft ──────────────────────────────────────────
@@ -47,6 +47,30 @@ const fmt1    = (n)       => Math.round(n*10)/10;
 const fmt2    = (n)       => Math.round(n*100)/100;
 // text rotation that keeps labels parallel to a wall and upright (-90..90]
 const wallAng = (dx,dy)=>{ let a=Math.atan2(dy,dx)*180/Math.PI; a=((a+90)%180+180)%180-90; return a; };
+// (rev 57) SEISMIC EFFECTIVE WEIGHT — 1-STORY.  W_total = roof + walls (lbs).
+//   W_roof  = enclosed plan area (ft²) × Roof DL (psf)
+//   per wall: H_trib = par + H/2  — the full parapet (above the diaphragm) + half the story height
+//             below it (the lower half spans to the foundation); W = H_trib × length × Wall DL (psf).
+//   W_wall  = Σ over every wall.  Pure + 1-STORY ONLY (the 2-story per-diaphragm tributary split lands
+//   in a later step). Reads each wall's own par/H via propsFor, so it tracks Global Inputs / section cuts.
+//   `profiles` groups equal (par,H) walls for a per-profile readout — the sum is identical either way.
+function seismicWeight1Story(graph, loop, propsFor, roofDL, wallDL){
+  const area = (loop && loop.area) ? loop.area : 0;
+  const Wroof = area * (roofDL||0);
+  let Wwall = 0; const byProfile = new Map();
+  for(const e of graph.edges){
+    const a = graph.nodes.find(n=>n.id===e.a), b = graph.nodes.find(n=>n.id===e.b);
+    if(!a||!b) continue;
+    const len = Math.hypot(b.x-a.x, b.y-a.y);
+    const p = propsFor(keyOf(e)); const par = p.par||0, H = p.H||0;
+    const htrib = par + H/2; const w = htrib * len * (wallDL||0);
+    Wwall += w;
+    const k = `${par}|${H}`;
+    const g = byProfile.get(k) || { par, H, htrib, len:0, w:0 };
+    g.len += len; g.w += w; byProfile.set(k, g);
+  }
+  return { area, Wroof, Wwall, Wtotal: Wroof + Wwall, profiles:[...byProfile.values()] };
+}
 // a section now stores its own shared values (per wind direction)
 const DEF_SECTION = { H:10, pw:16, qWind:32, qLee:22, par:5, H2:null,
                       // (rev 49) DEAD-LOAD TRIBUTARY — now a per-wall, per-floor property entered on the
@@ -230,10 +254,21 @@ function lineReactions(line, graph, isSup, travel, sOf, along){
   return { reactions, imbalance:false };
 }
 
+// (rev 58, Step 2 / Option B) buildSecData's per-wall LINE LOAD is supplied by a load MODEL, so the
+// same windward-collection + across-wind shadow + reaction geometry can carry a SEISMIC load
+// (uniform V / projected-extent) as well as wind. The DEFAULT model reproduces the exact wind
+// arithmetic verbatim — `base` = ½·H·pw + par·qWind (uniform over a wall) and `lee` = leePar·qLee
+// (the leeward-parapet term, taken per back-wall sub-span) — so the wind path is byte-identical
+// (proven by a golden-output regression). A seismic caller (Step 3) passes { base:()=>V/extent, lee:()=>0 }.
+const WIND_LOAD = {
+  base: (pr)=> 0.5*(pr.H||0)*(pr.pw||0) + (pr.par||0)*(pr.qWind||0),
+  lee:  (pr, leePar)=> leePar*(pr.qLee||0),
+};
 // wind field for one direction: loads EVERY windward-facing wall of that orientation
-function buildSecData(section, graph, loop, isSup, propsFor){
+function buildSecData(section, graph, loop, isSup, propsFor, loadModel){
   if(!section) return null;
   const { axis, sign } = section;
+  const LM = loadModel || WIND_LOAD;   // (rev 58) default = wind; seismic supplies a uniform model
   const travel = axis==="v" ? {x:0,y:sign} : {x:sign,y:0};
   const ring = loop?loop.ring:null;
   let cx=0,cy=0,cn=0;
@@ -279,7 +314,7 @@ function buildSecData(section, graph, loop, isSup, propsFor){
       // representative plf for the on-plan label: leeward parapet from the back wall behind centre
       const cLee=findLeewardPartner(w.key, axis, sign, graph);
       const cPar=cLee ? (propsFor(cLee).par||0) : 0;
-      w.total = 0.5*(pr.H||0)*(pr.pw||0) + (pr.par||0)*(pr.qWind||0) + cPar*(pr.qLee||0);
+      w.total = LM.base(pr) + LM.lee(pr, cPar);
       w.tdir=travel;
     });
     const drawn = kept.filter(w=>w.total>0);
@@ -299,7 +334,7 @@ function buildSecData(section, graph, loop, isSup, propsFor){
       if(!L){ L={depth, segs:[], smin:Infinity, smax:-Infinity}; lines.push(L); }
       const ws0=Math.min(sOf(w.wa),sOf(w.wb)), ws1=Math.max(sOf(w.wa),sOf(w.wb));
       const pr=propsFor(w.key);
-      const base = 0.5*(pr.H||0)*(pr.pw||0) + (pr.par||0)*(pr.qWind||0);   // uniform over the wall
+      const base = LM.base(pr);   // uniform over the wall (wind: ½·H·pw + par·qWind; seismic: V/extent)
       // back walls overlapping this windward wall (downwind), as {lo,hi,d,par}
       const backs=[];
       for(const e of graph.edges){
@@ -322,7 +357,7 @@ function buildSecData(section, graph, loop, isSup, propsFor){
         const a0=pts[i], a1=pts[i+1]; if(a1-a0<0.5) continue;
         const mid=(a0+a1)/2; let leePar=0, bestD=-Infinity;
         backs.forEach(bk=>{ if(mid>=bk.lo-1e-6&&mid<=bk.hi+1e-6&&bk.d>bestD){ bestD=bk.d; leePar=bk.par; } });
-        const plf = base + leePar*(pr.qLee||0);
+        const plf = base + LM.lee(pr, leePar);
         L.segs.push({ s0:a0, s1:a1, plf });
         w.subLoads.push({ plf, len:a1-a0, a:interp(a0), b:interp(a1) });   // for the on-plan display
         L.smin=Math.min(L.smin,a0); L.smax=Math.max(L.smax,a1);
@@ -1517,7 +1552,7 @@ function GlobalInputsWindow({ seed, twoStory, hasOneStory, onApply, onClose }) {
   );
 }
 
-function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, setTwoStory, activeFloor, setActiveFloor }) {
+function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, setTwoStory, activeFloor, setActiveFloor, g, setGl, setWtotal }) {
   const [graph,    setGraph]    = useState(INIT.graph);
   const [selected, setSelected] = useState(null);
   const [menu,     setMenu]     = useState(null);
@@ -2162,6 +2197,13 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
   // Step 1 is the tag + appearance only — the load/floor-view effects land in the following steps.
   const isOneStory = useCallback((key)=> twoStory && oneStory.has(key), [twoStory, oneStory]);
   const propsFor = useCallback((key)=> mergeWallProps(wallProps[key]), [wallProps]);
+  // (rev 57) live 1-story seismic effective weight (W_total) from the plan geometry + the relocated
+  // Roof DL / Wall DL. Reactive to graph, wall props (par/H), and g.roofDL/g.wallDL.
+  const sw = useMemo(()=> seismicWeight1Story(graph, loop, propsFor, g&&g.roofDL, g&&g.wallDL),
+                     [graph, loop, propsFor, g]);
+  // (rev 58) lift the 1-story W_total to App so the Design-tab Seismic card can show V = Cs·W_total.
+  // null in 2-Story mode (the per-diaphragm split is a later step), so downstream shows "—".
+  useEffect(()=>{ if(setWtotal) setWtotal(twoStory ? null : sw.Wtotal); }, [twoStory, sw.Wtotal, setWtotal]);
   // In 2-story mode the on-plan loads/reactions reflect the SELECTED floor, by feeding buildSecData a
   // floor-specific EFFECTIVE wall height (engine untouched — it reads pr.H only in the line-load term):
   //   2nd-floor plan → roof diaphragm:  H_eff = H₂            → ½·H₂·pw + parapets               (designs 2nd-floor walls)
@@ -2733,6 +2775,72 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
               title={graph.edges.length===0 ? "Draw at least one wall first" : "Apply wall/parapet heights and pressures to the whole building"}
               onClick={openGlobalInputs}>⚙ Global inputs…</button>
           </div>
+
+          <div className="card">
+            <h4>Dead Loads</h4>
+            <div className="row">
+              <span>Roof DL</span>
+              <span style={{display:"flex",alignItems:"center",gap:6}}>
+                <input type="number" step={1} min={0} value={g?g.roofDL:0}
+                  onChange={(e)=>setGl&&setGl("roofDL",parseFloat(e.target.value)||0)}
+                  style={{width:64,padding:"4px 6px",border:"1px solid var(--line)",borderRadius:4,fontSize:13,textAlign:"right",color:"var(--ink)",background:"#FFFFFF"}}/>
+                <small style={{color:"var(--muted)"}}>psf</small>
+              </span>
+            </div>
+            <div className="row">
+              <span>Floor DL</span>
+              <span style={{display:"flex",alignItems:"center",gap:6}}>
+                <input type="number" step={1} min={0} value={g?g.floorDL:0}
+                  onChange={(e)=>setGl&&setGl("floorDL",parseFloat(e.target.value)||0)}
+                  style={{width:64,padding:"4px 6px",border:"1px solid var(--line)",borderRadius:4,fontSize:13,textAlign:"right",color:"var(--ink)",background:"#FFFFFF"}}/>
+                <small style={{color:"var(--muted)"}}>psf</small>
+              </span>
+            </div>
+            <div className="row">
+              <span>Wall DL</span>
+              <span style={{display:"flex",alignItems:"center",gap:6}}>
+                <input type="number" step={1} min={0} value={g?g.wallDL:0}
+                  onChange={(e)=>setGl&&setGl("wallDL",parseFloat(e.target.value)||0)}
+                  style={{width:64,padding:"4px 6px",border:"1px solid var(--line)",borderRadius:4,fontSize:13,textAlign:"right",color:"var(--ink)",background:"#FFFFFF"}}/>
+                <small style={{color:"var(--muted)"}}>psf</small>
+              </span>
+            </div>
+            <p className="hint" style={{marginTop:6,marginBottom:0}}>Used for seismic weight (this tab) and wall uplift resistance (Design/Calc).</p>
+          </div>
+
+          {!twoStory ? (
+            <div className="card">
+              <h4>Seismic Weight</h4>
+              <div className="row"><span>Roof area</span><b>{loop?Math.round(sw.area).toLocaleString():"—"}{loop&&<small>ft²</small>}</b></div>
+              <div className="row"><span>W roof</span><b>{Math.round(sw.Wroof).toLocaleString()}<small>lbs</small></b></div>
+              <div className="row"><span>W wall</span><b>{Math.round(sw.Wwall).toLocaleString()}<small>lbs</small></b></div>
+              <div className="row" style={{borderTop:"1px solid var(--line)",marginTop:4,paddingTop:6}}>
+                <span style={{fontWeight:800}}>W total</span>
+                <b style={{color:"var(--accent)"}}>{Math.round(sw.Wtotal).toLocaleString()}<small>lbs</small></b>
+              </div>
+              <div className="row" style={{marginTop:2}}>
+                <span>Base shear V = Cs·W <span style={{color:"var(--muted)"}}>(Cs {Number(g&&g.Cs)||0})</span></span>
+                <b style={{color:"var(--hot)"}}>{Math.round((Number(g&&g.Cs)||0)*sw.Wtotal).toLocaleString()}<small>lbs</small></b>
+              </div>
+              {sw.profiles.length>0 && (
+                <div style={{marginTop:8}}>
+                  <div style={{fontSize:10.5,fontWeight:800,letterSpacing:".04em",textTransform:"uppercase",color:"var(--muted)",marginBottom:4}}>By parapet profile</div>
+                  {sw.profiles.map((p,i)=>(
+                    <div key={i} className="row" style={{fontSize:11}}>
+                      <span style={{color:"var(--muted)"}}>{fmt1(p.par)}′ par · H{fmt1(p.H)}′ · {Math.round(p.len)}′ → Hₜ {fmt1(p.htrib)}′</span>
+                      <b>{Math.round(p.w).toLocaleString()}<small>lbs</small></b>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {!loop && <p className="hint" style={{marginTop:6,marginBottom:0}}>Close the plan boundary to get the roof area.</p>}
+            </div>
+          ) : (
+            <div className="card">
+              <h4>Seismic Weight</h4>
+              <p className="hint" style={{marginTop:0,marginBottom:0}}>2-Story seismic weight uses a per-diaphragm tributary split — coming in a later step.</p>
+            </div>
+          )}
 
           {(secH||secV)&&(
             <div className="card">
@@ -4070,7 +4178,7 @@ function SwCtxMenu({ ctx, lines, segsByLine, resultsByLine, setOv, onRemove, onC
 }
 
 // ---------- DESIGN TAB ----------
-function DesignTab({ g, setGl, shape, lines, linesByFloor, segsByLine, setSegsByLine, ovSet, d, setDk, applyToCalc, selLine, setSelLine, twoStory, activeFloor, setActiveFloor, stale, onRebuild, calcPush, optimizePush, setOptimizePush }) {
+function DesignTab({ g, setGl, shape, lines, linesByFloor, segsByLine, setSegsByLine, ovSet, d, setDk, applyToCalc, selLine, setSelLine, twoStory, activeFloor, setActiveFloor, stale, onRebuild, calcPush, optimizePush, setOptimizePush, wTotal }) {
   const [ctx, setCtx] = useState(null);
   const [genMsg, setGenMsg] = useState(null);
   const [showTags, setShowTags] = useState(false);   // rev 13: SW marks no longer auto-show on the plan
@@ -4240,13 +4348,15 @@ function DesignTab({ g, setGl, shape, lines, linesByFloor, segsByLine, setSegsBy
         </div>
         <div style={{ display:"flex", flexWrap:"wrap", gap:8, alignItems:"flex-start" }}>
           <div style={{ flex:"1.4 1 280px", minWidth:240 }}>
-            <PinCard title="Loads" cols={2}>
-              <PinRow label="Roof DL" unit="psf"><input type="number" step={1} value={g.roofDL} onChange={(e)=>setGl("roofDL",parseFloat(e.target.value)||0)} style={pinNumS}/></PinRow>
-              <PinRow label="Floor DL" unit="psf"><input type="number" step={1} value={g.floorDL} onChange={(e)=>setGl("floorDL",parseFloat(e.target.value)||0)} style={pinNumS}/></PinRow>
-              <PinRow label="Wall self" unit="psf"><input type="number" step={1} value={g.wallDL} onChange={(e)=>setGl("wallDL",parseFloat(e.target.value)||0)} style={pinNumS}/></PinRow>
-              {/* (rev 49) Roof/Floor TRIBUTARY moved out — it is now a per-wall, per-floor value entered on
-                  the plan (right-click a wall → "DL Tributary"). d.roofTrib/d.floorTrib remain as the
-                  silent fallback for any line that has no per-wall trib. */}
+            <PinCard title="Seismic" cols={2}>
+              <PinRow label="Cs"><input type="number" step={0.005} min={0} value={g.Cs ?? 0} onChange={(e)=>setGl("Cs",parseFloat(e.target.value)||0)} style={pinNumS}/></PinRow>
+              <PinRow label="V = Cs·W" unit="lbs"><span style={{fontSize:12,fontWeight:700,color:SW.accent}}>{wTotal!=null ? Math.round((Number(g.Cs)||0)*wTotal).toLocaleString() : "—"}</span></PinRow>
+              {/* (rev 58) Seismic Response Coefficient Cs (g.Cs) + design base shear V = Cs·W_total.
+                  W_total is the 1-story seismic weight computed on the Plan tab and lifted to App as
+                  `wTotal` (null in 2-Story mode → "—", pending a later step). The Roof/Floor/Wall DL
+                  inputs now ALL live on the Plan tab (side panel → Dead Loads); the values stay in the
+                  shared `g`, so the Design/Calc uplift formula in calcCore.js
+                  (wdl = roofTrib·roofDL + floorTrib·floorDL + wallDL·h) reads them exactly as before. */}
             </PinCard>
           </div>
           <div style={{ flex:"1.4 1 280px", minWidth:240 }}>
@@ -4477,7 +4587,7 @@ button:focus-visible, select:focus-visible, input:focus-visible{ outline:2px sol
 // behavior change for current files. NOTE: `g.grade` is deliberately NOT included (the calc
 // engine treats a falsy grade as "rated", so omitting it keeps the save shape unchanged and
 // current files byte-identical; add it here only if you want new saves to carry grade:"rated").
-const DEFAULT_G   = { code:4, species:1, line:"1", vSeismic:5, sds:1, R:6.5, wWind:26000, roofDL:20, floorDL:0, wallDL:15 };
+const DEFAULT_G   = { code:4, species:1, line:"1", vSeismic:5, sds:1, R:6.5, wWind:26000, roofDL:20, floorDL:0, wallDL:15, Cs:0.05 };
 const DEFAULT_D   = { thickness:5.5, anchor:"Concrete", roofTrib:2, floorTrib:0, hdDist:5,
                       minSegLen:4, maxSegLen:12, maxSegments:4, maxType:3, snap:0.5,
                       objective:"length", ftgWidth:1.33, ftgThick:12, height:15, lineLength:40 };
@@ -4603,6 +4713,7 @@ function loadProject(raw){
 export default function App() {
   const [tab, setTab] = useState("plan");
   const [g, setG] = useState(DEFAULT_G);
+  const [wTotal, setWtotal] = useState(null);   // (rev 58) 1-story seismic W_total lifted from PlanSketcher; null in 2-Story (pending)
   const setGl = (key, val) => setG((p) => ({ ...p, [key]: val }));
 
   const mkSeg = (length, roofTrib) => ({ ...SEG_DEFAULTS, length, roofTrib });
@@ -4899,6 +5010,7 @@ export default function App() {
         </div>
         <div style={{ padding:"8px 20px 28px" }}>
           <DesignTab g={g} shape={designShape} lines={designLines} linesByFloor={designLinesByFloor}
+                     wTotal={wTotal}
                      segsByLine={segsByLine} setSegsByLine={setSegsByLine} ovSet={ovSet}
                      d={d} setDk={setDk} applyToCalc={applyToCalc} setGl={setGl}
                      selLine={selLine} setSelLine={setSelLine}
@@ -5043,7 +5155,8 @@ export default function App() {
       <input ref={fileInputRef} type="file" accept=".wps,.json" style={{display:"none"}} onChange={onFileChosen}/>
       <div style={{ display: tab==="plan" ? "block" : "none" }}>
         <PlanSketcher onDesignShearWalls={onDesignShearWalls} fileOps={fileOps} registerProject={registerProject}
-                      twoStory={twoStory} setTwoStory={setTwoStory} activeFloor={activeFloor} setActiveFloor={setActiveFloor}/>
+                      twoStory={twoStory} setTwoStory={setTwoStory} activeFloor={activeFloor} setActiveFloor={setActiveFloor}
+                      g={g} setGl={setGl} setWtotal={setWtotal}/>
       </div>
       {tab === "design" && designSheet}
       {tab === "calc" && calcSheetPage}
