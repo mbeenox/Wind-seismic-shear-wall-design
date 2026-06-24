@@ -15,7 +15,7 @@ import {
 //   • APP_VERSION (here)      — human-facing build number in the UI ("Version 1.00").
 //   • CURRENT_VERSION (~below)— save-file SCHEMA version; drives .wps migrations. Do NOT couple.
 //   • handoff "rev" number    — the dev changelog in PLAN_SKETCHER_SUITE_HANDOFF.md.
-const APP_BUILD = 134;                                                                 // +1 per release
+const APP_BUILD = 135;                                                                 // +1 per release
 const APP_VERSION = `${Math.floor(APP_BUILD / 100)}.${String(APP_BUILD % 100).padStart(2, "0")}`;  // "1.00"
 
 // ── geometry space: 1 unit = 1 ft ──────────────────────────────────────────
@@ -1441,11 +1441,88 @@ function DLTributaryWindow({ wprops, twoStory, activeFloor, oneStory, onSet, onC
   );
 }
 
+// (rev 56) GLOBAL INPUTS — define wall/parapet height + wind pressures once and apply them to EVERY
+// wall in the model, so a building with uniform walls doesn't need a section cut per wall. Opened from
+// a side-panel button. The fields map onto the existing per-wall props (no new data-model field):
+//   1-Story:  Wall Height→H · Parapet Height→par · Wall Pressure→pw · Windward/Leeward parapet→qWind/qLee
+//   2-Story:  1st/2nd Wall Height→H/H2 · Wall/Windward/Leeward pressures→pw/qWind/qLee · and the two
+//             parapet heights route by level — 1st-Level→par on walls tagged 1-story, 2nd-Level→par on
+//             the full-height (2-story) walls (each physical wall still has exactly ONE `par`). Apply
+//             writes wallProps for all edges; everything downstream (loads, reactions, section cuts,
+//             design handoff) is already reactive to wallProps, so no engine touch. Seed values are the
+//             building-wide consensus per field (uniform → that value; mixed → the default).
+function GlobalInputsWindow({ seed, twoStory, hasOneStory, onApply, onClose }) {
+  const [buf, setBuf] = React.useState(()=>{
+    const s = {}; for(const k of Object.keys(seed)) s[k] = String(seed[k]); return s;
+  });
+  const write = (w, raw)=> setBuf(b=>({ ...b, [w]: raw }));
+  const inputS = { width:96, padding:"6px 8px", border:"1px solid var(--line)", borderRadius:4,
+                   fontSize:13, textAlign:"right", color:"var(--ink)" };
+  const subH   = { fontSize:11, fontWeight:800, letterSpacing:".04em", textTransform:"uppercase",
+                   color:"var(--muted)", margin:"2px 0 9px" };
+  // [key, label, unit, step, hint]
+  const heightFields = twoStory
+    ? [["H",   "1st Level Wall Height",    "ft", 0.5, null],
+       ["H2",  "2nd Level Wall Height",    "ft", 0.5, null],
+       ["par1","1st Level Parapet Height", "ft", 0.5, hasOneStory ? "Applied to walls tagged 1-story" : "Applied to walls tagged 1-story (none yet)"],
+       ["par2","2nd Level Parapet Height", "ft", 0.5, "Applied to the full-height 2-story walls"]]
+    : [["H",   "Wall Height",    "ft", 0.5, null],
+       ["par1","Parapet Height", "ft", 0.5, null]];
+  const pressureFields = [
+    ["pw",    "Wall Pressure",              "psf", 1, null],
+    ["qWind", "Windward Parapet Pressure",  "psf", 1, null],
+    ["qLee",  "Leeward Parapet Pressure",   "psf", 1, null],
+  ];
+  const FieldRows = (rows)=> rows.map(([w,label,unit,step,hint])=>(
+    <div key={w} style={{ marginBottom:10 }}>
+      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", gap:10 }}>
+        <label style={{ fontSize:13, fontWeight:600, color:"var(--ink)" }}>{label}</label>
+        <div style={{ display:"flex", alignItems:"center", gap:6 }}>
+          <input type="number" step={step} min={0} value={buf[w] ?? ""}
+                 onChange={(e)=>write(w, e.target.value)} style={inputS}/>
+          <span style={{ fontSize:12, color:"var(--muted)", width:26 }}>{unit}</span>
+        </div>
+      </div>
+      {hint && <div style={{ fontSize:10.5, color:"var(--muted)", marginTop:2, lineHeight:1.35 }}>{hint}</div>}
+    </div>
+  ));
+  return (
+    <div className="ovl" onPointerDown={(e)=>{ if(e.target.classList.contains("ovl")) onClose(); }}>
+      <div className="win" style={{ width:"min(420px,97vw)" }}>
+        <div className="win-h">
+          <div className="win-t">Global Inputs{twoStory ? " — 2-Story" : ""}</div>
+          <button className="win-x" onClick={onClose} title="Close">×</button>
+        </div>
+        <div className="win-b">
+          <div style={{ fontSize:11, color:"var(--muted)", marginBottom:14, lineHeight:1.45 }}>
+            Set wall height, parapet height, and wind pressures for the whole building at once. Applying
+            overwrites these fields on every wall — open a section cut afterward to fine-tune one wall.
+            {twoStory && <> Parapet heights route by level: the 1st-Level value goes to walls tagged <b>1-story</b>, the 2nd-Level value to the full-height 2-story walls.</>}
+          </div>
+          <div style={subH}>Wall &amp; parapet heights</div>
+          {FieldRows(heightFields)}
+          <div style={{ ...subH, marginTop:14 }}>Wind pressures</div>
+          {FieldRows(pressureFields)}
+          <div style={{ display:"flex", gap:8, marginTop:14, paddingTop:12, borderTop:"1px solid var(--line)" }}>
+            <button onClick={onClose}
+              style={{ flex:"0 0 auto", padding:"8px 14px", border:"1px solid var(--line)", background:"#FFFFFF",
+                       color:"var(--ink)", borderRadius:4, fontWeight:600, cursor:"pointer" }}>Cancel</button>
+            <button onClick={()=>onApply(buf)}
+              style={{ flex:1, padding:"8px 14px", border:"1.5px solid var(--accent)", background:"var(--accent)",
+                       color:"#FFFFFF", borderRadius:4, fontWeight:700, cursor:"pointer" }}>Apply to all walls</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, setTwoStory, activeFloor, setActiveFloor }) {
   const [graph,    setGraph]    = useState(INIT.graph);
   const [selected, setSelected] = useState(null);
   const [menu,     setMenu]     = useState(null);
   const [dlEdit,   setDlEdit]   = useState(null);   // (rev 49) edge key whose DL-tributary window is open, or null
+  const [globalInputs,setGlobalInputs]=useState(null); // (rev 56) Global Inputs window: null = closed; {H,H2,par1,par2,pw,qWind,qLee} seed = open
   const [dimEdit,  setDimEdit]  = useState(null);
   const [sections, setSections] = useState({h:null, v:null}); // {axis,sign} per orientation
   const [wallProps,setWallProps]= useState({});      // edge key -> {H,pw,qWind,qLee,parW,parL}
@@ -2106,6 +2183,50 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
     const p = propsFor(key);
     return 0.5*(p.pw||0)*((p.H||0)+(p.H2||0));
   },[propsFor]);
+  // (rev 56) GLOBAL INPUTS — open seeds each field from the building-wide CONSENSUS: if every relevant
+  // wall already shares a value, show it; if walls differ (or there are none), fall back to the default.
+  // par1/par2 are seeded from walls tagged 1-story / 2-story respectively (in 2-story mode), so reopening
+  // reflects what's actually applied.
+  const openGlobalInputs = useCallback(()=>{
+    const D = DEF_SECTION;
+    const keys = graphRef.current.edges.map(keyOf);
+    const oneKeys = keys.filter(k=>oneStory.has(k));
+    const twoKeys = keys.filter(k=>!oneStory.has(k));
+    const cons = (get, ks)=>{                       // common value across ks, else null
+      let v=null, first=true;
+      for(const k of ks){ const val=get(propsFor(k)); if(first){ v=val; first=false; } else if(val!==v) return null; }
+      return first ? null : v;
+    };
+    setGlobalInputs({
+      H:     cons(p=>p.H,     keys)                       ?? D.H,
+      H2:    cons(p=>p.H2,    keys)                       ?? D.H,            // H2 default mirrors H
+      par1:  cons(p=>p.par,   twoStory ? oneKeys : keys)  ?? D.par,
+      par2:  cons(p=>p.par,   twoKeys)                    ?? D.par,
+      pw:    cons(p=>p.pw,    keys)                       ?? D.pw,
+      qWind: cons(p=>p.qWind, keys)                       ?? D.qWind,
+      qLee:  cons(p=>p.qLee,  keys)                       ?? D.qLee,
+    });
+  },[propsFor, oneStory, twoStory]);
+  // Apply the entered values to EVERY wall's props in one setState. 1-story mode leaves H2 untouched
+  // (there is no 2nd level); 2-story mode sets H + H2 on all walls and routes the parapet height by the
+  // 1-story tag. Spreading the current entry first preserves per-wall DL tributary + any other fields.
+  const applyGlobalInputs = useCallback((vals)=>{
+    const num = (s)=> Math.max(0, parseFloat(s)||0);
+    const H=num(vals.H), H2=num(vals.H2), pw=num(vals.pw), qWind=num(vals.qWind), qLee=num(vals.qLee);
+    const par1=num(vals.par1), par2=num(vals.par2);
+    setWallProps(prev=>{
+      const next={...prev};
+      for(const e of graphRef.current.edges){
+        const k=keyOf(e);
+        const cur = next[k] || DEF_SECTION;
+        next[k] = twoStory
+          ? { ...cur, H, H2, par:(oneStory.has(k) ? par1 : par2), pw, qWind, qLee }
+          : { ...cur, H,      par:par1,                            pw, qWind, qLee };
+      }
+      return next;
+    });
+    setGlobalInputs(null);
+  },[twoStory, oneStory]);
   const toggleSupport = useCallback((edge)=>{
     const k=keyOf(edge);
     setNoSupport(s=>{ const n=new Set(s); n.has(k)?n.delete(k):n.add(k); return n; });
@@ -2602,6 +2723,17 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
             <div className="row"><span>Enclosed area</span><b>{loop?Math.round(loop.area):"—"}{loop&&<small>ft²</small>}</b></div>
           </div>
 
+          <div className="card">
+            <h4>Global Inputs</h4>
+            <p className="hint" style={{marginTop:0,marginBottom:8}}>
+              Set wall height, parapet height, and wind pressures for every wall at once{twoStory?" (per level in 2-Story mode)":""}.
+            </p>
+            <button className="btn" style={{width:"100%",fontWeight:700}}
+              disabled={graph.edges.length===0}
+              title={graph.edges.length===0 ? "Draw at least one wall first" : "Apply wall/parapet heights and pressures to the whole building"}
+              onClick={openGlobalInputs}>⚙ Global inputs…</button>
+          </div>
+
           {(secH||secV)&&(
             <div className="card">
               <h4>Wind Line Loads</h4>
@@ -2681,6 +2813,12 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
         <DLTributaryWindow key={dlEdit+"|"+activeFloor+"|"+(isOneStory(dlEdit)?"1s":"2s")} wprops={propsFor(dlEdit)}
                     twoStory={twoStory} activeFloor={activeFloor} oneStory={isOneStory(dlEdit)}
                     onSet={(patch)=>setVals(dlEdit, patch)} onClose={()=>setDlEdit(null)}/>
+      )}
+
+      {globalInputs&&(
+        <GlobalInputsWindow key={twoStory?"gi2":"gi1"} seed={globalInputs} twoStory={twoStory}
+                    hasOneStory={oneStory.size>0}
+                    onApply={applyGlobalInputs} onClose={()=>setGlobalInputs(null)}/>
       )}
     </div>
   );
