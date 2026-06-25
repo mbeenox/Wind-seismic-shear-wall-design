@@ -15,7 +15,7 @@ import {
 //   • APP_VERSION (here)      — human-facing build number in the UI ("Version 1.00").
 //   • CURRENT_VERSION (~below)— save-file SCHEMA version; drives .wps migrations. Do NOT couple.
 //   • handoff "rev" number    — the dev changelog in PLAN_SKETCHER_SUITE_HANDOFF.md.
-const APP_BUILD = 142;                                                                 // +1 per release
+const APP_BUILD = 143;                                                                 // +1 per release
 const APP_VERSION = `${Math.floor(APP_BUILD / 100)}.${String(APP_BUILD % 100).padStart(2, "0")}`;  // "1.00"
 
 // ── geometry space: 1 unit = 1 ft ──────────────────────────────────────────
@@ -23,7 +23,7 @@ const VB_W = 100, VB_H = 75, GRID = 5, PAD = 2;
 const WORLD = 4000;            // plan coords may span -WORLD..+WORLD (origin is arbitrary)
 // pick a "nice" grid step so a plan of any size shows a sensible number of lines
 const niceStep = (span) => {
-  const steps=[1,2,5,10,25,50,100,250,500,1000];
+  const steps=[0.5,1,2,5,10,25,50,100,250,500,1000];   // rev 64: 0.5 ft is now the finest grid/snap increment (was 1 ft)
   const target=span/22;        // aim for ~22 divisions across the view
   for(const s of steps) if(s>=target) return s;
   return 1000;
@@ -45,6 +45,7 @@ const same    = (e1,e2)   => e1 && e2 && e1.a===e2.a && e1.b===e2.b;
 const keyOf   = (e)       => `${e.a}-${e.b}`;
 const fmt1    = (n)       => Math.round(n*10)/10;
 const fmt2    = (n)       => Math.round(n*100)/100;
+const fmtHalf = (n)       => Math.round(n*2)/2;   // rev 64: snap a dimension label to the nearest 0.5 ft (e.g. 10.5)
 // text rotation that keeps labels parallel to a wall and upright (-90..90]
 const wallAng = (dx,dy)=>{ let a=Math.atan2(dy,dx)*180/Math.PI; a=((a+90)%180+180)%180-90; return a; };
 // (rev 57) SEISMIC EFFECTIVE WEIGHT — 1-STORY.  W_total = roof + walls (lbs).
@@ -159,6 +160,19 @@ const segInt = (p1,p2,p3,p4) => {
   const u=((p3.x-p1.x)*d1y-(p3.y-p1.y)*d1x)/den;
   if (t<-1e-6||t>1+1e-6||u<-1e-6||u>1+1e-6) return null;
   return { pt:{x:p1.x+t*d1x, y:p1.y+t*d1y}, t };
+};
+
+// (rev 64) Foot of the perpendicular from point p onto the segment a–b.
+//   t  = parameter along a→b (UNclamped: 0..1 means the foot lies on the body; ≤0 / ≥1 means
+//        it falls beyond an endpoint — the caller rejects those so we only split the body).
+//   dist = perpendicular distance from p to the infinite line (the value the caller compares to
+//        the snap tolerance; meaningful exactly when 0<t<1, which is the only case we accept).
+const projToSeg = (p, a, b) => {
+  const dx=b.x-a.x, dy=b.y-a.y, L2=dx*dx+dy*dy;
+  if(L2<1e-12) return { pt:{x:a.x,y:a.y}, t:0, dist:Math.hypot(p.x-a.x,p.y-a.y) };
+  const t=((p.x-a.x)*dx+(p.y-a.y)*dy)/L2;
+  const fx=a.x+t*dx, fy=a.y+t*dy;
+  return { pt:{x:fx,y:fy}, t, dist:Math.hypot(p.x-fx,p.y-fy) };
 };
 
 // outermost two walls a cut line crosses → {front,back} each {edge,pt} (front = lower t)
@@ -695,7 +709,7 @@ const CSS = `
 .storyopt.on{color:var(--accent);}
 /* Floor selector — its own bar directly BELOW the drawing area (never over the canvas, so clicks land). */
 .canvascol{display:flex;flex-direction:column;min-width:0;}
-.floorbar{display:flex;justify-content:center;margin-top:8px;}
+.floorbar{display:flex;justify-content:center;margin-bottom:8px;}   /* rev 64: switcher moved ABOVE the canvas */
 .floorsel{display:inline-flex;border:1.5px solid var(--ink);border-radius:4px;overflow:hidden;background:#FFFFFF;
   box-shadow:4px 4px 0 rgba(28,39,51,.10);font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;}
 .floorbar.off .floorsel{opacity:.5;border-color:var(--line);box-shadow:none;}
@@ -1959,6 +1973,43 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
     setSelected(id);
   },[snap,snapshot]);
 
+  // ── (rev 64) AUTO-SPLIT on a T-intersection ──
+  // When a dragged node is dropped on the BODY of another wall, bind it there: snap the node
+  // exactly onto that wall, split the wall into two segments at the node, and carry the wall's
+  // per-edge state (support flag, 1-story tag, section props) onto BOTH halves. The node then
+  // joins all three walls, so moving it later drags the split wall with it. Mirrors splitWall's
+  // three-way propagation, but the split vertex is the EXISTING dragged node (not a fresh id), so
+  // the incoming wall stays attached. No extra snapshot() — the drag already pushed one history
+  // entry, so a single undo reverts the whole drag-and-bind gesture.
+  const bindNodeToWall = useCallback((nodeId)=>{
+    const g=graphRef.current;
+    const node=g.nodes.find(n=>n.id===nodeId);
+    if(!node) return;
+    const tol=2.4*SRef.current;          // same pick radius the draw tool uses for node snapping
+    let best=null;
+    for(const e of g.edges){
+      if(e.a===nodeId||e.b===nodeId) continue;      // can't split a wall this node already joins
+      const a=g.nodes.find(n=>n.id===e.a), b=g.nodes.find(n=>n.id===e.b);
+      if(!a||!b) continue;
+      const pr=projToSeg(node,a,b);
+      if(pr.t<=1e-3||pr.t>=1-1e-3) continue;         // foot must be on the body, not at an endpoint
+      if(pr.dist>tol) continue;
+      if(!best||pr.dist<best.dist) best={edge:e, pt:pr.pt, dist:pr.dist};
+    }
+    if(!best) return;
+    const e1=norm(best.edge.a,nodeId), e2=norm(nodeId,best.edge.b);
+    if(same(e1,e2)) return;                          // degenerate guard (excluded by the t test anyway)
+    const nodes=g.nodes.map(n=>n.id===nodeId?{...n,x:best.pt.x,y:best.pt.y}:n);
+    let edges=g.edges.filter(e=>!same(e,best.edge));
+    if(!edges.some(e=>same(e,e1))) edges=[...edges,e1];
+    if(!edges.some(e=>same(e,e2))) edges=[...edges,e2];
+    setGraph({nodes,edges});
+    const pk=keyOf(best.edge), k1=keyOf(e1), k2=keyOf(e2);
+    setNoSupport(s=>{ if(!s.has(pk)) return s; const n=new Set(s); n.delete(pk); n.add(k1); n.add(k2); return n; });
+    setOneStory(s=>{ if(!s.has(pk)) return s; const n=new Set(s); n.delete(pk); n.add(k1); n.add(k2); return n; });
+    setWallProps(m=>{ if(!m[pk]) return m; const v=m[pk]; const n={...m}; n[k1]={...v}; n[k2]={...v}; delete n[pk]; return n; });
+  },[]);
+
   const connectTo = useCallback((fromId, toId)=>{
     if(graphRef.current.edges.some(e=>same(e,norm(fromId,toId)))) return;
     snapshot();
@@ -2169,7 +2220,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
     svgRef.current?.releasePointerCapture?.(e.pointerId);
     if(panRef.current){ panRef.current=null; setPanCursor(false); return; }    // end pan (no thaw — pan doesn't freeze)
     thawView();
-    if(nodeDrag.current){ nodeDrag.current=null; return; }
+    if(nodeDrag.current){ const nd=nodeDrag.current; nodeDrag.current=null; if(nd.moved) bindNodeToWall(nd.id); return; }
     if(wallDrag.current){ wallDrag.current=null; return; }
     if(secDraw.current){
       const sd=secDraw.current; secDraw.current=null; setDraft(null);
@@ -2203,7 +2254,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
         }
       }
     }
-  },[toUser,thawView]);
+  },[toUser,thawView,bindNodeToWall]);
 
   const onLeave = useCallback(e=>{ onUp(e); },[onUp]);
 
@@ -2229,7 +2280,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
     const m=svgRef.current.getScreenCTM();
     const mx=(a.x+b.x)/2, my=(a.y+b.y)/2;
     const sx=m.a*mx+m.c*my+m.e, sy=m.b*mx+m.d*my+m.f;
-    setDimEdit({edge, moveEnd, px:sx-r.left, py:sy-r.top-18, val:String(Math.round(dist(a,b)))});
+    setDimEdit({edge, moveEnd, px:sx-r.left, py:sy-r.top-18, val:String(fmtHalf(dist(a,b)))});
     setMenu(null);
   },[toUser,placeDrawPoint]);
 
@@ -2707,8 +2758,18 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
 
       <div className="layout">
         <div className="canvascol">
+        {/* ── PLAN SELECTOR — directly ABOVE the drawing area (outside the canvas, so clicks never hit the SVG). Greyed/disabled until 2-Story is on. ── */}
+        <div className={"floorbar"+(twoStory?"":" off")}>
+          <div className="floorsel"
+               title={twoStory?"Choose which plan to view":"Turn on 2 Story (top toolbar) to enable plan switching"}>
+            <button className={"floortab"+(activeFloor===1?" act":"")} disabled={!twoStory}
+                    onClick={()=>twoStory&&setActiveFloor(1)}>Level 1</button>
+            <button className={"floortab"+(activeFloor===2?" act":"")} disabled={!twoStory}
+                    onClick={()=>twoStory&&setActiveFloor(2)}>Level 2</button>
+          </div>
+        </div>
         <div className="stage" ref={stageRef}>
-          {twoStory && (<div className="floorbadge">Floor {activeFloor} <span>plan</span></div>)}
+          {twoStory && (<div className="floorbadge">Level {activeFloor} <span>Plan</span></div>)}
           {allOneStory && (<div className="allonestory-warn">⚠ All walls are 1-story — the 2nd floor has no walls.</div>)}
           <svg ref={svgRef} className="cvs" style={drawMode?{cursor:"crosshair"}:(panMode||panCursor)?{cursor:panCursor?"grabbing":"grab"}:undefined}
                viewBox={`${view.x} ${view.y} ${view.w} ${view.h}`}
@@ -2820,7 +2881,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
               const editing=dimEdit&&same(dimEdit.edge,ed);
               return(
                 <g key={`d${ed.a}-${ed.b}`} style={{cursor:panMode?"grab":"text"}} onPointerDown={e=>{ if(panMode&&e.button===0){ beginPan(e); return; } e.stopPropagation(); }} onClick={e=>onDimClick(ed,e)}>
-                  <Tag x={mx} y={my} text={`${Math.round(L)}'`} box={editing?"#9A6B1F":C_DIMBOX} S={S} ts={markScale} rot={isV?-90:0}/>
+                  <Tag x={mx} y={my} text={`${fmtHalf(L)}'`} box={editing?"#9A6B1F":C_DIMBOX} S={S} ts={markScale} rot={isV?-90:0}/>
                 </g>
               );
             })}
@@ -2875,7 +2936,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
 
           {dimEdit&&(
             <div ref={dimWrapRef} className="dim-input-wrap" style={{left:dimEdit.px,top:dimEdit.py}}>
-              <input className="dim-inp" type="number" min="1" value={dimEdit.val} autoFocus
+              <input className="dim-inp" type="number" min="0.5" step="0.5" value={dimEdit.val} autoFocus
                      onChange={e=>setDimEdit(d=>({...d,val:e.target.value}))}
                      onKeyDown={e=>{ if(e.key==="Enter"){applyWallLength(dimEdit.edge,parseFloat(dimEdit.val),dimEdit.moveEnd);} if(e.key==="Escape"){setDimEdit(null);} }}/>
               <span className="dim-unit">ft</span>
@@ -2883,16 +2944,6 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
           )}
         </div>{/* /stage */}
 
-        {/* ── FLOOR SELECTOR — directly BELOW the drawing area (outside the canvas, so clicks never hit the SVG). Greyed/disabled until 2-Story is on. ── */}
-        <div className={"floorbar"+(twoStory?"":" off")}>
-          <div className="floorsel"
-               title={twoStory?"Choose which floor to view":"Turn on 2 Story (top toolbar) to enable floor switching"}>
-            <button className={"floortab"+(activeFloor===1?" act":"")} disabled={!twoStory}
-                    onClick={()=>twoStory&&setActiveFloor(1)}>1st Floor</button>
-            <button className={"floortab"+(activeFloor===2?" act":"")} disabled={!twoStory}
-                    onClick={()=>twoStory&&setActiveFloor(2)}>2nd Floor</button>
-          </div>
-        </div>
         </div>{/* /canvascol */}
 
         {/* side panel */}
