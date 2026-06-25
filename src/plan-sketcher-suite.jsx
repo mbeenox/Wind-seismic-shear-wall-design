@@ -15,7 +15,7 @@ import {
 //   • APP_VERSION (here)      — human-facing build number in the UI ("Version 1.00").
 //   • CURRENT_VERSION (~below)— save-file SCHEMA version; drives .wps migrations. Do NOT couple.
 //   • handoff "rev" number    — the dev changelog in PLAN_SKETCHER_SUITE_HANDOFF.md.
-const APP_BUILD = 140;                                                                 // +1 per release
+const APP_BUILD = 141;                                                                 // +1 per release
 const APP_VERSION = `${Math.floor(APP_BUILD / 100)}.${String(APP_BUILD % 100).padStart(2, "0")}`;  // "1.00"
 
 // ── geometry space: 1 unit = 1 ft ──────────────────────────────────────────
@@ -2469,6 +2469,24 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
   // `byFloor`. The actual push (runDesignHandoff) calls it then hands off; the live signature
   // memo calls it on every relevant plan change to detect divergence. (Not a guarded engine fn.)
   const computeHandoff = useCallback(()=>{
+    // rev 62: per-line SEISMIC reaction (1-story). The seismic base shear V = Cs·W_total is distributed
+    // on the full plan EXACTLY as the rev-59 Plan-tab Seismic view, but computed here UNCONDITIONALLY —
+    // independent of the Wind/Seismic view toggle AND the active floor — so each design line carries its
+    // own seismic demand even while the canvas shows wind. vSeismic is the post-R reduced base shear
+    // (rev 61), so the reaction feeds the engine directly (engine applies ×0.7 and envelopes W vs S).
+    // 2-story per-floor seismic (F_roof/F_floor) is rev 63 → forceLbsSeismic stays 0 in 2-Story for now.
+    const seisByKey = {};
+    if(!twoStory && loop){
+      const Vseis = (Number(g&&g.Cs)||0) * (sw ? sw.Wtotal : 0);
+      if(Vseis>0){
+        const wX = seisExtent.dy>0 ? Vseis/seisExtent.dy : 0;   // force-X plf on the Y-running faces
+        const wY = seisExtent.dx>0 ? Vseis/seisExtent.dx : 0;   // force-Y plf on the X-running faces
+        const sH = buildSecData({axis:"h",sign:-1}, graph, loop, isSup, propsFor, { base:()=>wX, lee:()=>0 });
+        const sV = buildSecData({axis:"v",sign:-1}, graph, loop, isSup, propsFor, { base:()=>wY, lee:()=>0 });
+        (sH ? sH.reactions : []).forEach(rr=>{ if(rr.kips>0) seisByKey["h|"+rr.key]=rr.kips*1000; });
+        (sV ? sV.reactions : []).forEach(rr=>{ if(rr.kips>0) seisByKey["v|"+rr.key]=rr.kips*1000; });
+      }
+    }
     // Build the design lines for ONE floor: re-run the frozen wind engine with that floor's effective
     // wall height (same substitution as propsForActive), and tag each line with the floor's DESIGN
     // height (floor 2 walls are H₂ tall, floor 1 walls are H tall) and its reaction.
@@ -2514,6 +2532,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
           const floorTrib = f2 ? (wp.floorTrib2 ?? wp.floorTrib) : wp.floorTrib;
           lines.push({ id:ax+"|"+r.key, key:r.key, windAxis:ax, o, a, b,
                        lengthFt:hi-lo, heightFt:Hmax||13, forceLbs:r.kips*1000,
+                       forceLbsSeismic: seisByKey[ax+"|"+r.key] || 0,   // rev 62: per-line seismic demand (1-story; 0 in 2-Story until rev 63)
                        roofTrib, floorTrib });
         });
       });
@@ -2559,7 +2578,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
         return u ? { ...l, id:u.id, key:u.key, a:u.a, b:u.b, lengthFt:u.lengthFt } : l; });
     }
     return byFloor;
-  },[sections, graph, loop, isSup, propsFor, twoStory, twoStoryGraph, twoStoryLoop, oneStory, isOneStory]);
+  },[sections, graph, loop, isSup, propsFor, twoStory, twoStoryGraph, twoStoryLoop, oneStory, isOneStory, g, sw, seisExtent]);
 
   // Live signature of what a push WOULD send right now. Recomputes whenever any handoff input
   // changes (computeHandoff's identity changes with its deps). Pure-view edits (zoom, markup
@@ -3271,7 +3290,7 @@ const WARN = "\u26A0\uFE0E ";
 function optimizeSig(linesByFloor, lines, twoStory, g, d){
   const f1 = (linesByFloor && linesByFloor[1]) || (twoStory ? [] : (lines || [])) || [];
   const f2 = (twoStory && linesByFloor && linesByFloor[2]) || [];
-  const key = (l) => [l.id, Math.round(l.forceLbs || 0), l.heightFt, l.lengthFt, l.roofTrib, l.floorTrib];
+  const key = (l) => [l.id, Math.round(l.forceLbs || 0), Math.round(l.forceLbsSeismic || 0), l.heightFt, l.lengthFt, l.roofTrib, l.floorTrib];
   const gKey = { ...(g || {}) }; delete gKey.wWind; delete gKey.line;
   return JSON.stringify({ f1: f1.map(key), f2: f2.map(key), g: gKey, d: d || {} });
 }
@@ -3858,7 +3877,7 @@ const hdCapacity = (name) => { const m = HD_TABLE.find(h => name.endsWith(h.name
 
 // evaluate one line's segments through the engine (auto type unless overridden)
 function lineResults(line, segs, g, d) {
-  const gL = { ...g, wWind: line.forceLbs };
+  const gL = { ...g, wWind: line.forceLbs, vSeismic: line.forceLbsSeismic || 0 };  // rev 62: per-line seismic demand (post-R reduced reaction, fed like wWind; engine envelopes W vs S)
   const totalL = segs.reduce((a, s) => a + s.length, 0);
   return segs.map((s) => {
     // (rev 49) DL tributary now rides on the LINE (per wall, per floor — set in runDesignHandoff from
@@ -4107,6 +4126,36 @@ function SwScheduleRef({ grade }) {
 
 // Wall mark letters: A..Z, AA, AB, … assigned in line order then segment order
 const letterOf = (k) => { let s = ""; k += 1; while (k > 0) { k -= 1; s = String.fromCharCode(65 + (k % 26)) + s; k = Math.floor(k / 26); } return s; };
+
+// rev 62 — per-element GOVERNING CASE (Wind vs Seismic), pure display derivation. The engine already
+// envelopes both cases per element (calcSegment: type=max(sugS,sugW); maxComp/maxUplift/reqFtgLen via
+// xMax). These helpers just read which case drove each element so the Design table can tag it. They
+// touch NO guarded fn — same out-of-engine pattern as withUtil. Return "W"/"S" or null (neither acts).
+const _govShearCase = (r, grade) => {
+  if (!r || !isNum(r.selType)) return null;
+  const t = schedFor(grade)[Math.max(0, Math.min(2, r.selType - 1))];
+  const uW = t.wind ? r.vW / t.wind : 0;
+  const uS = (r.factor * t.seismic) ? r.vS / (r.factor * t.seismic) : 0;
+  if (uW <= 0 && uS <= 0) return null;
+  return uS > uW ? "S" : "W";
+};
+const _govBy = (s, w) => {            // larger demand governs; both ≤0 → no tag ("neglect"/non-numbers → 0)
+  const ns = isNum(s) ? s : 0, nw = isNum(w) ? w : 0;
+  if (ns <= 0 && nw <= 0) return null;
+  return ns > nw ? "S" : "W";
+};
+function CaseTag({ which }) {
+  if (!which) return null;
+  const seis = which === "S";
+  return (
+    <span title={seis ? "Seismic governs this element" : "Wind governs this element"}
+      style={{ display:"inline-block", marginLeft:6, verticalAlign:"middle", fontFamily:MONO, fontSize:9,
+               fontWeight:700, lineHeight:1, padding:"2px 4px", borderRadius:3,
+               color: seis ? SW.amber : SW.accent,
+               background: seis ? SW.amberSoft : SW.accentSoft,
+               border:`1px solid ${seis ? SW.amber : SW.accent}` }}>{which}</span>
+  );
+}
 
 // ---------- the plan canvas ----------
 function DesignPlan({ shape, lines, segsByLine, setSegsByLine, resultsByLine, selLine, setSelLine, snap, maxSegLen, onCtx, marks, showTags }) {
@@ -4407,8 +4456,8 @@ function DesignTab({ g, setGl, shape, lines, linesByFloor, segsByLine, setSegsBy
         label = `${fmt(l1.forceLbs/1000,1)}k/${fmt(Math.min(l1.lengthFt,l2.lengthFt),0)}′ stacked line`;
       } else {                                 // 1-story-only / single-story → standalone
         const ln = l1 || l2;
-        out = generateDesign({ ...g, wWind: ln.forceLbs }, { ...d, lineLength: ln.lengthFt, height: ln.heightFt,
-                               roofTrib: ln.roofTrib ?? d.roofTrib, floorTrib: ln.floorTrib ?? d.floorTrib });  // (rev 49) per-wall trib
+        out = generateDesign({ ...g, wWind: ln.forceLbs, vSeismic: ln.forceLbsSeismic || 0 }, { ...d, lineLength: ln.lengthFt, height: ln.heightFt,
+                               roofTrib: ln.roofTrib ?? d.roofTrib, floorTrib: ln.floorTrib ?? d.floorTrib });  // (rev 49) per-wall trib · (rev 62) per-line seismic
         label = `${fmt(ln.forceLbs/1000,1)}k/${fmt(ln.lengthFt,0)}′ line`;
       }
       if(out){ next[id]=out.segs.map(s=>({...s})); okCount++; }
@@ -4517,11 +4566,14 @@ function DesignTab({ g, setGl, shape, lines, linesByFloor, segsByLine, setSegsBy
             <PinCard title="Seismic" cols={2}>
               <PinRow label="Cs"><span style={{fontSize:12,fontWeight:600}}>{g.Cs ?? 0}</span></PinRow>
               <PinRow label="V = Cs·W" unit="lbs"><span style={{fontSize:12,fontWeight:700,color:SW.accent}}>{wTotal!=null ? Math.round((Number(g.Cs)||0)*wTotal).toLocaleString() : "—"}</span></PinRow>
-              {/* (rev 59) Cs is now an INPUT on the Plan tab (side panel → Dead Loads, with the dead loads);
-                  shown here READ-ONLY alongside the resulting design base shear V = Cs·W_total. W_total is
-                  the 1-story seismic weight lifted from the Plan tab as `wTotal` (null in 2-Story → "—").
-                  The Roof/Floor/Wall DL inputs also live on the Plan tab; all values stay in shared `g`,
-                  so the Design/Calc uplift formula reads them exactly as before. */}
+              <PinRow label="S_DS"><input type="number" step={0.05} min={0} value={g.sds ?? 0} onChange={(e)=>setGl("sds",parseFloat(e.target.value)||0)} style={pinNumS}/></PinRow>
+              <PinRow label="R" unit="ref"><span style={{fontSize:12,fontWeight:600,color:SW.faint}}>{g.R}</span></PinRow>
+              {/* (rev 59) Cs is an INPUT on the Plan tab (side panel → Dead Loads); shown read-only here with
+                  the design base shear V = Cs·W_total (W_total lifted from the Plan tab as `wTotal`, "—" in 2-Story).
+                  (rev 61) g.vSeismic / g.R are now the post-R reduced convention — R is reference-only.
+                  (rev 62) S_DS is editable here (drives E_v on uplift/compression, B=0.6−0.14·S_DS); seismic is now
+                  applied PER LINE — each line carries its own seismic reaction from the plan, enveloped against wind
+                  by the engine. The per-line seismic shear + governing case show in the selected-line results below. */}
             </PinCard>
           </div>
           <div style={{ flex:"1.4 1 280px", minWidth:240 }}>
@@ -4556,7 +4608,7 @@ function DesignTab({ g, setGl, shape, lines, linesByFloor, segsByLine, setSegsBy
         </div>
       </div>
       <div style={{ fontSize:11, color:SW.faint, marginTop:6 }}>
-        Line force and wall height come from the Plan Sketcher (W<sub>WIND</sub> per line = its reaction). Seismic V, S<sub>DS</sub>, code &amp; species come from the Calculation sheet header; dead loads and sheathing grade are shared with it. Demand shear = line force ÷ total wall length on that line.
+        Line force and wall height come from the Plan Sketcher: W<sub>WIND</sub> per line = its wind reaction, and (rev 62) each line also carries its own <b>seismic</b> reaction (V = C<sub>s</sub>·W_total distributed on the plan) — the engine designs each line for the heavier of the two, per element. C<sub>s</sub> is set on the Plan tab; S<sub>DS</sub> (E_v) is editable here; code &amp; species come from the Calculation sheet; dead loads and sheathing grade are shared. Demand shear = line force ÷ total wall length on that line.
       </div>
 
       {genMsg && (
@@ -4618,7 +4670,7 @@ function DesignTab({ g, setGl, shape, lines, linesByFloor, segsByLine, setSegsBy
                   onClick={()=>applyToCalc(sel, selSegs, selRes, d, lineLabel(sel), selSegs.map((_,i)=>wallMarks[sel.id+"|"+i]))}>{calcStaleHint && WARN}Send line to calculation sheet →</button>
               </div>
             }>
-            Selected line — {lineNames[sel.id]} · {sel.windAxis==="h"?"E–W":"N–S"} wind · {fmt(sel.forceLbs/1000,2)}k · {fmt(sel.lengthFt,1)} ft · H {fmt(sel.heightFt,1)} ft
+            Selected line — {lineNames[sel.id]} · {sel.windAxis==="h"?"E–W":"N–S"} · wind {fmt(sel.forceLbs/1000,2)}k · seismic {fmt((sel.forceLbsSeismic||0)/1000,2)}k · {fmt(sel.lengthFt,1)} ft · H {fmt(sel.heightFt,1)} ft
           </SectionTitle>
           {selSegs.length === 0 ? (
             <div style={{ padding:20, border:`1px dashed ${SW.rule}`, borderRadius:8, color:SW.faint, fontSize:12 }}>
@@ -4664,7 +4716,7 @@ function DesignTab({ g, setGl, shape, lines, linesByFloor, segsByLine, setSegsBy
                   const bad = r.ovBad && r.ovBad.type;
                   return (
                     <span style={{ fontFamily:MONO, fontSize:12, color: bad ? SW.red : SW.ink }}>
-                      {NAIL_EDGE[r.selType]}
+                      {NAIL_EDGE[r.selType]}<CaseTag which={_govShearCase(r, g.grade)} />
                       <div style={{ fontSize:10, color: bad ? SW.red : SW.faint }}>
                         Type {r.selType}{bad ? ` — requires Type ${r.autoType}` : ""}
                       </div>
@@ -4681,14 +4733,13 @@ function DesignTab({ g, setGl, shape, lines, linesByFloor, segsByLine, setSegsBy
                     return <span style={{ fontFamily:MONO, fontSize:12, color:SW.accent, fontWeight:700 }}>{fmt(m/1000,1)}</span>;
                   }} />
                 )}
-                <Row label="End post" cells={selRes} render={(r) => <Chip v={r.ovBad&&r.ovBad.post?"NG!":r.dispPost} />} />
+                <Row label="End post" cells={selRes} render={(r) => <span><Chip v={r.ovBad&&r.ovBad.post?"NG!":r.dispPost} /><CaseTag which={_govBy(r.compS, r.compW)} /></span>} />
                 <Row label="Max uplift" unit="lbs" cells={selRes} render={(r) => <Chip v={r.maxUplift === 0 ? "—" : r.maxUplift} d={0} />} />
-                <Row label="Holdown" cells={selRes} render={(r) => <Chip v={r.ovBad&&r.ovBad.hd?"NG!":r.dispHd} />} />
+                <Row label="Holdown" cells={selRes} render={(r) => <span><Chip v={r.ovBad&&r.ovBad.hd?"NG!":r.dispHd} />{r.maxUplift>0 && <CaseTag which={_govBy(r.upHD_S, r.upHD_W)} />}</span>} />
                 <Row label="Anchor" cells={selRes} render={(r) => <Chip v={r.anchorSel} />} />
                 <Row label="Strap alternative" cells={selRes} render={(r) => <Chip v={r.altStrap} />} />
                 <Row label="Δ wind" unit="in" cells={selRes} render={(r) => <Chip v={isFinite(r.deflW) ? r.deflW : "—"} d={3} />} />
-                <Row label="Req. footing length" unit="ft" cells={selRes} render={(r) => <Chip v={isFinite(r.reqFtgLen) ? r.reqFtgLen : "—"} d={2} />} />
-                <Row label="Status" cells={selRes} render={(r) => <Chip v={r.failed ? "FAILED!!!" : "OK"} />} />
+                <Row label="Req. footing length" unit="ft" cells={selRes} render={(r) => <span><Chip v={isFinite(r.reqFtgLen) ? r.reqFtgLen : "—"} d={2} />{isFinite(r.reqFtgLen) && <CaseTag which={_govBy(r.LminS, r.LminW)} />}</span>} />                <Row label="Status" cells={selRes} render={(r) => <Chip v={r.failed ? "FAILED!!!" : "OK"} />} />
               </tbody>
             </table>
           </div>
@@ -4762,7 +4813,7 @@ const SEG_DEFAULTS= { length:0, height:15, roofTrib:10, floorTrib:0, hdDist:5, t
 // invented, so it is NOT in DEFAULT_LINE; a line missing geometry is filtered + flagged stale in
 // loadProject (it's regenerable from the saved plan). A PLACED shear-wall segment is { start, length,
 // ov? } — ov rides along in the spread and is already (s.ov||{})-tolerant downstream.
-const DEFAULT_LINE   = { lengthFt:0, heightFt:13, forceLbs:0 };
+const DEFAULT_LINE   = { lengthFt:0, heightFt:13, forceLbs:0, forceLbsSeismic:0 };
 const DEFAULT_PLACED = { start:0, length:0 };
 
 // Save-file schema version. WRITTEN by onSave and now READ by the loader (it used to be
