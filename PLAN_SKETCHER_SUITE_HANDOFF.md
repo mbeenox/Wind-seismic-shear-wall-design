@@ -366,6 +366,8 @@ for t in test_render_smoke test_ribbon_pin test_rev7 test_rev8_compact \
   node work/$t.cjs >/dev/null 2>&1 && echo "  $t OK" || { echo "  $t FAIL"; node work/$t.cjs; }
 done
 node work/test_str1_golden.mjs && node work/test_str1_design.mjs
+# rev 60/63 seismic goldens (need work/tests/exp_app.cjs + work/tests/sw_test.cjs — see §6b Step 2 + the new sources below):
+node work/tests/_test_seis2.cjs && node work/tests/_test_stackseg_golden.cjs
 
 # Engine guard: prove no UI edit changed the math.
 # ONE-TIME, before your first edit this session, snapshot the baseline (the app file alone is fine
@@ -415,6 +417,15 @@ PY
 # NOTE: refresh the baseline only when the user EXPLICITLY approves an engine/formula change,
 # i.e. after that change lands: cp the relevant current source over work/.engine-baseline.jsx
 # (or re-derive a fresh monolith baseline).
+# BASELINE STATUS (rev 63): re-snapshotted at rev 63 as `cat calcCore.js plan-sketcher-suite.jsx > work/.engine-baseline.jsx`.
+# THREE guarded fns have intentionally diverged from the original upload and are now GOLDEN-OUTPUT, not
+# byte-identity — their correctness is locked by the goldens, and the rev-63 baseline locks them forward:
+#   • calcSegment (rev 61, /R dropped)      → test_str1_golden.mjs (wind/DL; vSeismic 0 so unaffected) + the seismic convention
+#   • lineResults (rev 62, per-line vSeismic feed)  → covered by the Design-tab seismic wiring
+#   • stackSeg    (rev 63, upper-story DL + cumulative footing shear) → _test_stackseg_golden.cjs (exact + direction)
+# Verified rev 60→63: a guard run with the rev-60 upload as baseline showed EXACTLY these three changed; the
+# other 9 (generateDesign, evaluateCandidate, baseDesignSeg, lineReactions, buildSecData, findLeewardPartner,
+# stackedLineResults, upliftStk, withUtil) were byte-identical. 2-story distribution locked by _test_seis2.cjs.
 ```
 
 ### Step 4 — the test sources (write each verbatim to `work/<name>`)
@@ -719,6 +730,66 @@ process.exit(fail?1:0);
 ```
 </details>
 
+<details><summary><code>work/tests/_test_seis2.cjs</code> (rev 60/63 — 2-story seismic Section-B regression; needs the app-export bundle <code>exp_app.cjs</code>)</summary>
+
+```js
+// Build: cp the app to work/_exp_app.jsx, append `export { seismicWeight2Story, seismicDistribute2Story };`,
+// esbuild --bundle --format=cjs --external:react --external:react-dom → work/tests/exp_app.cjs
+const { seismicWeight2Story, seismicDistribute2Story } = require("./exp_app.cjs");
+let fail = 0; const ok = (n, c) => { console.log((c?"PASS":"FAIL")+": "+n); if(!c) fail++; };
+const close = (a, b, t=0.1) => Math.abs(a-b) <= t;
+// 60×39 rectangle, all walls 2-story; H 13 / H₂ 10 / par 6; roof DL 20 / floor DL 50 / wall DL 18; Cs 0.05
+const graph = { nodes:[{id:0,x:0,y:0},{id:1,x:60,y:0},{id:2,x:60,y:39},{id:3,x:0,y:39}],
+                edges:[{a:0,b:1},{a:1,b:2},{a:2,b:3},{a:3,b:0}] };
+const sw2 = seismicWeight2Story(graph, {area:2340}, {area:2340}, ()=>({par:6,H:13,H2:10}), ()=>false, 20, 50, 18);
+ok("W_roof 86,004 (46,800 area + 39,204 wall)", close(sw2.Wroof,86004)&&close(sw2.WroofArea,46800)&&close(sw2.WroofWall,39204));
+ok("W_floor 157,986 (117,000 + 40,986)",        close(sw2.Wfloor,157986)&&close(sw2.WfloorArea,117000)&&close(sw2.WfloorWall,40986));
+ok("W_total 243,990", close(sw2.Wtotal,243990));
+ok("h_floor 13 / h_roof 23", sw2.hFloor===13 && sw2.hRoof===23);
+const dist = seismicDistribute2Story(sw2, 0.05);
+ok("V 12,199.5", close(dist.V,12199.5));
+ok("Σ(W·h) 4,031,910", close(dist.sumWh,4031910));
+ok("F_roof 5,985.2", close(dist.Froof,5985.2,0.2));
+ok("F_floor 6,214.3", close(dist.Ffloor,6214.3,0.2));
+ok("F_roof+F_floor = V (conservation)", close(dist.Froof+dist.Ffloor,dist.V,1e-6));
+process.exit(fail?1:0);
+```
+</details>
+
+<details><summary><code>work/tests/_test_stackseg_golden.cjs</code> (rev 63 — stacked-segment golden: locks the upper-story-DL + cumulative footing shear; needs <code>exp_app.cjs</code> + <code>sw_test.cjs</code>)</summary>
+
+```js
+// Build: exp_app.cjs must also `export { stackSeg }`; sw_test.cjs = esbuild work/src/calcCore.js → cjs.
+const { stackSeg } = require("./exp_app.cjs");
+const { calcSegment, isNum } = require("./sw_test.cjs");
+let fail = 0; const ok = (n,c) => { console.log((c?"PASS":"FAIL")+": "+n); if(!c) fail++; };
+const close = (a,b,t=1e-6) => Math.abs(a-b) <= t*Math.max(1,Math.abs(b));
+const seg = { length:8, height:9, roofTrib:6, floorTrib:4, hdDist:0, thickness:5.5, anchor:"Concrete", selType:2 };
+const G = o => ({ grade:"rated", species:1, sds:1, R:6.5, code:4, roofDL:15, floorDL:10, wallDL:15, ...o });
+const r1 = Object.assign({active:true}, calcSegment({...seg}, G({wWind:4000,vSeismic:3000}), 8));
+const r2 = Object.assign({active:true}, calcSegment({...seg}, G({wWind:2500,vSeismic:2000}), 8));
+const d = { anchor:"Concrete", hdDist:0, thickness:5.5, ftgWidth:1.5, ftgThick:12 };
+const s = stackSeg(r1, r2, 8, G({wWind:4000,vSeismic:3000}), d, 9);
+// (1) EXACT golden (rev 63)
+ok("MotW 35,100", close(s.MotW,35100)); ok("MotS 31,500", close(s.MotS,31500));
+ok("compW 6072.380952", close(s.compW,6072.380952380952)); ok("compS 5841.371428", close(s.compS,5841.371428571429));
+ok("upHD_W 3205.333", close(s.upHD_W,3205.3333333333335)); ok("upHD_S 3040.279", close(s.upHD_S,3040.279365079365));
+ok("maxComp 6072.380952", close(s.maxComp,6072.380952380952)); ok("maxUplift 3205.333", close(s.maxUplift,3205.3333333333335));
+ok("post (2) 2x6", s.post==="(2) 2x6"); ok("hd HDU4", s.hd==="HDU4");
+ok("anchorSel SSTB16", s.anchorSel==="SSTB16"); ok("altStrap STHD10", s.altStrap==="STHD10");
+ok("LminW 17.78777", close(s.LminW,17.78777326003547)); ok("LminS 18.23834", close(s.LminS,18.23834129373669));
+ok("reqFtgLen 18.23834", close(s.reqFtgLen,18.23834129373669));
+// (2) DIRECTION: zero the upper-story (r2) DL → confirm the rev-63 correction is doing its job
+const s0 = stackSeg(r1, {...r2, wdl:0,AwDL:0,BwDL:0,CwDL:0,Fs:0,Fw:0}, 8, G({wWind:4000,vSeismic:3000}), d, 9);
+const num = x => isNum(x)?x:0;
+ok("upper DL ⇒ wind uplift DOWN", num(s.upHD_W)<num(s0.upHD_W));
+ok("upper DL ⇒ seismic uplift DOWN", num(s.upHD_S)<num(s0.upHD_S));
+ok("upper DL ⇒ wind comp UP", s.compW>s0.compW); ok("upper DL ⇒ seismic comp UP", s.compS>s0.compS);
+ok("cumulative footing shear shifts Lmin", Math.abs(s.LminW-s0.LminW)>1e-9);
+process.exit(fail?1:0);
+```
+</details>
+
 **Harness gotchas (learned the hard way):**
 - Build a fresh `sw_test.cjs`/`rk.cjs` AFTER every source edit before running the .mjs/rev12 suites, or you test stale code.
 - The design-tab bundle MUST inject a line with `a/b` points + `windAxis` (Step 2b); a line lacking geometry makes `DesignPlan.lineGeom` throw on `ln.a.x`.
@@ -728,7 +799,7 @@ process.exit(fail?1:0);
 
 ## 7. Known judgment calls / open items
 
-- **Seismic in the Design tab (rev 62 §4zzk + rev 63 §4zzl):** COMPLETE through 2-story. 1-story (rev 62): each line carries `forceLbsSeismic` (view-independent), fed to `lineResults`+optimizer as `vSeismic`; the engine's native envelope designs for the heavier case; per-element W/S badges + `S_DS` on the Design Seismic card. 2-story (rev 63): per-floor `F_roof`/`F_floor` feed via `seisMapFor`; guarded `stackSeg` now adds the upper-story DL as stabilizing to BOTH uplift-resist and post-compression (each case's factored bucket) and uses cumulative footing base-shear — net smaller holdowns, larger posts. `calcCore.js` untouched throughout; `stackSeg` guard is golden-OUTPUT. **Remaining follow-ups (none blocking):** (a) `stackSeg` golden numbers should be re-snapshotted + a 2-story regression vs the rev-60 Section-B seismic targets added when the §6b harness is regenerated (rev 63 verified change DIRECTION + intact rest, not exact goldens); (b) **"Send line to calculation sheet" still uses the GLOBAL manual `g.vSeismic`** (the calc sheet has no per-tab seismic, unlike per-tab `wWind`) — a seismic-governed Design line won't carry its seismic onto the calc sheet until a per-tab-`vSeismic` rev; (c) schema tripwire should add `forceLbsSeismic` to `schema.expected.json` when the harness is regenerated (additive, no migration); (d) visual sign-off on the per-element badges + the stacking results on real plan geometry (logic is verified; on-screen placement is the user's eyeball check).
+- **Seismic in the Design tab (rev 62 §4zzk + rev 63 §4zzl):** COMPLETE through 2-story. 1-story (rev 62): each line carries `forceLbsSeismic` (view-independent), fed to `lineResults`+optimizer as `vSeismic`; the engine's native envelope designs for the heavier case; per-element W/S badges + `S_DS` on the Design Seismic card. 2-story (rev 63): per-floor `F_roof`/`F_floor` feed via `seisMapFor`; guarded `stackSeg` now adds the upper-story DL as stabilizing to BOTH uplift-resist and post-compression (each case's factored bucket) and uses cumulative footing base-shear — net smaller holdowns, larger posts. `calcCore.js` untouched throughout; `stackSeg` guard is golden-OUTPUT. **Remaining follow-ups (none blocking):** (a) ✓ DONE — the §6b harness was regenerated and run against rev 63: engine wind/DL golden `test_str1_golden.mjs` PASS (vSeismic 0 → unaffected by rev 61), optimizer PASS, **`_test_seis2.cjs` 9/9** (exact rev-60 Section-B targets: W_roof 86,004 / W_floor 157,986 / W_total 243,990 / V 12,199.5 / F_roof 5,985.2 / F_floor 6,214.3), **`_test_stackseg_golden.cjs` 21/21** (exact rev-63 stacked outputs + the upper-DL direction: uplift↓, comp↑, cumulative footing shear), engine guard PASS (only `calcSegment`/`lineResults`/`stackSeg` changed vs the rev-60 upload), render smoke PASS; engine baseline re-snapshotted at rev 63. Both new suites are now in §6b.  (b) **"Send line to calculation sheet" still uses the GLOBAL manual `g.vSeismic`** (the calc sheet has no per-tab seismic, unlike per-tab `wWind`) — a seismic-governed Design line won't carry its seismic onto the calc sheet until a per-tab-`vSeismic` rev; (c) schema tripwire should add `forceLbsSeismic` to `schema.expected.json` when the harness is regenerated (additive, no migration); (d) visual sign-off on the per-element badges + the stacking results on real plan geometry (logic is verified; on-screen placement is the user's eyeball check).
 
 - **Seismic engine convention (rev 61, §4zzj):** `g.vSeismic` is the **post-R reduced** seismic base shear (lbs), not the old "lbs·R" — engine dropped `/R`, applies only ×0.7, mirroring wind. `g.R` is reference-only (kept in `g`/save files, unused by the math). `calcSegment` guard is golden-OUTPUT (re-baselined). KEY ENGINE FACTS (now exploited by rev 62): the optimizer is already case-aware (`type = max(sugS,sugW)`); `calcSegment` already envelopes every element via `xMax`; E_v is in the math via `g.sds` (`A=1+0.14·sds`, `B=0.6−0.14·sds`).
 
