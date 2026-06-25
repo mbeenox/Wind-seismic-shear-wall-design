@@ -20,8 +20,6 @@ const APP_VERSION = `${Math.floor(APP_BUILD / 100)}.${String(APP_BUILD % 100).pa
 
 // ── geometry space: 1 unit = 1 ft ──────────────────────────────────────────
 const VB_W = 100, VB_H = 75, GRID = 5, PAD = 2;
-// Minimum drawable / adjustable wall length (ft). rev 63: lowered 1 → 0.5 for finer detailing.
-const MIN_DRAW_FT = 0.5;
 const WORLD = 4000;            // plan coords may span -WORLD..+WORLD (origin is arbitrary)
 // pick a "nice" grid step so a plan of any size shows a sensible number of lines
 const niceStep = (span) => {
@@ -697,13 +695,9 @@ const CSS = `
 .storyopt.on{color:var(--accent);}
 /* Floor selector — its own bar directly BELOW the drawing area (never over the canvas, so clicks land). */
 .canvascol{display:flex;flex-direction:column;min-width:0;}
-/* Plan/level switcher — floated at the TOP-CENTER inside the canvas (rev 63; was below the canvas).
-   Absolute inside .stage (which is position:relative); the bar itself doesn't catch pointer events,
-   but the buttons do, so it never blocks drawing elsewhere on the canvas. */
-.floorbar{position:absolute;top:8px;left:50%;transform:translateX(-50%);z-index:6;
-  display:flex;justify-content:center;pointer-events:none;}
-.floorsel{pointer-events:auto;display:inline-flex;border:1.5px solid var(--ink);border-radius:4px;overflow:hidden;background:#FFFFFF;
-  box-shadow:0 2px 6px -2px rgba(28,39,51,.4);font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;}
+.floorbar{display:flex;justify-content:center;margin-top:8px;}
+.floorsel{display:inline-flex;border:1.5px solid var(--ink);border-radius:4px;overflow:hidden;background:#FFFFFF;
+  box-shadow:4px 4px 0 rgba(28,39,51,.10);font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;}
 .floorbar.off .floorsel{opacity:.5;border-color:var(--line);box-shadow:none;}
 .floortab{border:0;background:#FFFFFF;color:var(--muted);font-size:11px;font-weight:600;letter-spacing:.03em;
   padding:5px 14px;cursor:pointer;transition:background .14s ease,color .14s ease;}
@@ -1797,7 +1791,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
   // dimension the user clicked (nearest end moves, like AutoCAD's LENGTHEN); ties broken by
   // anchoring the better-connected end so the rest of the plan stays put.
   const applyWallLength = useCallback((edge, newLen, moveEnd="b")=>{
-    if(!(newLen>=MIN_DRAW_FT)) return;   // rev 63: 0.5 ft floor (was implicit 1 ft via the input min)
+    if(!(newLen>0)) return;
     const g=graphRef.current;
     const a=g.nodes.find(n=>n.id===edge.a), b=g.nodes.find(n=>n.id===edge.b);
     if(!a||!b) return;
@@ -2015,7 +2009,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
       if(dimWrapRef.current&&dimWrapRef.current.contains(e.target)) return;
       if(e.button===2){ setDimEdit(null); return; }
       const v=parseFloat(dimEdit.val);
-      if(v>=MIN_DRAW_FT) applyWallLength(dimEdit.edge,v,dimEdit.moveEnd); else setDimEdit(null);
+      if(v>0) applyWallLength(dimEdit.edge,v,dimEdit.moveEnd); else setDimEdit(null);
     };
     window.addEventListener("pointerdown",h,true);
     return()=>window.removeEventListener("pointerdown",h,true);
@@ -2119,49 +2113,6 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
     openMenu(e, { kind:"canvas" });                         // …and opens the canvas tool menu
   },[endDrawChain,openMenu]);
 
-  // ── T-INTERSECTION AUTO-SPLIT (rev 63) ──
-  // When a node is dropped onto the BODY of another wall (a perpendicular/T landing), bind it:
-  //   1. project the node exactly onto that wall (the new shared intersection point),
-  //   2. split the target wall into two segments at that point,
-  //   3. the dropped node IS the shared node, so moving it later drags all three walls together.
-  // Only fires for an interior landing (clear of the target's own endpoints) within a small
-  // perpendicular tolerance; endpoint-to-endpoint landings are left alone.
-  const tryBindTJunction = useCallback((nodeId)=>{
-    const g=graphRef.current;
-    const me=g.nodes.find(n=>n.id===nodeId);
-    if(!me) return;
-    const tol = 1.6*SRef.current;                  // perpendicular snap tolerance (world units, zoom-aware)
-    const endMargin = Math.max(tol, MIN_DRAW_FT);  // stay clear of the target wall's own endpoints
-    let best=null;
-    for(const ed of g.edges){
-      if(ed.a===nodeId || ed.b===nodeId) continue; // skip walls already touching this node
-      const a=g.nodes.find(n=>n.id===ed.a), b=g.nodes.find(n=>n.id===ed.b);
-      if(!a||!b) continue;
-      const dx=b.x-a.x, dy=b.y-a.y, L2=dx*dx+dy*dy;
-      if(L2<1e-9) continue;
-      const t=((me.x-a.x)*dx+(me.y-a.y)*dy)/L2;     // projection parameter along a→b
-      if(t<=0 || t>=1) continue;                    // foot must fall within the segment
-      const fx=a.x+t*dx, fy=a.y+t*dy;               // perpendicular foot on the wall
-      const L=Math.sqrt(L2);
-      if(t*L < endMargin || (1-t)*L < endMargin) continue;  // interior only (real T, no degenerate split)
-      const pd=Math.hypot(me.x-fx, me.y-fy);        // perpendicular distance node→wall
-      if(pd>tol) continue;
-      if(!best || pd<best.pd) best={ed,fx,fy,pd};
-    }
-    if(!best) return;
-    snapshot();
-    setGraph(g=>{
-      // weld the dragged node onto the wall at the foot point …
-      const nodes=g.nodes.map(n=>n.id===nodeId?{...n,x:best.fx,y:best.fy}:n);
-      // … and split the target wall a–b into a–node + node–b
-      const e1=norm(best.ed.a,nodeId), e2=norm(nodeId,best.ed.b);
-      const edges=g.edges.filter(e=>!same(e,best.ed));
-      if(!edges.some(e=>same(e,e1))) edges.push(e1);
-      if(!edges.some(e=>same(e,e2))) edges.push(e2);
-      return {nodes,edges};
-    });
-  },[snapshot]);
-
   const onMove = useCallback(e=>{
     if(panRef.current){                                   // middle-button pan: translate the view
       const p=panRef.current, svg=svgRef.current; if(!svg) return;
@@ -2218,7 +2169,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
     svgRef.current?.releasePointerCapture?.(e.pointerId);
     if(panRef.current){ panRef.current=null; setPanCursor(false); return; }    // end pan (no thaw — pan doesn't freeze)
     thawView();
-    if(nodeDrag.current){ const nd=nodeDrag.current; nodeDrag.current=null; if(nd.moved) tryBindTJunction(nd.id); return; }
+    if(nodeDrag.current){ nodeDrag.current=null; return; }
     if(wallDrag.current){ wallDrag.current=null; return; }
     if(secDraw.current){
       const sd=secDraw.current; secDraw.current=null; setDraft(null);
@@ -2252,7 +2203,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
         }
       }
     }
-  },[toUser,thawView,tryBindTJunction]);
+  },[toUser,thawView]);
 
   const onLeave = useCallback(e=>{ onUp(e); },[onUp]);
 
@@ -2278,7 +2229,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
     const m=svgRef.current.getScreenCTM();
     const mx=(a.x+b.x)/2, my=(a.y+b.y)/2;
     const sx=m.a*mx+m.c*my+m.e, sy=m.b*mx+m.d*my+m.f;
-    setDimEdit({edge, moveEnd, px:sx-r.left, py:sy-r.top-18, val:String(Math.round(dist(a,b)*10)/10)});
+    setDimEdit({edge, moveEnd, px:sx-r.left, py:sy-r.top-18, val:String(Math.round(dist(a,b)))});
     setMenu(null);
   },[toUser,placeDrawPoint]);
 
@@ -2443,6 +2394,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
     ns.forEach(p=>{mnX=Math.min(mnX,p.x);mnY=Math.min(mnY,p.y);mxX=Math.max(mxX,p.x);mxY=Math.max(mxY,p.y);});
     return { dx:mxX-mnX, dy:mxY-mnY }; };
   const seisExtent     = useMemo(()=> bbox(graph.nodes),      [graph.nodes]);      // full-plan bbox (1-story card)
+  const twoStoryExtent = useMemo(()=> bbox(twoStoryGraph.nodes), [twoStoryGraph]); // (rev 63) 2-story sub-plan bbox — F_roof spans only this
   const seisViewExtent = useMemo(()=> bbox(seisGraph.nodes),  [seisGraph]);        // bbox of the diaphragm being drawn
   const wSeisX = seisViewExtent.dy>0 ? Vview/seisViewExtent.dy : 0;   // force-X plf (on the Y-running faces)
   const wSeisY = seisViewExtent.dx>0 ? Vview/seisViewExtent.dx : 0;   // force-Y plf (on the X-running faces)
@@ -2518,28 +2470,35 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
   // `byFloor`. The actual push (runDesignHandoff) calls it then hands off; the live signature
   // memo calls it on every relevant plan change to detect divergence. (Not a guarded engine fn.)
   const computeHandoff = useCallback(()=>{
-    // rev 62: per-line SEISMIC reaction (1-story). The seismic base shear V = Cs·W_total is distributed
-    // on the full plan EXACTLY as the rev-59 Plan-tab Seismic view, but computed here UNCONDITIONALLY —
-    // independent of the Wind/Seismic view toggle AND the active floor — so each design line carries its
-    // own seismic demand even while the canvas shows wind. vSeismic is the post-R reduced base shear
-    // (rev 61), so the reaction feeds the engine directly (engine applies ×0.7 and envelopes W vs S).
-    // 2-story per-floor seismic (F_roof/F_floor) is rev 63 → forceLbsSeismic stays 0 in 2-Story for now.
-    const seisByKey = {};
-    if(!twoStory && loop){
-      const Vseis = (Number(g&&g.Cs)||0) * (sw ? sw.Wtotal : 0);
-      if(Vseis>0){
-        const wX = seisExtent.dy>0 ? Vseis/seisExtent.dy : 0;   // force-X plf on the Y-running faces
-        const wY = seisExtent.dx>0 ? Vseis/seisExtent.dx : 0;   // force-Y plf on the X-running faces
-        const sH = buildSecData({axis:"h",sign:-1}, graph, loop, isSup, propsFor, { base:()=>wX, lee:()=>0 });
-        const sV = buildSecData({axis:"v",sign:-1}, graph, loop, isSup, propsFor, { base:()=>wY, lee:()=>0 });
-        (sH ? sH.reactions : []).forEach(rr=>{ if(rr.kips>0) seisByKey["h|"+rr.key]=rr.kips*1000; });
-        (sV ? sV.reactions : []).forEach(rr=>{ if(rr.kips>0) seisByKey["v|"+rr.key]=rr.kips*1000; });
-      }
-    }
+    // rev 62/63: per-line SEISMIC reaction, computed UNCONDITIONALLY (independent of the Wind/Seismic
+    // view toggle + active floor) so each design line carries its own seismic demand while the canvas
+    // shows wind. vSeismic is the post-R reduced base shear (rev 61), fed straight to the engine.
+    //   1-story: one map — V = Cs·W_total distributed on the full plan (rev-59 mechanism).
+    //   2-story (rev 63): per-floor — F_roof on the 2-story sub-plan (the roof exists only on 2-story
+    //     walls), F_floor on the full plan, using the rev-60 vertical distribution seis2.Froof/Ffloor.
+    // The per-floor force is read in buildFloor and joined by axis|key (same key as the wind reaction).
+    const seisMapFor = (F, fGraph, fLoop, ext) => {
+      const m = {}; if(!(F>0) || !fLoop) return m;
+      const wX = ext.dy>0 ? F/ext.dy : 0;   // force-X plf on the Y-running faces
+      const wY = ext.dx>0 ? F/ext.dx : 0;   // force-Y plf on the X-running faces
+      const sH = buildSecData({axis:"h",sign:-1}, fGraph, fLoop, isSup, propsFor, { base:()=>wX, lee:()=>0 });
+      const sV = buildSecData({axis:"v",sign:-1}, fGraph, fLoop, isSup, propsFor, { base:()=>wY, lee:()=>0 });
+      (sH ? sH.reactions : []).forEach(rr=>{ if(rr.kips>0) m["h|"+rr.key]=rr.kips*1000; });
+      (sV ? sV.reactions : []).forEach(rr=>{ if(rr.kips>0) m["v|"+rr.key]=rr.kips*1000; });
+      return m;
+    };
+    const Cs = Number(g&&g.Cs)||0;
+    const seisMap1 = !twoStory                                       // floor-1 (or the only floor)
+          ? seisMapFor(Cs*(sw?sw.Wtotal:0), graph, loop, seisExtent)
+          : seisMapFor(seis2?seis2.Ffloor:0, graph, loop, seisExtent);
+    const seisMap2 = twoStory                                        // floor-2 (roof) — 2-story sub-plan only
+          ? seisMapFor(seis2?seis2.Froof:0, twoStoryGraph, twoStoryLoop, twoStoryExtent)
+          : {};
     // Build the design lines for ONE floor: re-run the frozen wind engine with that floor's effective
     // wall height (same substitution as propsForActive), and tag each line with the floor's DESIGN
     // height (floor 2 walls are H₂ tall, floor 1 walls are H tall) and its reaction.
     const buildFloor=(floor)=>{
+      const seisMap = (twoStory && floor===2) ? seisMap2 : seisMap1;   // rev 63: floor-2 → roof force map, else floor-1/1-story map
       const fg = (twoStory && floor===2) ? twoStoryGraph : graph;   // step 2: roof floor excludes 1-story walls
       const fl = (twoStory && floor===2) ? twoStoryLoop  : loop;
       const mixedF1 = twoStory && floor===1 && oneStory.size>0;       // step 3: mixed-height 1st-floor accumulation
@@ -2581,7 +2540,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
           const floorTrib = f2 ? (wp.floorTrib2 ?? wp.floorTrib) : wp.floorTrib;
           lines.push({ id:ax+"|"+r.key, key:r.key, windAxis:ax, o, a, b,
                        lengthFt:hi-lo, heightFt:Hmax||13, forceLbs:r.kips*1000,
-                       forceLbsSeismic: seisByKey[ax+"|"+r.key] || 0,   // rev 62: per-line seismic demand (1-story; 0 in 2-Story until rev 63)
+                       forceLbsSeismic: seisMap[ax+"|"+r.key] || 0,   // rev 62/63: per-line seismic demand (1-story, or per-floor for 2-story)
                        roofTrib, floorTrib });
         });
       });
@@ -2627,7 +2586,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
         return u ? { ...l, id:u.id, key:u.key, a:u.a, b:u.b, lengthFt:u.lengthFt } : l; });
     }
     return byFloor;
-  },[sections, graph, loop, isSup, propsFor, twoStory, twoStoryGraph, twoStoryLoop, oneStory, isOneStory, g, sw, seisExtent]);
+  },[sections, graph, loop, isSup, propsFor, twoStory, twoStoryGraph, twoStoryLoop, oneStory, isOneStory, g, sw, seisExtent, seis2, twoStoryExtent]);
 
   // Live signature of what a push WOULD send right now. Recomputes whenever any handoff input
   // changes (computeHandoff's identity changes with its deps). Pure-view edits (zoom, markup
@@ -2749,19 +2708,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
       <div className="layout">
         <div className="canvascol">
         <div className="stage" ref={stageRef}>
-          {twoStory && (<div className="floorbadge">Level {activeFloor} <span>Plan</span></div>)}
-          {/* ── PLAN/LEVEL SWITCHER — floated at the TOP of the drawing area, INSIDE the canvas (rev 63).
-               .floorbar is pointer-events:none; only the .floorsel buttons catch clicks, so the rest of
-               the canvas stays drawable. Greyed/disabled until 2-Story is on. ── */}
-          <div className={"floorbar"+(twoStory?"":" off")}>
-            <div className="floorsel"
-                 title={twoStory?"Choose which level to view":"Turn on 2 Story (top toolbar) to enable level switching"}>
-              <button className={"floortab"+(activeFloor===1?" act":"")} disabled={!twoStory}
-                      onClick={()=>twoStory&&setActiveFloor(1)}>Level 1</button>
-              <button className={"floortab"+(activeFloor===2?" act":"")} disabled={!twoStory}
-                      onClick={()=>twoStory&&setActiveFloor(2)}>Level 2</button>
-            </div>
-          </div>
+          {twoStory && (<div className="floorbadge">Floor {activeFloor} <span>plan</span></div>)}
           {allOneStory && (<div className="allonestory-warn">⚠ All walls are 1-story — the 2nd floor has no walls.</div>)}
           <svg ref={svgRef} className="cvs" style={drawMode?{cursor:"crosshair"}:(panMode||panCursor)?{cursor:panCursor?"grabbing":"grab"}:undefined}
                viewBox={`${view.x} ${view.y} ${view.w} ${view.h}`}
@@ -2928,7 +2875,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
 
           {dimEdit&&(
             <div ref={dimWrapRef} className="dim-input-wrap" style={{left:dimEdit.px,top:dimEdit.py}}>
-              <input className="dim-inp" type="number" min={MIN_DRAW_FT} step="0.5" value={dimEdit.val} autoFocus
+              <input className="dim-inp" type="number" min="1" value={dimEdit.val} autoFocus
                      onChange={e=>setDimEdit(d=>({...d,val:e.target.value}))}
                      onKeyDown={e=>{ if(e.key==="Enter"){applyWallLength(dimEdit.edge,parseFloat(dimEdit.val),dimEdit.moveEnd);} if(e.key==="Escape"){setDimEdit(null);} }}/>
               <span className="dim-unit">ft</span>
@@ -2936,6 +2883,16 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
           )}
         </div>{/* /stage */}
 
+        {/* ── FLOOR SELECTOR — directly BELOW the drawing area (outside the canvas, so clicks never hit the SVG). Greyed/disabled until 2-Story is on. ── */}
+        <div className={"floorbar"+(twoStory?"":" off")}>
+          <div className="floorsel"
+               title={twoStory?"Choose which floor to view":"Turn on 2 Story (top toolbar) to enable floor switching"}>
+            <button className={"floortab"+(activeFloor===1?" act":"")} disabled={!twoStory}
+                    onClick={()=>twoStory&&setActiveFloor(1)}>1st Floor</button>
+            <button className={"floortab"+(activeFloor===2?" act":"")} disabled={!twoStory}
+                    onClick={()=>twoStory&&setActiveFloor(2)}>2nd Floor</button>
+          </div>
+        </div>
         </div>{/* /canvascol */}
 
         {/* side panel */}
@@ -3976,8 +3933,17 @@ function lineResults(line, segs, g, d) {
 // unchanged (the 1st-floor story shear was already carried by Step 5's combined
 // load); only its chord (bending) term uses the STACKED end post, so a stacked
 // wall with a bigger required chord reports a smaller in-plane Δ — the as-built
-// behavior. Footing uses the stacked moments/uplifts with the 1st-floor's own
-// dead load + base shear (same dead-load convention Step 6 set, kept for parity).
+// behavior.
+// rev 63 (SANCTIONED guarded change — user-approved; stackSeg guard is now
+// golden-OUTPUT, re-baselined): the UPPER-STORY dead load now stacks onto the
+// 1st-floor base, because the 2nd-floor + roof gravity travels down through the
+// 1st-floor end posts. It is added through EACH case's factored bucket — wind
+// compression +r2.wdl, seismic compression +r2.AwDL (A=1+0.14·Sds); wind uplift
+// +r2.CwDL (0.6·D), seismic uplift +r2.BwDL ((0.6−0.14·Sds)·D, E_v-consistent) —
+// so it REDUCES net uplift (smaller holdowns) and RAISES post compression (the
+// physically-correct two-way effect). The footing base-shear term is now CUMULATIVE
+// (r1.F+r2.F) to match the summed moments. r2's factored buckets already exist on
+// the 2nd-floor calcSegment result; r1.B==r2.B (shared Sds), so aF is unchanged.
 const upliftStk = (Mot, w, L, denomIn) => {            // mirror of calcSegment's local upliftFn
   const u = (Mot - w*L*(L/2 - 1.5/12)) / (L - denomIn/12);
   return u < 0 ? 0 : u < 625 ? "neglect" : u;
@@ -3991,12 +3957,12 @@ function stackSeg(r1, r2, L, g, d, h) {
   const MotW = r1.MotW + r2.MotW;                          // arm-aware combined wind moment @ 1st-floor base
   const MotS = r1.MotS + r2.MotS;                          // …and seismic
   const minL = Math.min(3, L/2);
-  const compW = (MotW + r1.wdl  * L * minL) / (L - (1.5 + hdDist/12) / 12);  // E42 quirk preserved
-  const compS = (MotS + r1.AwDL * L * minL) / (L - (1.5 + hdDist)   / 12);
-  const upHD_W = upliftStk(MotW, r1.CwDL, L, 1.5 + hdDist);
-  const upHD_S = upliftStk(MotS, r1.BwDL, L, 1.5 + hdDist);
-  const upStrap_W = upliftStk(MotW, r1.CwDL, L, 3);        // E56/E57 strap uplift: denominator is 3", not 1.5+hdDist
-  const upStrap_S = upliftStk(MotS, r1.BwDL, L, 3);
+  const compW = (MotW + (r1.wdl  + r2.wdl ) * L * minL) / (L - (1.5 + hdDist/12) / 12);  // E42 quirk preserved · (rev 63) +upper-story DL onto the post
+  const compS = (MotS + (r1.AwDL + r2.AwDL) * L * minL) / (L - (1.5 + hdDist)   / 12);   // (rev 63) +upper-story DL (seismic A=1+0.14·Sds bucket)
+  const upHD_W = upliftStk(MotW, r1.CwDL + r2.CwDL, L, 1.5 + hdDist);   // (rev 63) +upper-story DL resists uplift (wind C=0.6·D bucket)
+  const upHD_S = upliftStk(MotS, r1.BwDL + r2.BwDL, L, 1.5 + hdDist);   // (rev 63) +upper-story DL (seismic B=(0.6−0.14·Sds)·D bucket, E_v consistent)
+  const upStrap_W = upliftStk(MotW, r1.CwDL + r2.CwDL, L, 3);        // E56/E57 strap uplift: denominator is 3", not 1.5+hdDist
+  const upStrap_S = upliftStk(MotS, r1.BwDL + r2.BwDL, L, 3);
   const maxComp   = xMax(compS, compW);
   const maxUplift = xMax(upHD_S, upHD_W);
   const maxStrap  = xMax(upStrap_S, upStrap_W);
@@ -4063,13 +4029,13 @@ function stackSeg(r1, r2, L, g, d, h) {
   const deflW = defl(r1.vW);
   // ── Footing (engine's quad; stacked moments + uplifts, 1st-floor dead load + base shear) ──
   const quad = (qa, qb, qc) => { const disc = qb*qb - 4*qa*qc; if (disc < 0 || qa === 0) return NaN; return (-qb + Math.sqrt(disc)) / (2*qa); };
-  const aF = (Math.min(0.6, r1.B) * 150 * ftgW * ftgT) / 24;
-  const P65 = (MotS + r1.BwDL*L*(L/2 - hdDist/12)) / (L - (1.5 + hdDist)/12);
+  const aF = (Math.min(0.6, r1.B) * 150 * ftgW * ftgT) / 24;   // footing self-weight (B factor only; r1.B==r2.B, no DL sum)
+  const P65 = (MotS + (r1.BwDL+r2.BwDL)*L*(L/2 - hdDist/12)) / (L - (1.5 + hdDist)/12);   // (rev 63) +upper-story DL
   const uS = numOr0(upHD_S);
-  const LminS = quad(aF, (P65-uS)/2, uS*(hdDist/12 - L/2) + P65*(1.5/12 - L/2) - (r1.Fs*ftgT)/12);
-  const P70 = (MotW + r1.CwDL*L*(L/2 - hdDist/12)) / (L - (1.5 + hdDist/12)/12);
+  const LminS = quad(aF, (P65-uS)/2, uS*(hdDist/12 - L/2) + P65*(1.5/12 - L/2) - ((r1.Fs+r2.Fs)*ftgT)/12);   // (rev 63) cumulative seismic base shear
+  const P70 = (MotW + (r1.CwDL+r2.CwDL)*L*(L/2 - hdDist/12)) / (L - (1.5 + hdDist/12)/12);   // (rev 63) +upper-story DL
   const uW = numOr0(upHD_W);
-  const LminW = quad(aF, (P70-uW)/2, uW*(hdDist/12 - L/2) + P70*(1.5/12 - L/2) - (r1.Fw*ftgT)/12);
+  const LminW = quad(aF, (P70-uW)/2, uW*(hdDist/12 - L/2) + P70*(1.5/12 - L/2) - ((r1.Fw+r2.Fw)*ftgT)/12);   // (rev 63) cumulative wind base shear
   const reqFtgLen = xMax(L + 1, LminS, LminW);
   return { ...r1, MotW, MotS, compW, compS, upHD_W, upHD_S, upStrap_W, upStrap_S,
            maxComp, maxUplift, maxStrap, post, hd,
@@ -4737,9 +4703,12 @@ function DesignTab({ g, setGl, shape, lines, linesByFloor, segsByLine, setSegsBy
               <b> arm-aware</b> overturning of both stories — the roof reaction acts a full upper story higher
               (arm H₁+H₂), so its moment adds on top of the 2nd-floor moment
               (M<sub>base</sub> = M<sub>1st</sub> + M<sub>2nd</sub>), not a flat sum of the reactions. End post,
-              uplift, holdown, anchor, strap, deflection and footing all reflect the stacked demand. Wind/seismic
-              shear and nailing are unchanged (the combined story shear was already carried). Δ uses the stacked
-              (stiffer) end post, so the 1st-floor inter-story drift can read smaller than the single-story value.
+              uplift, holdown, anchor, strap, deflection and footing all reflect the stacked demand, now for
+              <b> both wind and seismic</b> (each line carries its per-floor seismic force). The
+              <b> upper-story dead load</b> stacks too (rev 63): it resists uplift (smaller holdowns) while adding
+              to the end-post compression, through each case's factored bucket; the footing base shear is cumulative.
+              Wind/seismic shear and nailing are unchanged (the combined story shear was already carried). Δ uses the
+              stacked (stiffer) end post, so the 1st-floor inter-story drift can read smaller than the single-story value.
             </div>
           )}
           <div className="sw-scroll">
