@@ -15,7 +15,7 @@ import {
 //   • APP_VERSION (here)      — human-facing build number in the UI ("Version 1.00").
 //   • CURRENT_VERSION (~below)— save-file SCHEMA version; drives .wps migrations. Do NOT couple.
 //   • handoff "rev" number    — the dev changelog in PLAN_SKETCHER_SUITE_HANDOFF.md.
-const APP_BUILD = 139;                                                                 // +1 per release
+const APP_BUILD = 140;                                                                 // +1 per release
 const APP_VERSION = `${Math.floor(APP_BUILD / 100)}.${String(APP_BUILD % 100).padStart(2, "0")}`;  // "1.00"
 
 // ── geometry space: 1 unit = 1 ft ──────────────────────────────────────────
@@ -3558,7 +3558,7 @@ function Elevation({ segments, results }) {
 function CalcSheet({ g, setGl, segments, setSegments, results, totalL, marks }) {
   const setSeg = (i, key, val) =>
     setSegments((prev) => prev.map((s, j) => (j === i ? { ...s, [key]: val } : s)));
-  const E_seis = (0.7 * g.vSeismic) / g.R;
+  const E_seis = 0.7 * g.vSeismic;  // rev 61: mirrors calcCore — vSeismic is the post-R reduced base shear; /R dropped
   const F_wind = g.code >= 3 ? 0.6 * g.wWind : g.wWind;
 
   const failBadge = (cond) =>
@@ -3578,10 +3578,10 @@ function CalcSheet({ g, setGl, segments, setSegments, results, totalL, marks }) 
           <div style={{ flex: "1 1 260px", border: `1px solid ${LT.rule}`, padding: "10px 14px" }}>
             <div style={{ fontSize: 11, fontWeight: 700, marginBottom: 8 }}>Seismic</div>
             <table style={{ fontSize: 12, width: "100%" }}><tbody>
-              <tr><td>V<sub>SEISMIC</sub> (lbs·R)</td><td style={{ textAlign: "right" }}><LtNumInput value={g.vSeismic} onChange={(v) => setGl("vSeismic", v)} /></td></tr>
+              <tr><td>V<sub>SEISMIC</sub> (lbs)</td><td style={{ textAlign: "right" }}><LtNumInput value={g.vSeismic} onChange={(v) => setGl("vSeismic", v)} /></td></tr>
               <tr><td>S<sub>DS</sub></td><td style={{ textAlign: "right" }}><LtNumInput value={g.sds} onChange={(v) => setGl("sds", v)} step={0.05} /></td></tr>
-              <tr><td>R</td><td style={{ textAlign: "right", fontFamily: MONO }}>{g.R}</td></tr>
-              <tr><td style={{ paddingTop: 6 }}>E = 0.70 · V / R</td><td style={{ textAlign: "right", fontFamily: MONO, fontWeight: 700, paddingTop: 6 }}>{fmt(E_seis, 2)} lbs</td></tr>
+              <tr><td>R <span style={{ color: LT.faint, fontSize: 10 }}>(ref)</span></td><td style={{ textAlign: "right", fontFamily: MONO }}>{g.R}</td></tr>
+              <tr><td style={{ paddingTop: 6 }}>E = 0.70 · V</td><td style={{ textAlign: "right", fontFamily: MONO, fontWeight: 700, paddingTop: 6 }}>{fmt(E_seis, 2)} lbs</td></tr>
             </tbody></table>
           </div>
           <div style={{ flex: "1 1 260px", border: `1px solid ${LT.rule}`, padding: "10px 14px" }}>
@@ -4767,7 +4767,7 @@ const DEFAULT_PLACED = { start:0, length:0 };
 
 // Save-file schema version. WRITTEN by onSave and now READ by the loader (it used to be
 // decorative). Bump this on every schema change and add the matching MIGRATIONS step.
-const CURRENT_VERSION = 2;
+const CURRENT_VERSION = 3;
 // Step migrations: MIGRATIONS[k] takes a project AT version k and returns it AT version k+1.
 // 1→2 is purely ADDITIVE — v2 only adds optional ui/camera/selection fields the loader already
 // feature-detects — so there is no data transform, we only stamp the version. This ladder exists
@@ -4789,6 +4789,19 @@ const CURRENT_VERSION = 2;
 // botched unit conversion — see the migration checklist in the handoff §4x / §7).
 const MIGRATIONS = {
   1: (p) => ({ ...p, version:2 }),
+  // 2→3 (rev 61): UNIT/SEMANTICS change. The engine dropped the /R from E_seis, so g.vSeismic
+  // now means the post-R (ASCE 7 reduced) seismic base shear in lbs — it used to be stored as
+  // "lbs·R" (un-reduced). Convert by dividing the OLD value by the stored R (DEFAULT_G.R when the
+  // file predates an R field). g.R itself is preserved (now reference-only). This runs BEFORE
+  // merge-onto-defaults, so guard for a missing calc/g.
+  2: (p) => {
+    const g = p && p.calc && p.calc.g;
+    if (g && Number.isFinite(g.vSeismic)) {
+      const R = Number.isFinite(g.R) && g.R !== 0 ? g.R : DEFAULT_G.R;
+      return { ...p, calc: { ...p.calc, g: { ...g, vSeismic: g.vSeismic / R } }, version:3 };
+    }
+    return { ...p, version:3 };
+  },
 };
 // Walk a loaded project up to `target` one step at a time. `migrations`/`target` are injectable so a
 // test can prove the MECHANISM (ordering + value transforms) with a synthetic ladder even while the

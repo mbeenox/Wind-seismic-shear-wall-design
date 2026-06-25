@@ -6,6 +6,12 @@
    change any formula here without the user's explicit approval — the engine
    byte-identity guard diffs these functions against a baseline.
 
+   SANCTIONED DEVIATIONS (user-approved; the guard for the affected fn is
+   golden-OUTPUT, not byte-identity, and its baseline was re-snapshotted):
+     • rev 61 — calcSegment: E_seis dropped its /R, so vSeismic is now the
+       post-R (ASCE 7 reduced) seismic base shear, parallel to wWind; the
+       engine applies only the 0.7 ASD factor. g.R is no longer read here.
+
    Self-contained: depends only on Math + the helpers defined in this file
    (no React, no geometry/sketcher imports), so there is no circular
    dependency with the app file that imports from it.
@@ -50,7 +56,7 @@ function calcSegment(seg, g, totalL) {
   const L = seg.length, h = seg.height;
   if (!(L > 0)) return { active: false };
   const sp = g.species === 1;
-  const E_seis = (0.7 * g.vSeismic) / g.R;
+  const E_seis = 0.7 * g.vSeismic;  // rev 61 (sanctioned): /R dropped — vSeismic is now the post-R (ASCE 7 reduced) seismic base shear, parallel to wWind; engine applies ONLY the 0.7 ASD factor. g.R is no longer used by the engine.
   const F_wind = g.code >= 3 ? 0.6 * g.wWind : g.wWind;
   const aspect = h / L;
   const aspectNG = aspect > 3.5;
