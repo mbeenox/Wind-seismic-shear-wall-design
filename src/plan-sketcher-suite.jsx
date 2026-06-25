@@ -15,7 +15,7 @@ import {
 //   • APP_VERSION (here)      — human-facing build number in the UI ("Version 1.00").
 //   • CURRENT_VERSION (~below)— save-file SCHEMA version; drives .wps migrations. Do NOT couple.
 //   • handoff "rev" number    — the dev changelog in PLAN_SKETCHER_SUITE_HANDOFF.md.
-const APP_BUILD = 138;                                                                 // +1 per release
+const APP_BUILD = 139;                                                                 // +1 per release
 const APP_VERSION = `${Math.floor(APP_BUILD / 100)}.${String(APP_BUILD % 100).padStart(2, "0")}`;  // "1.00"
 
 // ── geometry space: 1 unit = 1 ft ──────────────────────────────────────────
@@ -70,6 +70,61 @@ function seismicWeight1Story(graph, loop, propsFor, roofDL, wallDL){
     g.len += len; g.w += w; byProfile.set(k, g);
   }
   return { area, Wroof, Wwall, Wtotal: Wroof + Wwall, profiles:[...byProfile.values()] };
+}
+// (rev 60) SEISMIC EFFECTIVE WEIGHT — 2-STORY.  The tributary wall weight SPLITS between the floor
+// diaphragm (level 1) and the roof diaphragm (level 2); each level is tracked independently so the
+// base shear V = Cs·W_total can be distributed vertically (Phase 3).  Per SECTION-B (2 STORY):
+//   Level 2 (roof):   area×roofDL  +  Σ over 2-STORY walls of (par + H₂/2)·len·wallDL
+//                     (full parapet above + the UPPER half of story 2).      e.g. 6 + 10/2 = 11 ft
+//   Level 1 (floor):  area×floorDL +  Σ over walls of H_trib·len·wallDL where
+//                       2-story wall → H₂/2 + H₁/2  (lower half of story 2 + upper half of story 1)
+//                                                                            e.g. 5 + 6.5 = 11.5 ft
+//                       1-story wall → par + H₁/2   (its own parapet + upper half — its roof sits at
+//                                                    the floor-diaphragm level; mixed-height C/D)
+//   The remaining bottom half of story 1 (H₁/2) dumps to the foundation and is excluded.
+// Area DL by level (handles mixed height): the 2-story footprint (twoStoryLoop) carries a real FLOOR
+// at level 1 (floorDL) and a ROOF at level 2 (roofDL); any 1-story-only footprint carries its ROOF at
+// level 1 (roofDL).  Uniform 2-story → roofArea==floorArea, so floor = floorDL·area, roof = roofDL·area.
+// Diaphragm elevations above grade: h_floor = H₁, h_roof = H₁ + H₂ (representative story heights from
+// the 2-story walls).  isOne(key) = wall tagged 1-story.  Pure; reads each wall's par/H/H₂ via propsFor.
+function seismicWeight2Story(graph, loop, twoStoryLoop, propsFor, isOne, roofDL, floorDL, wallDL){
+  const floorArea = (loop && loop.area) ? loop.area : 0;
+  const roofArea  = (twoStoryLoop && twoStoryLoop.area) ? twoStoryLoop.area
+                  : ((loop && loop.area) ? loop.area : 0);           // closed 2-story sub-loop, else full
+  const oneStoryArea = Math.max(0, floorArea - roofArea);            // footprint that is 1-story only
+  const WroofArea  = roofArea  * (roofDL||0);
+  const WfloorArea = floorArea===0 ? 0 : (roofArea*(floorDL||0) + oneStoryArea*(roofDL||0));
+  let WroofWall=0, WfloorWall=0, H1rep=0, H2rep=0; const byProfile = new Map();
+  for(const e of graph.edges){
+    const a=graph.nodes.find(n=>n.id===e.a), b=graph.nodes.find(n=>n.id===e.b);
+    if(!a||!b) continue;
+    const len=Math.hypot(b.x-a.x, b.y-a.y);
+    const k=keyOf(e); const p=propsFor(k);
+    const par=p.par||0, H1=p.H||0, H2=(p.H2!=null?p.H2:p.H)||0;
+    const one = isOne ? isOne(k) : false;
+    let htR=0, htF=0;
+    if(one){ htF = par + H1/2; }                                     // 1-story wall → floor diaphragm only
+    else   { htR = par + H2/2; htF = H2/2 + H1/2;                    // 2-story wall → both diaphragms
+             H1rep=Math.max(H1rep,H1); H2rep=Math.max(H2rep,H2); }
+    WroofWall  += htR*len*(wallDL||0);
+    WfloorWall += htF*len*(wallDL||0);
+    const pk=`${one?"1":"2"}|${par}|${H1}|${H2}`;
+    const g=byProfile.get(pk)||{one,par,H1,H2,htR,htF,len:0,wR:0,wF:0};
+    g.len+=len; g.wR+=htR*len*(wallDL||0); g.wF+=htF*len*(wallDL||0); byProfile.set(pk,g);
+  }
+  if(H1rep===0){ for(const e of graph.edges){ const p=propsFor(keyOf(e)); H1rep=Math.max(H1rep,p.H||0); H2rep=Math.max(H2rep,(p.H2!=null?p.H2:p.H)||0); } }
+  const Wroof=WroofArea+WroofWall, Wfloor=WfloorArea+WfloorWall;
+  const hFloor=H1rep, hRoof=H1rep+H2rep;
+  return { floorArea, roofArea, WroofArea, WfloorArea, WroofWall, WfloorWall,
+           Wroof, Wfloor, Wtotal:Wroof+Wfloor, hFloor, hRoof, profiles:[...byProfile.values()] };
+}
+// (rev 60) Phase 3 — vertical distribution of base shear V across the two diaphragm levels by
+// F_level = V·(W_level·h_level)/Σ(W·h).  Returns V + the roof/floor forces (lbs).
+function seismicDistribute2Story(sw2, Cs){
+  if(!sw2) return null;
+  const V = (Cs||0) * sw2.Wtotal;
+  const whR = sw2.Wroof*sw2.hRoof, whF = sw2.Wfloor*sw2.hFloor, sum = whR+whF;
+  return { V, Froof: sum>0 ? V*whR/sum : 0, Ffloor: sum>0 ? V*whF/sum : 0, sumWh:sum };
 }
 // a section now stores its own shared values (per wind direction)
 const DEF_SECTION = { H:10, pw:16, qWind:32, qLee:22, par:5, H2:null,
@@ -2203,9 +2258,8 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
   // Roof DL / Wall DL. Reactive to graph, wall props (par/H), and g.roofDL/g.wallDL.
   const sw = useMemo(()=> seismicWeight1Story(graph, loop, propsFor, g&&g.roofDL, g&&g.wallDL),
                      [graph, loop, propsFor, g]);
-  // (rev 58) lift the 1-story W_total to App so the Design-tab Seismic card can show V = Cs·W_total.
-  // null in 2-Story mode (the per-diaphragm split is a later step), so downstream shows "—".
-  useEffect(()=>{ if(setWtotal) setWtotal(twoStory ? null : sw.Wtotal); }, [twoStory, sw.Wtotal, setWtotal]);
+  // (rev 60) lift W_total to App for the Design-tab Seismic card: 2-story now has a real per-diaphragm
+  // total (sw2), so V = Cs·W shows on both tabs in either mode (was null/"—" in 2-Story before).
   // In 2-story mode the on-plan loads/reactions reflect the SELECTED floor, by feeding buildSecData a
   // floor-specific EFFECTIVE wall height (engine untouched — it reads pr.H only in the line-load term):
   //   2nd-floor plan → roof diaphragm:  H_eff = H₂            → ½·H₂·pw + parapets               (designs 2nd-floor walls)
@@ -2311,30 +2365,45 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
   // (2-story mode) warn when EVERY wall has been tagged 1-story — then the 2nd floor has no walls.
   const allOneStory = useMemo(()=> twoStory && graph.edges.length>0
         && graph.edges.every(e=>oneStory.has(keyOf(e))), [twoStory, graph.edges, oneStory]);
-  // (rev 59, Step 3) SEISMIC distribution. V = Cs·W_total spread as a uniform line load along the
-  // boundary faces perpendicular to each direction: w = V / (projected extent perpendicular to the
-  // force). Force X (axis "h") → extent = Y-span (D), loads the Y-running faces; Force Y (axis "v") →
-  // extent = X-span (B), loads the X-running faces. Reuses the generalized buildSecData (Option B) with
-  // a uniform load model { base:()=>w, lee:()=>0 }, so the windward-collection + across-wind shadow +
-  // lineReactions geometry distributes V (conserving it — the shadow filter keeps a face set whose
-  // transverse projections tile the extent once) and yields wall reactions exactly like wind.
+  // SEISMIC distribution.  A diaphragm force F is spread as a uniform line load along the boundary
+  // faces perpendicular to each direction: w = F / (projected extent ⟂ the force). Force X (axis "h")
+  // → extent = Y-span (D), loads the Y-running faces; Force Y (axis "v") → extent = X-span (B), loads
+  // the X-running faces. Reuses the generalized buildSecData (Option B) with a uniform load model
+  // { base:()=>w, lee:()=>0 }, so the windward-collection + across-wind shadow + lineReactions geometry
+  // distributes F (conserving it — the shadow filter keeps a face set whose transverse projections
+  // tile the extent once) and yields wall reactions exactly like wind.
+  //   1-story (rev 59): one diaphragm, F = V = Cs·W_total.
+  //   2-story (rev 60): per-level weights → vertical distribution F_roof / F_floor (Phase 3), then the
+  //     ACTIVE-floor force is distributed: roof view (level 2) on the 2-story-only walls (twoStoryGraph,
+  //     the roof exists only there), floor view (level 1) on the full graph.
   const Cs = Number(g&&g.Cs)||0;
-  const Vfull = (!twoStory) ? Cs*sw.Wtotal : 0;        // design base shear V (lbs); 1-story only for now
-  const seisExtent = useMemo(()=>{
-    const ns=graph.nodes; if(!ns.length) return {dx:0,dy:0};
+  const sw2 = useMemo(()=> twoStory
+        ? seismicWeight2Story(graph, loop, twoStoryLoop, propsFor, isOneStory, g&&g.roofDL, g&&g.floorDL, g&&g.wallDL)
+        : null, [twoStory, graph, loop, twoStoryLoop, propsFor, isOneStory, g]);
+  const seis2 = useMemo(()=> seismicDistribute2Story(sw2, Cs), [sw2, Cs]);
+  useEffect(()=>{ if(setWtotal) setWtotal(twoStory ? (sw2?sw2.Wtotal:null) : sw.Wtotal); },
+    [twoStory, sw.Wtotal, sw2, setWtotal]);
+  // the diaphragm force to distribute on the CURRENT plan view
+  const Vview = twoStory ? (seis2 ? (activeFloor===2 ? seis2.Froof : seis2.Ffloor) : 0)
+                         : Cs*sw.Wtotal;
+  // the graph/loop the seismic diaphragm spans on this view (roof = 2-story walls only)
+  const seisGraph = (twoStory && activeFloor===2) ? twoStoryGraph : graph;
+  const seisLoop  = (twoStory && activeFloor===2) ? twoStoryLoop  : loop;
+  const bbox = (ns)=>{ if(!ns.length) return {dx:0,dy:0};
     let mnX=Infinity,mnY=Infinity,mxX=-Infinity,mxY=-Infinity;
     ns.forEach(p=>{mnX=Math.min(mnX,p.x);mnY=Math.min(mnY,p.y);mxX=Math.max(mxX,p.x);mxY=Math.max(mxY,p.y);});
-    return { dx:mxX-mnX, dy:mxY-mnY };
-  },[graph.nodes]);
-  const wSeisX = seisExtent.dy>0 ? Vfull/seisExtent.dy : 0;   // force-X plf (on the Y-running faces)
-  const wSeisY = seisExtent.dx>0 ? Vfull/seisExtent.dx : 0;   // force-Y plf (on the X-running faces)
-  const seisOn = loadCase==="seismic" && Vfull>0 && !!loop;
+    return { dx:mxX-mnX, dy:mxY-mnY }; };
+  const seisExtent     = useMemo(()=> bbox(graph.nodes),      [graph.nodes]);      // full-plan bbox (1-story card)
+  const seisViewExtent = useMemo(()=> bbox(seisGraph.nodes),  [seisGraph]);        // bbox of the diaphragm being drawn
+  const wSeisX = seisViewExtent.dy>0 ? Vview/seisViewExtent.dy : 0;   // force-X plf (on the Y-running faces)
+  const wSeisY = seisViewExtent.dx>0 ? Vview/seisViewExtent.dx : 0;   // force-Y plf (on the X-running faces)
+  const seisOn = loadCase==="seismic" && Vview>0 && !!seisLoop;
   const seisModelH = useMemo(()=>({ base:()=>wSeisX, lee:()=>0 }),[wSeisX]);
   const seisModelV = useMemo(()=>({ base:()=>wSeisY, lee:()=>0 }),[wSeisY]);
-  const secSeisH = useMemo(()=> seisOn ? buildSecData({axis:"h",sign:-1}, graph, loop, isSup, propsFor, seisModelH) : null,
-        [seisOn, graph, loop, isSup, propsFor, seisModelH]);
-  const secSeisV = useMemo(()=> seisOn ? buildSecData({axis:"v",sign:-1}, graph, loop, isSup, propsFor, seisModelV) : null,
-        [seisOn, graph, loop, isSup, propsFor, seisModelV]);
+  const secSeisH = useMemo(()=> seisOn ? buildSecData({axis:"h",sign:-1}, seisGraph, seisLoop, isSup, propsFor, seisModelH) : null,
+        [seisOn, seisGraph, seisLoop, isSup, propsFor, seisModelH]);
+  const secSeisV = useMemo(()=> seisOn ? buildSecData({axis:"v",sign:-1}, seisGraph, seisLoop, isSup, propsFor, seisModelV) : null,
+        [seisOn, seisGraph, seisLoop, isSup, propsFor, seisModelV]);
   // what the canvas draws: wind sections, or the seismic ones when the Load-case toggle is on Seismic
   const showSeis = loadCase==="seismic";
   const dispH = showSeis ? secSeisH : secH;
@@ -2897,8 +2966,45 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
             </div>
           ) : (
             <div className="card">
-              <h4>Seismic Weight</h4>
-              <p className="hint" style={{marginTop:0,marginBottom:0}}>2-Story seismic weight uses a per-diaphragm tributary split — coming in a later step.</p>
+              <h4>Seismic Weight <span style={{fontSize:10,fontWeight:600,color:"var(--muted)"}}>· 2-Story</span></h4>
+              {sw2 ? (<>
+                {/* per-level effective weights (area DL + tributary wall DL) */}
+                <div className="row" style={{fontSize:10.5,fontWeight:800,letterSpacing:".04em",textTransform:"uppercase",color:"var(--muted)",marginBottom:2}}><span>Level</span><span>W · h</span></div>
+                <div className="row"><span>Roof (L2) <span style={{color:"var(--muted)"}}>h {fmt1(sw2.hRoof)}′</span></span><b>{Math.round(sw2.Wroof).toLocaleString()}<small>lbs</small></b></div>
+                <div className="row" style={{fontSize:11,color:"var(--muted)",marginTop:-2}}>
+                  <span>area {Math.round(sw2.WroofArea).toLocaleString()} + wall {Math.round(sw2.WroofWall).toLocaleString()}</span>
+                </div>
+                <div className="row" style={{marginTop:3}}><span>Floor (L1) <span style={{color:"var(--muted)"}}>h {fmt1(sw2.hFloor)}′</span></span><b>{Math.round(sw2.Wfloor).toLocaleString()}<small>lbs</small></b></div>
+                <div className="row" style={{fontSize:11,color:"var(--muted)",marginTop:-2}}>
+                  <span>area {Math.round(sw2.WfloorArea).toLocaleString()} + wall {Math.round(sw2.WfloorWall).toLocaleString()}</span>
+                </div>
+                <div className="row" style={{borderTop:"1px solid var(--line)",marginTop:4,paddingTop:6}}>
+                  <span style={{fontWeight:800}}>W total</span>
+                  <b style={{color:"var(--accent)"}}>{Math.round(sw2.Wtotal).toLocaleString()}<small>lbs</small></b>
+                </div>
+                <div className="row" style={{marginTop:2}}>
+                  <span>Base shear V = Cs·W <span style={{color:"var(--muted)"}}>(Cs {Cs})</span></span>
+                  <b style={{color:"var(--hot)"}}>{Math.round(Cs*sw2.Wtotal).toLocaleString()}<small>lbs</small></b>
+                </div>
+                {/* Phase 3 — vertical distribution F_x = V·(W·h)/Σ(W·h) */}
+                {seis2 && (<>
+                  <div className="row" style={{fontSize:10.5,fontWeight:800,letterSpacing:".04em",textTransform:"uppercase",color:"var(--muted)",marginTop:8,marginBottom:2}}><span>Story force F<sub>x</sub></span><span></span></div>
+                  <div className="row"><span>F roof (L2)</span><b style={{color:"var(--ink)"}}>{Math.round(seis2.Froof).toLocaleString()}<small>lbs</small></b></div>
+                  <div className="row"><span>F floor (L1)</span><b style={{color:"var(--ink)"}}>{Math.round(seis2.Ffloor).toLocaleString()}<small>lbs</small></b></div>
+                  {/* Phase 4 — per-level plan plf (face load = F / extent ⟂ the force) */}
+                  <div className="row" style={{fontSize:10.5,fontWeight:800,letterSpacing:".04em",textTransform:"uppercase",color:"var(--muted)",marginTop:8,marginBottom:2}}><span>Plan plf · {activeFloor===2?"Roof (L2)":"Floor (L1)"} view</span><span></span></div>
+                  <div className="row" style={{fontSize:11,color:"var(--muted)"}}>
+                    <span>X-dir face load (⟂ {Math.round(seisViewExtent.dy)}′)</span><b style={{color:"var(--ink)"}}>{fmt2(wSeisX)}<small>plf</small></b>
+                  </div>
+                  <div className="row" style={{fontSize:11,color:"var(--muted)"}}>
+                    <span>Y-dir face load (⟂ {Math.round(seisViewExtent.dx)}′)</span><b style={{color:"var(--ink)"}}>{fmt2(wSeisY)}<small>plf</small></b>
+                  </div>
+                </>)}
+                <p className="hint" style={{marginTop:6,marginBottom:0}}>The <b>Plan plf</b> follows the <b>floor selector</b> (below the canvas) — Level 2 shows the roof diaphragm, Level 1 the floor diaphragm. Toggle <b>Load case → Seismic</b> to map them onto the plan boundary as plf loads + wall reactions.</p>
+                {!loop && <p className="hint" style={{marginTop:6,marginBottom:0}}>Close the plan boundary to get the diaphragm areas.</p>}
+              </>) : (
+                <p className="hint" style={{marginTop:0,marginBottom:0}}>Draw a closed plan to compute the per-diaphragm seismic weight.</p>
+              )}
             </div>
           )}
 
