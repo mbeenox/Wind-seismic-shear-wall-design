@@ -15,7 +15,7 @@ import {
 //   • APP_VERSION (here)      — human-facing build number in the UI ("Version 1.00").
 //   • CURRENT_VERSION (~below)— save-file SCHEMA version; drives .wps migrations. Do NOT couple.
 //   • handoff "rev" number    — the dev changelog in PLAN_SKETCHER_SUITE_HANDOFF.md.
-const APP_BUILD = 147;                                                                 // +1 per release
+const APP_BUILD = 148;                                                                 // +1 per release
 const APP_VERSION = `${Math.floor(APP_BUILD / 100)}.${String(APP_BUILD % 100).padStart(2, "0")}`;  // "1.00"
 
 // ── geometry space: 1 unit = 1 ft ──────────────────────────────────────────
@@ -2761,17 +2761,9 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
       </div>
 
       {/* ── COMMAND BAR (mini-ribbon, pinned below the suite tab bar) ──
-          Draft toggles (Draw/Snap/Ortho/Dims) live here ONLY; Presets live in the side panel ONLY. ── */}
+          Draft toggles (Draw/Snap/Ortho/Dims) live here ONLY; Presets live in the side panel ONLY.
+          File (New/Open/Save) moved to the persistent app-level toolbar (rev 69) — accessible from every tab. ── */}
       <div className="ribbon">
-        <div className="rgroup">
-          <div className="rlabel">File</div>
-          <div className="rbtns">
-            <button className="rbtn" title="New project" onClick={()=>fileOps&&fileOps.onNew()}>🗋 New</button>
-            <button className="rbtn" title="Open project (Ctrl+O)" onClick={()=>fileOps&&fileOps.onOpen()}>📂 Open</button>
-            <button className="rbtn" title="Save project (Ctrl+S)" onClick={()=>fileOps&&fileOps.onSave()}>💾 Save</button>
-          </div>
-        </div>
-        <div className="rsep"/>
         <div className="rgroup">
           <div className="rlabel">Edit</div>
           <div className="rbtns">
@@ -4945,6 +4937,17 @@ const APP_CSS = `
 }
 /* Suite tab bar as a drawing title block */
 .tbar{ box-shadow:0 1px 0 rgba(28,39,51,.06); }
+/* (rev 69) persistent file toolbar — sits above the tab bar inside the sticky header; reachable on every tab */
+.apphdr{ box-shadow:0 2px 10px -7px rgba(28,39,51,.35); }
+.filebar{ display:flex; align-items:center; gap:6px; padding:5px 16px; background:#ECEAE2; border-bottom:1px solid #D8D4C8; }
+.filebar .fblabel{ font-family:'IBM Plex Mono',ui-monospace,monospace; font-size:9px; letter-spacing:.22em;
+  color:#67737F; font-weight:600; text-transform:uppercase; margin-right:8px; }
+.filebtn{ border:1px solid #D8D4C8; background:#FFFFFF; color:#1C2733; font-family:'IBM Plex Sans','Helvetica Neue',Arial,sans-serif;
+  font-size:11.5px; font-weight:600; padding:4px 12px; border-radius:4px; cursor:pointer;
+  transition:border-color .14s ease, color .14s ease, background .14s ease; }
+.filebtn:hover{ border-color:#23577F; color:#23577F; background:#F6F9FB; }
+.filebtn:active{ box-shadow:inset 0 1px 3px rgba(28,39,51,.18); }
+@media print{ .filebar{ display:none; } }
 .tbrand{ border-right:1px solid #DAD6CA; align-self:stretch; display:flex; flex-direction:column; justify-content:center; }
 .tbrand small{ font-family:'IBM Plex Mono',ui-monospace,monospace; font-size:8.5px; letter-spacing:.22em; color:#67737F; font-weight:500; }
 .ttab{ position:relative; transition:color .14s ease, background .14s ease; }
@@ -5535,20 +5538,31 @@ export default function App() {
       <style>{LT_CSS}</style>
       {/* tab bar */}
       <style>{APP_CSS}</style>
-      <div ref={tabBarRef} className="no-print tbar" style={{ display:"flex", alignItems:"center", borderBottom:`1px solid ${SW.rule}`, background:SW.sheet, position:"sticky", top:0, zIndex:40 }}>
-        <div className="tbrand" style={{ padding:"6px 16px" }}>
-          <div style={{ fontSize:12, fontWeight:800, letterSpacing:"0.06em", color:SW.ink }}>
-            PLAN<span style={{color:SW.accent}}>·</span>SKETCHER <span style={{color:SW.faint,fontWeight:400}}>+ Shear Walls</span>
-          </div>
-          <small>STRUCTURAL SUITE</small>
+      {/* persistent app-level header: file toolbar (rev 69) + suite tab bar, in ONE sticky wrapper so
+          New/Open/Save are reachable from every tab and the Plan ribbon / Design constraints stick below
+          the WHOLE header (tabBarRef now measures the wrapper, so --tabbar-h includes the file bar). */}
+      <div ref={tabBarRef} className="no-print apphdr" style={{ position:"sticky", top:0, zIndex:40 }}>
+        <div className="filebar">
+          <div className="fblabel">Project</div>
+          <button className="filebtn" title="New project" onClick={onNew}>🗋 New</button>
+          <button className="filebtn" title="Open project (Ctrl+O)" onClick={onOpen}>📂 Open</button>
+          <button className="filebtn" title="Save project (Ctrl+S)" onClick={onSave}>💾 Save</button>
         </div>
-        {tabBtn("plan","Plan Sketcher")}
-        {tabBtn("design","Design")}
-        {tabBtn("calc","Calculation Sheet", actU.length ? calcOK : undefined)}
-        <div style={{ marginLeft:"auto", padding:"6px 16px", fontFamily:MONO, fontSize:11, fontWeight:700,
-                      letterSpacing:"0.08em", color:SW.faint, whiteSpace:"nowrap" }}
-             title="App version">
-          Version {APP_VERSION}
+        <div className="tbar" style={{ display:"flex", alignItems:"center", borderBottom:`1px solid ${SW.rule}`, background:SW.sheet }}>
+          <div className="tbrand" style={{ padding:"6px 16px" }}>
+            <div style={{ fontSize:12, fontWeight:800, letterSpacing:"0.06em", color:SW.ink }}>
+              PLAN<span style={{color:SW.accent}}>·</span>SKETCHER <span style={{color:SW.faint,fontWeight:400}}>+ Shear Walls</span>
+            </div>
+            <small>STRUCTURAL SUITE</small>
+          </div>
+          {tabBtn("plan","Plan Sketcher")}
+          {tabBtn("design","Design")}
+          {tabBtn("calc","Calculation Sheet", actU.length ? calcOK : undefined)}
+          <div style={{ marginLeft:"auto", padding:"6px 16px", fontFamily:MONO, fontSize:11, fontWeight:700,
+                        letterSpacing:"0.08em", color:SW.faint, whiteSpace:"nowrap" }}
+               title="App version">
+            Version {APP_VERSION}
+          </div>
         </div>
       </div>
       {/* keep the sketcher mounted so the plan survives tab switches */}
