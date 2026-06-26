@@ -15,7 +15,7 @@ import {
 //   • APP_VERSION (here)      — human-facing build number in the UI ("Version 1.00").
 //   • CURRENT_VERSION (~below)— save-file SCHEMA version; drives .wps migrations. Do NOT couple.
 //   • handoff "rev" number    — the dev changelog in PLAN_SKETCHER_SUITE_HANDOFF.md.
-const APP_BUILD = 143;                                                                 // +1 per release
+const APP_BUILD = 144;                                                                 // +1 per release
 const APP_VERSION = `${Math.floor(APP_BUILD / 100)}.${String(APP_BUILD % 100).padStart(2, "0")}`;  // "1.00"
 
 // ── geometry space: 1 unit = 1 ft ──────────────────────────────────────────
@@ -2687,6 +2687,16 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
         </div>
         <div className="rsep"/>
         <div className="rgroup">
+          <div className="rlabel">Inputs</div>
+          <div className="rbtns">
+            <button className="rbtn"
+              disabled={graph.edges.length===0}
+              title={graph.edges.length===0 ? "Draw at least one wall first" : "Apply wall/parapet heights and pressures to the whole building"}
+              onClick={openGlobalInputs}>⚙ Global inputs…</button>
+          </div>
+        </div>
+        <div className="rsep"/>
+        <div className="rgroup">
           <div className="rlabel">Draft</div>
           <div className="rbtns">
             <button className={"rbtn"+(drawMode?" ron":"")} title="Draw walls — click to chain segments" onClick={toggleDrawMode}>✏ Draw</button>
@@ -2954,17 +2964,6 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
             <div className="row"><span>Walls</span><b>{graph.edges.length}</b></div>
             <div className="row"><span>Total wall</span><b>{Math.round(totalLen)}<small>ft</small></b></div>
             <div className="row"><span>Enclosed area</span><b>{loop?Math.round(loop.area):"—"}{loop&&<small>ft²</small>}</b></div>
-          </div>
-
-          <div className="card">
-            <h4>Global Inputs</h4>
-            <p className="hint" style={{marginTop:0,marginBottom:8}}>
-              Set wall height, parapet height, and wind pressures for every wall at once{twoStory?" (per level in 2-Story mode)":""}.
-            </p>
-            <button className="btn" style={{width:"100%",fontWeight:700}}
-              disabled={graph.edges.length===0}
-              title={graph.edges.length===0 ? "Draw at least one wall first" : "Apply wall/parapet heights and pressures to the whole building"}
-              onClick={openGlobalInputs}>⚙ Global inputs…</button>
           </div>
 
           <div className="card">
@@ -3329,7 +3328,7 @@ function calcPushSig(line, segs, res, dC){
     rt: (line && line.roofTrib != null)  ? line.roofTrib  : (dC ? dC.roofTrib  : null),
     ft: (line && line.floorTrib != null) ? line.floorTrib : (dC ? dC.floorTrib : null),
     segs: (segs || []).map(s => s.length),
-    types: (res || []).map(r => (r && isNum(r.selType)) ? Math.min(r.selType, 3) : 1),
+    types: (res || []).map(r => (r && isNum(r.selType)) ? Math.min(r.selType, 6) : 1),
     d: dC ? [dC.hdDist, dC.thickness, dC.anchor, dC.ftgWidth, dC.ftgThick] : [],
   });
 }
@@ -3365,7 +3364,7 @@ function optimizeSig(linesByFloor, lines, twoStory, g, d){
 // result WITHOUT touching calcSegment (engine stays verbatim per handoff §2).
 function withUtil(r, seg, grade) {
   if (!r || !r.active) return r;
-  const selT = schedFor(grade)[Math.max(0, Math.min(2, (seg.selType || 1) - 1))];
+  const selT = schedFor(grade)[Math.max(0, Math.min(5, (seg.selType || 1) - 1))];
   const utilW = r.vW / selT.wind;
   const utilS = r.vS / (r.factor * selT.seismic);
   const { Pa224, Pa44, Pa226, Pa46, Pa66, Pa68 } = r.Pa;
@@ -3686,8 +3685,8 @@ function CalcSheet({ g, setGl, segments, setSegments, results, totalL, marks }) 
                   <option value="str1">1/2&Prime; Structural I</option>
                 </select>
               </td></tr>
-              <tr><td style={{ paddingTop: 6 }}>Type 1/2/3 wind (plf)</td><td style={{ textAlign: "right", fontFamily: MONO, paddingTop: 6 }}>{schedFor(g.grade).map((t) => t.wind).join(" / ")}</td></tr>
-              <tr><td>Type 1/2/3 seismic (plf)</td><td style={{ textAlign: "right", fontFamily: MONO }}>{schedFor(g.grade).map((t) => t.seismic).join(" / ")}</td></tr>
+              <tr><td style={{ paddingTop: 6 }}>Type 1/2/3 wind (plf)</td><td style={{ textAlign: "right", fontFamily: MONO, paddingTop: 6 }}>{schedFor(g.grade).slice(0,3).map((t) => t.wind).join(" / ")}</td></tr>
+              <tr><td>Type 1/2/3 seismic (plf)</td><td style={{ textAlign: "right", fontFamily: MONO }}>{schedFor(g.grade).slice(0,3).map((t) => t.seismic).join(" / ")}</td></tr>
             </tbody></table>
           </div>
         </div>
@@ -3745,6 +3744,7 @@ function CalcSheet({ g, setGl, segments, setSegments, results, totalL, marks }) 
                   <td key={i} style={{ padding: "4px 8px", textAlign: "right" }}>
                     <select value={s.selType} onChange={(e) => setSeg(i, "selType", +e.target.value)} style={ltSel}>
                       <option value={1}>1</option><option value={2}>2</option><option value={3}>3</option>
+                      <option value={4}>4 (2-sided)</option><option value={5}>5 (2-sided)</option><option value={6}>6 (2-sided)</option>
                     </select>
                   </td>
                 ))}
@@ -3950,7 +3950,7 @@ function lineResults(line, segs, g, d) {
     const r1 = calcSegment({ ...base, selType: 1 }, gL, totalL);
     let autoType = 1;
     if (r1.active && isNum(r1.sugS) && isNum(r1.sugW)) autoType = Math.max(r1.sugS, r1.sugW);
-    const selType = s.ov && s.ov.type ? s.ov.type : Math.min(autoType, 3);
+    const selType = s.ov && s.ov.type ? s.ov.type : Math.min(autoType, 6);
     const r = calcSegment({ ...base, selType }, gL, totalL);
     const ovBad = {
       type: s.ov && s.ov.type ? r.status !== "OK" : false,
@@ -4074,7 +4074,7 @@ function stackSeg(r1, r2, L, g, d, h) {
   // ── Deflection (engine's defl shape; shear v unchanged, chord uses the STACKED post) ──
   const Epost = ["(2) 2x4","4x4","(2) 2x6","4x6"].includes(post) ? (sp ? 1400000 : 1600000) : (sp ? 1500000 : 1300000);
   const Apost = post === "(2) 2x4" ? 10.5 : post === "4x4" ? 12.25 : post === "(2) 2x6" ? 16.5 : post === "4x6" ? 19.25 : post === "6x6" ? 30.25 : 39.875;
-  const Ga = r1.selType === 1 ? SCHED[0].ga : r1.selType === 2 ? SCHED[1].ga : SCHED[2].ga;
+  const Ga = SCHED[Math.max(0, Math.min(SCHED.length - 1, r1.selType - 1))].ga;  // marks 1–6; 4–6 carry 2× combined Ga
   const defl = (v) => (8*(v/0.7)*Math.pow(h,3))/(Epost*Apost*L) + ((v/0.7)*h)/(1000*Ga) + (h/L)*0.125;
   const deflS = defl(r1.vS);
   const deflW = defl(r1.vW);
@@ -4201,7 +4201,7 @@ const letterOf = (k) => { let s = ""; k += 1; while (k > 0) { k -= 1; s = String
 // touch NO guarded fn — same out-of-engine pattern as withUtil. Return "W"/"S" or null (neither acts).
 const _govShearCase = (r, grade) => {
   if (!r || !isNum(r.selType)) return null;
-  const t = schedFor(grade)[Math.max(0, Math.min(2, r.selType - 1))];
+  const t = schedFor(grade)[Math.max(0, Math.min(5, r.selType - 1))];
   const uW = t.wind ? r.vW / t.wind : 0;
   const uS = (r.factor * t.seismic) ? r.vS / (r.factor * t.seismic) : 0;
   if (uW <= 0 && uS <= 0) return null;
@@ -4659,8 +4659,8 @@ function DesignTab({ g, setGl, shape, lines, linesByFloor, segsByLine, setSegsBy
               <PinRow label="Sheathing" grow><select value={g.grade === "str1" ? "str1" : "rated"} onChange={(e)=>setGl("grade",e.target.value)} style={{ ...pinSelS, width:"100%", flex:"1 1 auto", minWidth:0 }}><option value="rated">1/2&Prime; rated</option><option value="str1">1/2&Prime; Structural I</option></select></PinRow>
               <PinRow label="Max SW type" grow><select value={d.maxType} onChange={(e)=>setDk("maxType",+e.target.value)} style={{ ...pinSelS, width:"100%", flex:"1 1 auto", minWidth:0 }}><option value={1}>1</option><option value={2}>2</option><option value={3}>3</option></select></PinRow>
               <div style={{ gridColumn:"1 / -1", marginTop:1, fontSize:9, color:SW.faint, lineHeight:1.55 }}>
-                <div style={{ display:"flex", justifyContent:"space-between" }}><span>Allow. W (plf)</span><span style={{ fontFamily:MONO, color:SW.ink, fontWeight:600 }}>{schedFor(g.grade).map((t)=>t.wind).join("/")}</span></div>
-                <div style={{ display:"flex", justifyContent:"space-between" }}><span>Allow. S (plf)</span><span style={{ fontFamily:MONO, color:SW.ink, fontWeight:600 }}>{schedFor(g.grade).map((t)=>t.seismic).join("/")}</span></div>
+                <div style={{ display:"flex", justifyContent:"space-between" }}><span>Allow. W (plf)</span><span style={{ fontFamily:MONO, color:SW.ink, fontWeight:600 }}>{schedFor(g.grade).slice(0,3).map((t)=>t.wind).join("/")}</span></div>
+                <div style={{ display:"flex", justifyContent:"space-between" }}><span>Allow. S (plf)</span><span style={{ fontFamily:MONO, color:SW.ink, fontWeight:600 }}>{schedFor(g.grade).slice(0,3).map((t)=>t.seismic).join("/")}</span></div>
               </div>
             </PinCard>
           </div>
@@ -4871,10 +4871,12 @@ button:focus-visible, select:focus-visible, input:focus-visible{ outline:2px sol
 // consume them, so any field ADDED here in the future auto-fills its default on an OLD file
 // (the dominant forward-compat risk: a wholesale setG/setD/setSegments leaving a new field
 // `undefined`). Keep these byte-faithful to the prior inline inits — a value change here is a
-// behavior change for current files. NOTE: `g.grade` is deliberately NOT included (the calc
-// engine treats a falsy grade as "rated", so omitting it keeps the save shape unchanged and
-// current files byte-identical; add it here only if you want new saves to carry grade:"rated").
-const DEFAULT_G   = { code:4, species:1, line:"1", vSeismic:5, sds:1, R:6.5, wWind:26000, roofDL:20, floorDL:0, wallDL:15, Cs:0.05 };
+// behavior change for current files. NOTE: `g.grade` defaults to "str1" (Structural I) — rev 65, by
+// request. It now rides in DEFAULT_G, so new sessions default to Structural I AND a toggled grade
+// round-trips through save/load via the {...DEFAULT_G, ...calc.g} merge. An OLD file with no stored
+// grade reopens as "str1" (no live .wps files predate this; the engine still reads a falsy grade as
+// "rated"). To revert the default, set grade:"rated" here.
+const DEFAULT_G   = { code:4, species:1, line:"1", vSeismic:5, sds:1, R:6.5, wWind:26000, roofDL:20, floorDL:0, wallDL:15, Cs:0.05, grade:"str1" };
 const DEFAULT_D   = { thickness:5.5, anchor:"Concrete", roofTrib:2, floorTrib:0, hdDist:5,
                       minSegLen:4, maxSegLen:12, maxSegments:4, maxType:3, snap:0.5,
                       objective:"length", ftgWidth:1.33, ftgThick:12, height:15, lineLength:40 };
@@ -5228,7 +5230,7 @@ export default function App() {
       // every sent segment seeds with it, still editable per-segment on the sheet afterward.
       height: line.heightFt, roofTrib: line.roofTrib ?? dC.roofTrib, floorTrib: line.floorTrib ?? dC.floorTrib,
       hdDist: dC.hdDist, thickness: dC.thickness, anchor: dC.anchor,
-      selType: res[i] && isNum(res[i].selType) ? Math.min(res[i].selType, 3) : 1,
+      selType: res[i] && isNum(res[i].selType) ? Math.min(res[i].selType, 6) : 1,
       ftgWidth: dC.ftgWidth, ftgThick: dC.ftgThick,
     }));
     const wWind = Math.round(line.forceLbs);

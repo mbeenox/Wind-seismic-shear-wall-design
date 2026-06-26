@@ -11,6 +11,17 @@
      • rev 61 — calcSegment: E_seis dropped its /R, so vSeismic is now the
        post-R (ASCE 7 reduced) seismic base shear, parallel to wWind; the
        engine applies only the 0.7 ASD factor. g.R is no longer read here.
+     • rev 65 — DOUBLE-SIDED shear walls (marks 4–6): SCHEDULE/SCHEDULE_STR1
+       gain three derived rows = the single-sided rows with 2× wind, 2×
+       seismic, 2× Ga and the "BOTH SIDES OF WALL" callout; NAIL_EDGE gains
+       4/5/6; calcSegment's sugS/sugW/allowS ladders + the deflection Ga
+       index extend to 6 marks; generateDesign now treats 4–6 as a LAST
+       RESORT (single-sided 1–3 is searched first; doubles only if nothing
+       single-sided passes). For any demand a single-sided design satisfies,
+       calcSegment AND generateDesign are OUTPUT-identical to the rev-64
+       engine — the new marks change output only above single-sided capacity
+       (where the engine previously returned "FAILED!!!"). Single-sided rows
+       1–3 are byte-identical to the verbatim source.
 
    Self-contained: depends only on Math + the helpers defined in this file
    (no React, no geometry/sketcher imports), so there is no circular
@@ -25,20 +36,36 @@
 // Sheathing-grade schedules. SCHEDULE (rated) = original "Plywood Shear Wall - Wood Studs.xlsx";
 // SCHEDULE_STR1 extracted verbatim from "shear_walls_-_Structural_1.xlsx" (formula-identical workbook,
 // only Shearwall Schedule capacities + Ga differ). Nailing/anchorage callouts identical between grades.
-const SCHEDULE = [
+// Single-sided base rows (marks 1–3) — extracted verbatim from the source workbooks; DO NOT edit values.
+const SCHEDULE_1S = [
   { mark: 1, sheathing: '1/2" WOOD STR. PANELS — ONE SIDE OF WALL', edge: '10d COMMON AT 6" O.C.', field: '10d COMMON AT 12" O.C.', concrete: '1/2" DIA. A.B. AT 36" O.C.', wood: '16d STAGGERED AT 6" O.C.', wind: 435, seismic: 310, ga: 14 * 1.2 },
   { mark: 2, sheathing: '1/2" WOOD STR. PANELS — ONE SIDE OF WALL', edge: '10d COMMON AT 4" O.C.', field: '10d COMMON AT 12" O.C.', concrete: '1/2" DIA. A.B. AT 24" O.C.', wood: '16d STAGGERED AT 4" O.C.', wind: 645, seismic: 460, ga: 17 * 1.2 },
   { mark: 3, sheathing: '1/2" WOOD STR. PANELS — ONE SIDE OF WALL', edge: '10d COMMON AT 3" O.C.', field: '10d COMMON AT 12" O.C.', concrete: '1/2" DIA. A.B. AT 18" O.C.', wood: '16d STAGGERED AT 3" O.C.', wind: 840, seismic: 600, ga: 19 * 1.2 },
 ];
-const SCHEDULE_STR1 = [
+const SCHEDULE_STR1_1S = [
   { mark: 1, sheathing: '1/2" WOOD STR. PANELS-STR. 1 — ONE SIDE OF WALL', edge: '10d COMMON AT 6" O.C.', field: '10d COMMON AT 12" O.C.', concrete: '1/2" DIA. A.B. AT 36" O.C.', wood: '16d STAGGERED AT 6" O.C.', wind: 475, seismic: 340, ga: 16 * 1.2 },
   { mark: 2, sheathing: '1/2" WOOD STR. PANELS-STR. 1 — ONE SIDE OF WALL', edge: '10d COMMON AT 4" O.C.', field: '10d COMMON AT 12" O.C.', concrete: '1/2" DIA. A.B. AT 24" O.C.', wood: '16d STAGGERED AT 4" O.C.', wind: 715, seismic: 510, ga: 20 * 1.2 },
   { mark: 3, sheathing: '1/2" WOOD STR. PANELS-STR. 1 — ONE SIDE OF WALL', edge: '10d COMMON AT 3" O.C.', field: '10d COMMON AT 12" O.C.', concrete: '1/2" DIA. A.B. AT 18" O.C.', wood: '16d STAGGERED AT 3" O.C.', wind: 930, seismic: 665, ga: 22 * 1.2 },
 ];
+// DOUBLE-SIDED variant (user-sanctioned addition): sheathe BOTH faces with the same panel/nailing.
+// Shear capacity is EXACTLY 2× the single-sided counterpart (wind & seismic both ×2); the apparent
+// shear stiffness Ga is also 2× (combined two-sided value per SDPWS 4.3.3.4 — affects deflection only,
+// not capacity). Identical edge/field/anchorage callouts, applied each side. Marks are 4/5/6 = the
+// double of 1/2/3. Derived from the single-sided rows so the ×2 can never drift out of sync.
+const dblSide = (t, mark) => ({ ...t, mark,
+  sheathing: t.sheathing.replace("ONE SIDE OF WALL", "BOTH SIDES OF WALL"),
+  wind: t.wind * 2, seismic: t.seismic * 2, ga: t.ga * 2, doubleSided: true });
+const withDbl = (rows) => [ ...rows, dblSide(rows[0], 4), dblSide(rows[1], 5), dblSide(rows[2], 6) ];
+// Full 6-mark schedules (1–3 single-sided, 4–6 double-sided). Single-sided rows are byte-identical
+// to the verbatim source; the optimizer treats 4–6 as a LAST RESORT (see generateDesign).
+const SCHEDULE = withDbl(SCHEDULE_1S);
+const SCHEDULE_STR1 = withDbl(SCHEDULE_STR1_1S);
 // grade ∈ {"rated","str1"}; absent/unknown → rated (backward-compatible with v1 .wps files)
 const schedFor = (grade) => (grade === "str1" ? SCHEDULE_STR1 : SCHEDULE);
-// compact edge-nailing callouts per schedule mark (keep in sync with SCHEDULE above)
-const NAIL_EDGE = { 1: '10d-6" o.c. @ edges', 2: '10d-4" o.c. @ edges', 3: '10d-3" o.c. @ edges' };
+// compact edge-nailing callouts per schedule mark (keep in sync with SCHEDULE above).
+// 4/5/6 mirror 1/2/3 with a "(2 sides)" suffix — same nailing applied to both faces.
+const NAIL_EDGE = { 1: '10d-6" o.c. @ edges', 2: '10d-4" o.c. @ edges', 3: '10d-3" o.c. @ edges',
+                    4: '10d-6" o.c. @ edges (2 sides)', 5: '10d-4" o.c. @ edges (2 sides)', 6: '10d-3" o.c. @ edges (2 sides)' };
 const CODES = { 1:"2006 INTERNATIONAL BUILDING CODE (IBC)", 2:"2009 INTERNATIONAL BUILDING CODE (IBC)", 3:"2012 INTERNATIONAL BUILDING CODE (IBC)", 4:"2015 INTERNATIONAL BUILDING CODE (IBC)" };
 const HD_TABLE = [
   { name:"HDU2", cap:3075 }, { name:"HDU4", cap:4565 }, { name:"HDU5", cap:5645 },
@@ -65,9 +92,15 @@ function calcSegment(seg, g, totalL) {
   const Fs = (E_seis * L) / totalL;
   const vS = Fs / L;
   const factor = aspectNG || aspect >= 2 ? (2 * L) / h : 1;
-  const [s1, s2, s3] = SCHED.map((t) => t.seismic);
-  const allowS = vS <= factor*s1 ? factor*s1 : vS <= factor*s2 ? factor*s2 : vS <= factor*s3 ? factor*s3 : "FAILED!!!";
-  const sugS = aspectNG ? "None" : vS <= factor*s1 ? 1 : vS <= factor*s2 ? 2 : vS <= factor*s3 ? 3 : "FAILED!!!";
+  // Capacity ladder is 6 marks: 1–3 single-sided, 4–6 double-sided (2× the single capacity). Because
+  // 2×(mark 1) ≥ mark 3 in every schedule, the ladder is monotonic and 4–6 are only reached once 1–3
+  // are exceeded — output is byte-identical to the old 3-mark engine for any demand ≤ mark-3 capacity.
+  const sV = SCHED.map((t) => t.seismic);
+  const allowS = vS <= factor*sV[0] ? factor*sV[0] : vS <= factor*sV[1] ? factor*sV[1] : vS <= factor*sV[2] ? factor*sV[2]
+               : vS <= factor*sV[3] ? factor*sV[3] : vS <= factor*sV[4] ? factor*sV[4] : vS <= factor*sV[5] ? factor*sV[5] : "FAILED!!!";
+  const sugS = aspectNG ? "None"
+             : vS <= factor*sV[0] ? 1 : vS <= factor*sV[1] ? 2 : vS <= factor*sV[2] ? 3
+             : vS <= factor*sV[3] ? 4 : vS <= factor*sV[4] ? 5 : vS <= factor*sV[5] ? 6 : "FAILED!!!";
   const MotS = Fs * h;
   const A = 1 + 0.14 * g.sds;
   const AwDL = A * wdl;
@@ -80,8 +113,10 @@ function calcSegment(seg, g, totalL) {
   // WIND
   const Fw = (F_wind * L) / totalL;
   const vW = Fw / L;
-  const [w1, w2, w3] = SCHED.map((t) => t.wind);
-  const sugW = aspectNG ? "None" : vW <= w1 ? 1 : vW <= w2 ? 2 : vW <= w3 ? 3 : "FAILED!!!";
+  const wV = SCHED.map((t) => t.wind);
+  const sugW = aspectNG ? "None"
+             : vW <= wV[0] ? 1 : vW <= wV[1] ? 2 : vW <= wV[2] ? 3
+             : vW <= wV[3] ? 4 : vW <= wV[4] ? 5 : vW <= wV[5] ? 6 : "FAILED!!!";
   const MotW = Fw * h;
   const compW = (MotW + wdl * L * Math.min(3, L / 2)) / (L - (1.5 + seg.hdDist / 12) / 12); // E42 quirk preserved
   const Cfac = 0.6;
@@ -164,7 +199,7 @@ function calcSegment(seg, g, totalL) {
   // DEFLECTION
   const Epost = ["(2) 2x4","4x4","(2) 2x6","4x6"].includes(post) ? (sp ? 1400000 : 1600000) : (sp ? 1500000 : 1300000);
   const Apost = post === "(2) 2x4" ? 10.5 : post === "4x4" ? 12.25 : post === "(2) 2x6" ? 16.5 : post === "4x6" ? 19.25 : post === "6x6" ? 30.25 : 39.875;
-  const Ga = seg.selType === 1 ? SCHED[0].ga : seg.selType === 2 ? SCHED[1].ga : SCHED[2].ga;
+  const Ga = SCHED[Math.max(0, Math.min(SCHED.length - 1, seg.selType - 1))].ga;  // marks 1–6; 4–6 carry the 2× combined Ga
   const defl = (v) => (8*(v/0.7)*Math.pow(h,3))/(Epost*Apost*L) + ((v/0.7)*h)/(1000*Ga) + (h/L)*0.125;
   const deflS = defl(vS);
   const deflW = defl(vW);
@@ -209,19 +244,34 @@ function evaluateCandidate(Ls, totalL, g, d) {
 function generateDesign(g, d) {
   const snap = Math.max(0.25, d.snap || 0.5);
   const maxN = Math.max(1, Math.min(6, Math.floor(d.maxSegments)));
-  const solutions = [];
-  for (let T = 1; T <= d.maxType; T++) {
-    for (let N = 1; N <= maxN; N++) {
-      const maxLs = Math.min(d.maxSegLen, d.lineLength / N);
-      if (maxLs < d.minSegLen - 1e-9) continue;
-      const start = Math.ceil(d.minSegLen / snap) * snap;
-      for (let Ls = start; Ls <= maxLs + 1e-9; Ls = +(Ls + snap).toFixed(4)) {
-        const ev = evaluateCandidate(Ls, N * Ls, g, d);
-        if (ev && ev.type <= T) { solutions.push({ T: ev.type, N, Ls, total: N * Ls, r: ev.r }); break; }
+  // The "Max SW type" constraint caps the SINGLE-SIDED nailing the optimizer may use (1–3). Double-
+  // sided marks (4–6) are NOT a user ceiling — they are an automatic LAST RESORT (below).
+  const singleCap = Math.max(1, Math.min(3, Math.floor(d.maxType)));
+  // One sweep over a contiguous mark band [Tlo,Thi]; minMark gates out lower marks so the double-sided
+  // pass can't re-admit a single-sided solution the cap excluded. minMark=1 ⇒ inner gate is exactly the
+  // original `ev.type<=T`, so the single-sided sweep is byte-identical to the prior optimizer.
+  const sweep = (Tlo, Thi, minMark) => {
+    const sols = [];
+    for (let T = Tlo; T <= Thi; T++) {
+      for (let N = 1; N <= maxN; N++) {
+        const maxLs = Math.min(d.maxSegLen, d.lineLength / N);
+        if (maxLs < d.minSegLen - 1e-9) continue;
+        const start = Math.ceil(d.minSegLen / snap) * snap;
+        for (let Ls = start; Ls <= maxLs + 1e-9; Ls = +(Ls + snap).toFixed(4)) {
+          const ev = evaluateCandidate(Ls, N * Ls, g, d);
+          if (ev && ev.type <= T && ev.type >= minMark) { sols.push({ T: ev.type, N, Ls, total: N * Ls, r: ev.r }); break; }
+        }
       }
+      if (d.objective === "nailing" && sols.some((s) => s.T <= T)) break;
     }
-    if (d.objective === "nailing" && solutions.some((s) => s.T <= T)) break;
-  }
+    return sols;
+  };
+  // LAST RESORT: only fall to double-sided (4–6) when NO single-sided (1–singleCap) solution exists at
+  // all. The fallback accepts ONLY genuine double-sided requirements (mark ≥ 4) — a line that fails
+  // single-sided merely because of the user's cap is NOT silently upgraded. For any line a single-sided
+  // design can satisfy, this is byte-identical to the prior optimizer (the double sweep is never entered).
+  let solutions = sweep(1, singleCap, 1);
+  if (!solutions.length) solutions = sweep(4, 6, 4);
   if (!solutions.length) return null;
   solutions.sort((a, b) => d.objective === "nailing"
     ? a.T - b.T || a.total - b.total || a.N - b.N
