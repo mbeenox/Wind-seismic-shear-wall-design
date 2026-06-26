@@ -15,7 +15,7 @@ import {
 //   • APP_VERSION (here)      — human-facing build number in the UI ("Version 1.00").
 //   • CURRENT_VERSION (~below)— save-file SCHEMA version; drives .wps migrations. Do NOT couple.
 //   • handoff "rev" number    — the dev changelog in PLAN_SKETCHER_SUITE_HANDOFF.md.
-const APP_BUILD = 148;                                                                 // +1 per release
+const APP_BUILD = 149;                                                                 // +1 per release
 const APP_VERSION = `${Math.floor(APP_BUILD / 100)}.${String(APP_BUILD % 100).padStart(2, "0")}`;  // "1.00"
 
 // ── geometry space: 1 unit = 1 ft ──────────────────────────────────────────
@@ -2018,6 +2018,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
       // captured fresh because this effect has no dep array and re-registers on every render.
       rerun: runDesignHandoff,
       hasReactions: !!((secH && secH.reactions && secH.reactions.length) || (secV && secV.reactions && secV.reactions.length)),
+      undo, redo,   // (rev 70) promoted to the app-level toolbar; re-registered every render so they stay current
     });
   });
   const toggleDrawMode = useCallback(()=>{
@@ -2767,8 +2768,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
         <div className="rgroup">
           <div className="rlabel">Edit</div>
           <div className="rbtns">
-            <button className="rbtn" title="Undo (Ctrl+Z)" onClick={undo}>↶ Undo</button>
-            <button className="rbtn" title="Redo (Ctrl+Y / Ctrl+Shift+Z)" onClick={redo}>↷ Redo</button>
+            {/* Undo/Redo promoted to the app-level file toolbar (rev 70); Clear stays (plan-specific). */}
             <button className="rbtn" title="Clear the plan" onClick={clearAll}>🗑 Clear</button>
           </div>
         </div>
@@ -4947,6 +4947,15 @@ const APP_CSS = `
   transition:border-color .14s ease, color .14s ease, background .14s ease; }
 .filebtn:hover{ border-color:#23577F; color:#23577F; background:#F6F9FB; }
 .filebtn:active{ box-shadow:inset 0 1px 3px rgba(28,39,51,.18); }
+/* (rev 70) project-name input, group separator, and last-saved status in the file bar */
+.fbname{ border:1px solid #D8D4C8; background:#FFFFFF; color:#1C2733; font-family:'IBM Plex Sans','Helvetica Neue',Arial,sans-serif;
+  font-size:11.5px; font-weight:600; padding:4px 9px; border-radius:4px; width:170px; margin-right:4px;
+  transition:border-color .14s ease, box-shadow .14s ease; }
+.fbname:focus{ outline:none; border-color:#23577F; box-shadow:0 0 0 2px rgba(35,87,127,.15); }
+.fbname::placeholder{ color:#9AA3AC; font-weight:500; }
+.fbsep{ width:1px; align-self:stretch; margin:2px 6px; background:#D8D4C8; }
+.fbstatus{ margin-left:auto; font-family:'IBM Plex Mono',ui-monospace,monospace; font-size:10.5px; font-weight:600;
+  letter-spacing:.04em; color:#67737F; white-space:nowrap; }
 @media print{ .filebar{ display:none; } }
 .tbrand{ border-right:1px solid #DAD6CA; align-self:stretch; display:flex; flex-direction:column; justify-content:center; }
 .tbrand small{ font-family:'IBM Plex Mono',ui-monospace,monospace; font-size:8.5px; letter-spacing:.22em; color:#67737F; font-weight:500; }
@@ -5245,9 +5254,12 @@ export default function App() {
   const projectRef = useRef(null);                       // sketcher get/set, registered below
   const fileInputRef = useRef(null);
   const registerProject = useCallback((api)=>{ projectRef.current=api; },[]);
+  const [projectName, setProjectName] = useState("Untitled");   // (rev 70) editable name → save filename, round-trips in .wps
+  const [lastSaved, setLastSaved] = useState(null);             // (rev 70) ms timestamp of last save (or the loaded file's savedAt)
   const onSave = useCallback(()=>{
     const sk = projectRef.current ? projectRef.current.get() : null;
-    const proj = { app:"plan-sketcher-suite", version:CURRENT_VERSION, savedAt:new Date().toISOString(),
+    const now = new Date();
+    const proj = { app:"plan-sketcher-suite", version:CURRENT_VERSION, savedAt:now.toISOString(), name:projectName,
                    sketcher:sk, design:{ linesByFloor:designLinesByFloor, shape:designShape, segsByLine, d, selLine },
                    // calc.tabs is the rev-132 sub-tab model; calc.segments is kept (= active tab) so a
                    // pre-132 build can still open the file and show at least the active wall.
@@ -5255,10 +5267,12 @@ export default function App() {
     const blob = new Blob([JSON.stringify(proj,null,1)], {type:"application/json"});
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
-    a.download = "plan-project.wps";
+    const fname = (projectName||"").trim().replace(/[^\w.\- ]+/g,"_").replace(/\s+/g,"-") || "plan-project";
+    a.download = fname.toLowerCase().endsWith(".wps") ? fname : fname + ".wps";
     a.click();
     URL.revokeObjectURL(a.href);
-  },[designLinesByFloor, designShape, segsByLine, d, g, segments, calcTabs, activeCalcId, tab, hlSel, selLine, twoStory, activeFloor]);
+    setLastSaved(now.getTime());                                // (rev 70) update the "Saved …" status
+  },[designLinesByFloor, designShape, segsByLine, d, g, segments, calcTabs, activeCalcId, tab, hlSel, selLine, twoStory, activeFloor, projectName]);
   const onOpen = useCallback(()=>{ fileInputRef.current && fileInputRef.current.click(); },[]);
   const onFileChosen = useCallback((e)=>{
     const f = e.target.files && e.target.files[0];
@@ -5293,6 +5307,8 @@ export default function App() {
         setTwoStory(L.ui.twoStory);
         setActiveFloor(L.ui.activeFloor);
         setTab(L.ui.tab);
+        setProjectName(typeof raw.name==="string" && raw.name.trim() ? raw.name : "Untitled");   // (rev 70)
+        setLastSaved(raw.savedAt ? (Date.parse(raw.savedAt)||null) : null);                       // (rev 70) show the file's own save time
       }catch(err){ window.alert("Could not open project: "+err.message); }
     };
     rd.readAsText(f);
@@ -5305,6 +5321,7 @@ export default function App() {
     setCalcPush(null);                              // rev 130: clear stale-calc memory on New
     setOptimizePush(null);                          // rev 130b: clear stale-optimize memory on New
     setTwoStory(false); setActiveFloor(1);
+    setProjectName("Untitled"); setLastSaved(null);   // (rev 70) fresh project → fresh name + no save time
   },[]);
   // rev 24: the Design-tab stale banner rebuilds geometry-less lines from the restored plan. If the
   // saved plan still has a wind reaction, regenerate straight from it (rerun → onDesignShearWalls,
@@ -5544,9 +5561,22 @@ export default function App() {
       <div ref={tabBarRef} className="no-print apphdr" style={{ position:"sticky", top:0, zIndex:40 }}>
         <div className="filebar">
           <div className="fblabel">Project</div>
+          <input className="fbname" value={projectName} spellCheck={false}
+                 onChange={e=>setProjectName(e.target.value)}
+                 placeholder="Untitled" title="Project name — used as the saved file name"/>
           <button className="filebtn" title="New project" onClick={onNew}>🗋 New</button>
           <button className="filebtn" title="Open project (Ctrl+O)" onClick={onOpen}>📂 Open</button>
           <button className="filebtn" title="Save project (Ctrl+S)" onClick={onSave}>💾 Save</button>
+          <div className="fbsep"/>
+          <button className="filebtn" title="Undo (Ctrl+Z)" onClick={()=>projectRef.current&&projectRef.current.undo&&projectRef.current.undo()}>↶ Undo</button>
+          <button className="filebtn" title="Redo (Ctrl+Y / Ctrl+Shift+Z)" onClick={()=>projectRef.current&&projectRef.current.redo&&projectRef.current.redo()}>↷ Redo</button>
+          <div className="fbstatus" title={lastSaved!=null ? new Date(lastSaved).toLocaleString() : "This project has not been saved yet"}>
+            {(()=>{ if(lastSaved==null) return "Not saved yet";
+                    const d=new Date(lastSaved), now=new Date();
+                    const t=d.toLocaleTimeString([], {hour:"numeric", minute:"2-digit"});
+                    const sameDay = d.toDateString()===now.toDateString();
+                    return "Saved "+(sameDay ? t : d.toLocaleDateString([], {month:"short", day:"numeric"})+", "+t); })()}
+          </div>
         </div>
         <div className="tbar" style={{ display:"flex", alignItems:"center", borderBottom:`1px solid ${SW.rule}`, background:SW.sheet }}>
           <div className="tbrand" style={{ padding:"6px 16px" }}>
