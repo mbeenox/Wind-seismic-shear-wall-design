@@ -15,7 +15,7 @@ import {
 //   • APP_VERSION (here)      — human-facing build number in the UI ("Version 1.00").
 //   • CURRENT_VERSION (~below)— save-file SCHEMA version; drives .wps migrations. Do NOT couple.
 //   • handoff "rev" number    — the dev changelog in PLAN_SKETCHER_SUITE_HANDOFF.md.
-const APP_BUILD = 145;                                                                 // +1 per release
+const APP_BUILD = 147;                                                                 // +1 per release
 const APP_VERSION = `${Math.floor(APP_BUILD / 100)}.${String(APP_BUILD % 100).padStart(2, "0")}`;  // "1.00"
 
 // ── geometry space: 1 unit = 1 ft ──────────────────────────────────────────
@@ -198,7 +198,35 @@ const buildFrom = (pts, startId) => ({
   nextId: startId + pts.length,
 });
 
+// (rev 67) GRAPH SANITIZER — the perimeter tracer below (and the seismic roof area + plf that
+// depend on it) hard-fail if the graph carries an ORPHAN edge (one whose endpoint node was deleted
+// without the edge being removed), a duplicate edge, or a self-loop. Such a stray edge is invisible
+// on the canvas but pushes a node off degree-2 / makes edges≠nodes, so loopInfo returns null and the
+// roof area silently reads blank with W_roof=0. This pure helper drops exactly those defects and
+// nothing else: a well-formed closed plan passes through UNCHANGED (so a valid graph's area is
+// byte-identical to before). Applied (a) on .wps load, so any already-saved corrupt file self-heals
+// and a re-save is clean, and (b) inside loopInfo, so even a transient in-session stray edge can't
+// blank the area. It does NOT alter node positions or add geometry.
+const sanitizeGraph = (graph) => {
+  if(!graph || !Array.isArray(graph.nodes) || !Array.isArray(graph.edges)) return graph;
+  const ids = new Set(graph.nodes.map(n=>n.id));
+  const seen = new Set();
+  const edges = [];
+  for(const e of graph.edges){
+    if(!e || e.a===e.b) continue;                 // drop self-loops
+    if(!ids.has(e.a) || !ids.has(e.b)) continue;  // drop orphan edges (endpoint node missing)
+    const k = keyOf(norm(e.a,e.b));               // normalized key → dedupe undirected duplicates
+    if(seen.has(k)) continue;
+    seen.add(k); edges.push(e);
+  }
+  // preserve object identity when nothing changed (avoids needless re-renders / memo churn)
+  return edges.length===graph.edges.length ? graph : { ...graph, edges };
+};
+
 const loopInfo = (nodes, edges) => {
+  // (rev 67) heal an orphan/duplicate/self-loop edge before tracing, so a closed plan that carries
+  // an invisible stray edge still yields its area. A clean ring is unaffected (sanitize is a no-op).
+  ({ nodes, edges } = sanitizeGraph({ nodes, edges }));
   const n = nodes.length;
   if (n < 3 || edges.length !== n) return null;
   const adj = new Map(nodes.map(nd=>[nd.id,[]]));
@@ -730,7 +758,12 @@ const CSS = `
   background:rgba(154,107,31,.95);color:#FFFFFF;font-family:'IBM Plex Sans','Helvetica Neue',Arial,sans-serif;
   font-size:11px;font-weight:600;letter-spacing:.02em;line-height:1.3;
   padding:5px 10px;border-radius:3px;box-shadow:0 2px 6px -2px rgba(28,39,51,.4);}
-/* 2nd-story height field in the wind window (2-story mode). */
+/* (rev 68) one-time "stray edge healed on load" toast — top-center, click to dismiss, auto-clears. */
+.healtoast{position:absolute;top:8px;left:50%;transform:translateX(-50%);z-index:6;cursor:pointer;max-width:80%;
+  background:rgba(34,108,74,.96);color:#FFFFFF;font-family:'IBM Plex Sans','Helvetica Neue',Arial,sans-serif;
+  font-size:11px;font-weight:700;letter-spacing:.02em;line-height:1.3;
+  padding:5px 11px;border-radius:3px;box-shadow:0 2px 6px -2px rgba(28,39,51,.4);}
+.healtoast span{font-weight:500;opacity:.85;}
 .h2row{border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:4px;padding:9px 11px;margin-bottom:12px;background:#F6F9FB;}
 .h2top{display:flex;align-items:center;justify-content:space-between;gap:10px;}
 .h2top label{font-size:12px;font-weight:600;color:var(--ink);}
@@ -1844,6 +1877,8 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
   const [drawAnchor, setDrawAnchor] = useState(null);   // node id the next wall starts from
   const [drawPrev, setDrawPrev] = useState(null);       // rubber-band preview point
   const [cursorFt, setCursorFt] = useState(null);       // status-bar coordinates (ft)
+  const [healNote, setHealNote] = useState(null);       // (rev 68) #stray edges repaired on the last load (toast), else null
+  useEffect(()=>{ if(healNote==null) return; const t=setTimeout(()=>setHealNote(null), 7000); return ()=>clearTimeout(t); },[healNote]);
   const cursorRef = useRef(null);
   const drawModeRef = useRef(drawMode);   useEffect(()=>{drawModeRef.current=drawMode;},[drawMode]);
   const drawAnchorRef = useRef(drawAnchor); useEffect(()=>{drawAnchorRef.current=drawAnchor;},[drawAnchor]);
@@ -1942,7 +1977,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
   useEffect(()=>{
     if(!registerProject) return;
     registerProject({
-      get: ()=>({ graph:graphRef.current,
+      get: ()=>({ graph:sanitizeGraph(graphRef.current),   // (rev 68) never write an orphan/duplicate/self-loop edge to disk
                   wallProps, noSupport:[...noSupport], oneStory:[...oneStory], sections, nextId:idc.current,
                   // v2: the camera + working state, so a reopened file looks like where you left it
                   view:viewRef.current, selected:selRef.current,
@@ -1950,7 +1985,11 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
                   zoomEnabled:zoomEnabledRef.current, snapOn, ortho, dims, markScale, loadCase }),
       set: (s)=>{
         if(!s||!s.graph) return;
-        setGraph(s.graph);
+        const cleanGraph = sanitizeGraph(s.graph);   // (rev 67) self-heal orphan/duplicate/self-loop edges from any older save
+        const healed = (Array.isArray(s.graph.edges)?s.graph.edges.length:0) - cleanGraph.edges.length;
+        setGraph(cleanGraph);
+        setHealNote(healed>0 ? healed : null);        // (rev 68) one-time toast when a loaded file was repaired
+
         setWallProps(s.wallProps||{});
         setNoSupport(new Set(s.noSupport||[]));
         setOneStory(new Set(s.oneStory||[]));   // old files lack it → no 1-story walls (unchanged behavior)
@@ -2836,6 +2875,9 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
         </div>
         <div className="stage" ref={stageRef}>
           {twoStory && (<div className="floorbadge">Level {activeFloor} <span>Plan</span></div>)}
+          {healNote!=null && (<div className="healtoast" onClick={()=>setHealNote(null)} title="Click to dismiss">
+            ✓ Repaired {healNote} stray edge{healNote===1?"":"s"} on load <span>— the plan boundary is now consistent</span>
+          </div>)}
           {allOneStory && (<div className="allonestory-warn">⚠ All walls are 1-story — the 2nd floor has no walls.</div>)}
           <svg ref={svgRef} className="cvs" style={drawMode?{cursor:"crosshair"}:(panMode||panCursor)?{cursor:panCursor?"grabbing":"grab"}:undefined}
                viewBox={`${view.x} ${view.y} ${view.w} ${view.h}`}
