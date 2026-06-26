@@ -15,7 +15,7 @@ import {
 //   • APP_VERSION (here)      — human-facing build number in the UI ("Version 1.00").
 //   • CURRENT_VERSION (~below)— save-file SCHEMA version; drives .wps migrations. Do NOT couple.
 //   • handoff "rev" number    — the dev changelog in PLAN_SKETCHER_SUITE_HANDOFF.md.
-const APP_BUILD = 144;                                                                 // +1 per release
+const APP_BUILD = 145;                                                                 // +1 per release
 const APP_VERSION = `${Math.floor(APP_BUILD / 100)}.${String(APP_BUILD % 100).padStart(2, "0")}`;  // "1.00"
 
 // ── geometry space: 1 unit = 1 ft ──────────────────────────────────────────
@@ -1848,18 +1848,41 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
   const drawModeRef = useRef(drawMode);   useEffect(()=>{drawModeRef.current=drawMode;},[drawMode]);
   const drawAnchorRef = useRef(drawAnchor); useEffect(()=>{drawAnchorRef.current=drawAnchor;},[drawAnchor]);
 
-  // resolve a pointer event to a draw target: an existing node (snap) or a new snapped point
+  // resolve a pointer event to a draw target, in priority order:
+  //   1. an existing node within the pick radius → snap to it (closes loops exactly, beats ortho);
+  //   2. (rev 66) the BODY of an existing wall within the pick radius → snap to the foot of the
+  //      perpendicular and flag that wall for auto-split (so a click directly on a wall creates an
+  //      intersection node there and splits the wall — same end-topology as the rev-64 drag bind);
+  //   3. a free point, with ortho + grid snap as usual.
   const resolveDrawPoint = useCallback((e)=>{
     const u=toUser(e), g=graphRef.current;
     const R=2.4*SRef.current;
+    // 1) existing-node snap — highest priority
     let nearest=null, best=R*R;
     g.nodes.forEach(n=>{ const d=(n.x-u.x)**2+(n.y-u.y)**2; if(d<best){best=d; nearest=n;} });
-    if(nearest) return { node:nearest, x:nearest.x, y:nearest.y, snapped:true };
+    if(nearest) return { node:nearest, x:nearest.x, y:nearest.y, snapped:true, splitEdge:null };
+    // 2) wall-body snap — click landed on a wall line, not a node: target it for auto-split.
+    //    Skip any wall the current anchor already joins (splitting one would make a sliver chain
+    //    edge) — mirrors bindNodeToWall's incident-edge exclusion. Foot must be strictly interior
+    //    (endpoints are node-snap territory, handled in step 1).
+    const anchorId=drawAnchorRef.current;
+    let bestW=null;
+    for(const ed of g.edges){
+      if(anchorId!==null && (ed.a===anchorId||ed.b===anchorId)) continue;
+      const a=g.nodes.find(n=>n.id===ed.a), b=g.nodes.find(n=>n.id===ed.b);
+      if(!a||!b) continue;
+      const pr=projToSeg(u,a,b);
+      if(pr.t<=1e-3||pr.t>=1-1e-3) continue;
+      if(pr.dist>R) continue;
+      if(!bestW||pr.dist<bestW.dist) bestW={edge:ed, pt:pr.pt, dist:pr.dist};
+    }
+    if(bestW) return { node:null, x:bestW.pt.x, y:bestW.pt.y, snapped:true, splitEdge:bestW.edge };
+    // 3) free point — ortho + grid snap
     let x=u.x, y=u.y;
-    const anchor = drawAnchorRef.current!==null ? g.nodes.find(n=>n.id===drawAnchorRef.current) : null;
+    const anchor = anchorId!==null ? g.nodes.find(n=>n.id===anchorId) : null;
     if(ortho && anchor){ if(Math.abs(u.x-anchor.x)>=Math.abs(u.y-anchor.y)) y=anchor.y; else x=anchor.x; }
     x=clamp(snap(x),-WORLD,WORLD); y=clamp(snap(y),-WORLD,WORLD);
-    return { node:null, x, y, snapped:false };
+    return { node:null, x, y, snapped:false, splitEdge:null };
   },[toUser,ortho,snap]);
 
   const placeDrawPoint = useCallback((e)=>{
@@ -1867,6 +1890,39 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
     const anchorId=drawAnchorRef.current;
     growUserViewTo(pt.x, pt.y);          // keep the placed node in frame (grow only, never recenter)
     snapshot();
+    // (rev 66) AUTO-SPLIT on draw: the click landed on a wall body. Create the intersection node
+    // exactly on that wall, split the wall into two halves at the node, propagate the wall's
+    // per-edge state to BOTH halves, and chain the anchor → new node — all in ONE setGraph (one
+    // undo reverts the whole gesture). The new node now joins the two halves + the incoming wall,
+    // so moving it later drags all of them. Mirrors bindNodeToWall's split/propagation, but the
+    // split vertex is a fresh node placed by the draw click (not a dragged existing node).
+    if(pt.splitEdge){
+      const se=pt.splitEdge;
+      const newId=idc.current++;
+      setGraph(g=>{
+        const edge=g.edges.find(ed=>same(ed,se));   // re-find in the live graph
+        let nodes=[...g.nodes,{id:newId,x:pt.x,y:pt.y}];
+        let edges=g.edges;
+        if(edge){
+          const e1=norm(edge.a,newId), e2=norm(newId,edge.b);
+          edges=edges.filter(ed=>!same(ed,edge));
+          if(!edges.some(ed=>same(ed,e1))) edges=[...edges,e1];
+          if(!edges.some(ed=>same(ed,e2))) edges=[...edges,e2];
+        }
+        if(anchorId!==null && anchorId!==newId){
+          const ne=norm(anchorId,newId);
+          if(!edges.some(ed=>same(ed,ne))) edges=[...edges,ne];
+        }
+        return { nodes, edges };
+      });
+      const e1=norm(se.a,newId), e2=norm(newId,se.b);
+      const pk=keyOf(se), k1=keyOf(e1), k2=keyOf(e2);
+      setNoSupport(s=>{ if(!s.has(pk)) return s; const n=new Set(s); n.delete(pk); n.add(k1); n.add(k2); return n; });
+      setOneStory(s=>{ if(!s.has(pk)) return s; const n=new Set(s); n.delete(pk); n.add(k1); n.add(k2); return n; });
+      setWallProps(m=>{ if(!m[pk]) return m; const v=m[pk]; const n={...m}; n[k1]={...v}; n[k2]={...v}; delete n[pk]; return n; });
+      setDrawAnchor(newId);
+      return;
+    }
     setGraph(g=>{
       let nodes=g.nodes, edges=g.edges, targetId;
       if(pt.node) targetId=pt.node.id;
