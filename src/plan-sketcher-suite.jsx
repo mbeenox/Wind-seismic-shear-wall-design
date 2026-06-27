@@ -15,7 +15,7 @@ import {
 //   • APP_VERSION (here)      — human-facing build number in the UI ("Version 1.00").
 //   • CURRENT_VERSION (~below)— save-file SCHEMA version; drives .wps migrations. Do NOT couple.
 //   • handoff "rev" number    — the dev changelog in PLAN_SKETCHER_SUITE_HANDOFF.md.
-const APP_BUILD = 150;                                                                 // +1 per release
+const APP_BUILD = 151;                                                                 // +1 per release
 const APP_VERSION = `${Math.floor(APP_BUILD / 100)}.${String(APP_BUILD % 100).padStart(2, "0")}`;  // "1.00"
 
 // ── geometry space: 1 unit = 1 ft ──────────────────────────────────────────
@@ -206,6 +206,10 @@ const pinchTransform = (view0, rect, midWorld, curMid, d0, d, vmin, vmax) => {
   const fy = rect.height ? (curMid.y-rect.top )/rect.height : 0.5;
   return { x: midWorld.x - fx*w, y: midWorld.y - fy*h, w, h };
 };
+
+// (rev 72) Spreadsheet-style column name for a 1-based index: 1→A, 26→Z, 27→AA … Used to letter the
+// E–W (horizontal) grid lines in the Design tab. Pure → unit-testable.
+const colName = (n) => { let s=""; let k=Math.max(1,Math.floor(n)); while(k>0){ const r=(k-1)%26; s=String.fromCharCode(65+r)+s; k=Math.floor((k-1)/26); } return s; };
 
 // outermost two walls a cut line crosses → {front,back} each {edge,pt} (front = lower t)
 const computeCut = (line, graph) => {
@@ -4495,7 +4499,7 @@ function CaseTag({ which }) {
 }
 
 // ---------- the plan canvas ----------
-function DesignPlan({ shape, lines, segsByLine, setSegsByLine, resultsByLine, selLine, setSelLine, snap, maxSegLen, onCtx, marks, showTags }) {
+function DesignPlan({ shape, lines, segsByLine, setSegsByLine, resultsByLine, selLine, setSelLine, snap, maxSegLen, onCtx, marks, showTags, lineNames }) {
   const svgRef = useRef(null);
   const dragRef = useRef(null);
   // fit viewBox to footprint
@@ -4581,6 +4585,23 @@ function DesignPlan({ shape, lines, segsByLine, setSegsByLine, resultsByLine, se
                   stroke={isSel ? SEL_STROKE : SW.faint} strokeWidth={(isSel?0.5:0.3)*S}
                   strokeDasharray={`${1.6*S} ${1.2*S}`} opacity={isSel?0.9:0.45}
                   style={{cursor:"pointer"}} onClick={()=>setSelLine(ln.id)}/>
+            {/* (rev 72) GRID BUBBLE at the line's `a` end — `a` is the min-coordinate end, i.e. the TOP
+                for a vertical (N–S) line and the LEFT for a horizontal (E–W) line, so numbers land on
+                top and letters on the left exactly like a plan grid. The bubble sits just BEYOND the
+                end along −(ux,uy) with a short stem; the label is always upright (no rotation). Black
+                on white so it reads as drawing annotation, distinct from the blue/red wall callouts. */}
+            {(()=>{
+              const rB=2.4*S, stem=1.1*S, gap=0.25*S, near={x:ln.a.x-ux*gap,y:ln.a.y-uy*gap};
+              const cx=ln.a.x-ux*(stem+rB), cy=ln.a.y-uy*(stem+rB);
+              return (
+                <g pointerEvents="none">
+                  <line x1={near.x} y1={near.y} x2={cx+ux*rB} y2={cy+uy*rB} stroke={SW.ink} strokeWidth={0.16*S}/>
+                  <circle cx={cx} cy={cy} r={rB} fill={C_BG} stroke={SW.ink} strokeWidth={0.22*S}/>
+                  <text x={cx} y={cy} textAnchor="middle" dominantBaseline="central"
+                        fontSize={2.0*S} fontWeight="800" fill={SW.ink} fontFamily={MONO}>{lineNames[ln.id]}</text>
+                </g>
+              );
+            })()}
             {/* shear-wall segments — distinct hatched band over the wall line */}
             {segs.map((s,i)=>{
               const r=res[i]||{};
@@ -4758,15 +4779,18 @@ function DesignTab({ g, setGl, shape, lines, linesByFloor, segsByLine, setSegsBy
     return m;
   },[lines, segsByLine]);
 
-  // (rev 132) Per-line display name: the direction PLUS an incrementing index WITHIN that direction,
-  // since several lines can share a direction — "E–W-1", "E–W-2", "N–S-1", … The full chip/title
-  // label appends force + length. This name is what is sent to the Calculation Sheet as the sub-tab
-  // title, so the two tabs identify the same wall identically. Positional (like the SW marks): it
-  // tracks a line's position in this floor's list, not a persisted id.
+  // (rev 72) Per-line display name follows the standard structural GRID convention — no direction
+  // prefix. N–S (vertical, windAxis "v") lines are NUMBERED 1,2,3… ordered left→right by x; E–W
+  // (horizontal, windAxis "h") lines are LETTERED A,B,C… ordered top→bottom by y (screen y grows
+  // downward, so ascending y = top→bottom). Positional like the SW marks — it tracks each line's
+  // place in THIS floor's grid, not a persisted id. This name titles the matching Calculation-Sheet
+  // sub-tab (via lineLabel → applyToCalc), so the Design and Calc tabs identify a wall identically.
   const lineNames = useMemo(()=>{
-    const m={}, cnt={};
-    lines.forEach(ln=>{ const dir = ln.windAxis==="h" ? "E–W" : "N–S";
-      cnt[dir] = (cnt[dir]||0) + 1; m[ln.id] = `${dir}-${cnt[dir]}`; });
+    const m={};
+    const ns = lines.filter(l=>l.windAxis==="v").slice().sort((p,q)=> p.a.x-q.a.x || p.a.y-q.a.y);
+    const ew = lines.filter(l=>l.windAxis==="h").slice().sort((p,q)=> p.a.y-q.a.y || p.a.x-q.a.x);
+    ns.forEach((l,i)=>{ m[l.id]=String(i+1); });          // N–S → 1, 2, 3 …
+    ew.forEach((l,i)=>{ m[l.id]=colName(i+1); });         // E–W → A, B, C …
     return m;
   },[lines]);
   const lineLabel = (ln) => `${lineNames[ln.id]} · ${fmt(ln.forceLbs/1000,2)}k · ${fmt(ln.lengthFt,0)}′`;
@@ -4973,7 +4997,7 @@ function DesignTab({ g, setGl, shape, lines, linesByFloor, segsByLine, setSegsBy
         Plan — live recalculation
       </SectionTitle>
 
-      <DesignPlan shape={shape} lines={lines} marks={wallMarks} showTags={showTags}
+      <DesignPlan shape={shape} lines={lines} marks={wallMarks} showTags={showTags} lineNames={lineNames}
                   segsByLine={segsByLine} setSegsByLine={setSegsByLine}
                   resultsByLine={resultsByLine} selLine={selLine} setSelLine={setSelLine}
                   snap={d.snap} maxSegLen={d.maxSegLen}
