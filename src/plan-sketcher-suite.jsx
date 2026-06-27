@@ -15,7 +15,7 @@ import {
 //   • APP_VERSION (here)      — human-facing build number in the UI ("Version 1.00").
 //   • CURRENT_VERSION (~below)— save-file SCHEMA version; drives .wps migrations. Do NOT couple.
 //   • handoff "rev" number    — the dev changelog in PLAN_SKETCHER_SUITE_HANDOFF.md.
-const APP_BUILD = 151;                                                                 // +1 per release
+const APP_BUILD = 152;                                                                 // +1 per release
 const APP_VERSION = `${Math.floor(APP_BUILD / 100)}.${String(APP_BUILD % 100).padStart(2, "0")}`;  // "1.00"
 
 // ── geometry space: 1 unit = 1 ft ──────────────────────────────────────────
@@ -2815,7 +2815,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
           const ea=fg.nodes.find(n=>n.id===e.a), eb=fg.nodes.find(n=>n.id===e.b); if(!ea||!eb) return;
           const o=edgeAxis(ea,eb);
           const fixed = o==="h" ? ea.y : ea.x;
-          let lo=Infinity, hi=-Infinity, Hmax=0;
+          let lo=Infinity, hi=-Infinity, Hmax=0; const ivals=[];
           fg.edges.forEach(e2=>{
             if(!isSup(keyOf(e2))) return;
             const a2=fg.nodes.find(n=>n.id===e2.a), b2=fg.nodes.find(n=>n.id===e2.b); if(!a2||!b2) return;
@@ -2824,11 +2824,20 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
             if(Math.abs(f2-fixed)>0.75) return;
             const v0 = o==="h" ? Math.min(a2.x,b2.x) : Math.min(a2.y,b2.y);
             const v1 = o==="h" ? Math.max(a2.x,b2.x) : Math.max(a2.y,b2.y);
-            lo=Math.min(lo,v0); hi=Math.max(hi,v1);
+            lo=Math.min(lo,v0); hi=Math.max(hi,v1); ivals.push([v0,v1]);   // (rev 73) record each solid wall span
             const pp=propsFor(keyOf(e2));
             Hmax=Math.max(Hmax, (twoStory && floor===2 ? (pp.H2||0) : (pp.H||0)));   // design height per floor
           });
           if(!(hi>lo)) return;
+          // (rev 73) merge the collinear support edges into SOLID RUNS in line-local coords (0 = the `a`
+          // end), so the Design tab can snap a shear-wall segment INTO a real wall instead of a gap
+          // (an opening between two collinear walls). Display/placement only — never read by the engine.
+          ivals.sort((p,q)=>p[0]-q[0]);
+          const runs=[];
+          ivals.forEach(([s,e])=>{ const last=runs[runs.length-1];
+            if(last && s <= last[1] + 1e-6) last[1]=Math.max(last[1], e);
+            else runs.push([s, e]); });
+          const runsLocal = runs.map(([s,e])=>[+(s-lo).toFixed(4), +(e-lo).toFixed(4)]);
           const a = o==="h" ? {x:lo,y:fixed} : {x:fixed,y:lo};
           const b = o==="h" ? {x:hi,y:fixed} : {x:fixed,y:hi};
           // (rev 49) carry this line's DEAD-LOAD tributary from the keyed support wall, picking the
@@ -2842,7 +2851,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
           lines.push({ id:ax+"|"+r.key, key:r.key, windAxis:ax, o, a, b,
                        lengthFt:hi-lo, heightFt:Hmax||13, forceLbs:r.kips*1000,
                        forceLbsSeismic: seisMap[ax+"|"+r.key] || 0,   // rev 62/63: per-line seismic demand (1-story, or per-floor for 2-story)
-                       roofTrib, floorTrib });
+                       roofTrib, floorTrib, runs:runsLocal });        // rev 73: solid wall runs (line-local) for default-placement snapping
         });
       });
       return lines;
@@ -4396,6 +4405,42 @@ function stackedLineResults(line1, line2, segs, g, d) {
 // segment) — and that one length is used on both floors. If nothing passes within the segment it
 // returns null → the line reports FAIL (never spills past the 2-story segment). calcCore.js is
 // untouched: this only composes its exported primitives (calcSegment/baseDesignSeg via lineResults).
+// (rev 73) Snap shear-wall segments so each sits INSIDE a solid wall run, instead of defaulting into an
+// opening between two collinear walls. PLACEMENT-only and engine-neutral: the structural calc reads a
+// segment's LENGTH and the line's total segment length (lineResults/calcSegment), never its `start`, so
+// re-positioning changes nothing about the design result. A segment already fully inside a run is left
+// where the engine placed it (so a continuous wall keeps the engine's even spacing); only a segment that
+// overlaps a gap is shifted to the nearest run that can host it, packed left→right so placements never
+// overlap. `runs` are line-local [start,end] pairs (0 = the line's `a` end). The user can still freely
+// drag any placed segment along or across the walls afterward — this only sets the INITIAL position.
+function snapSegsToRuns(segs, runs, lineLen) {
+  if (!Array.isArray(runs) || runs.length === 0) return segs;                  // no wall geometry → leave as-is
+  const solid = runs.reduce((a, r) => a + Math.max(0, r[1] - r[0]), 0);
+  if (solid >= lineLen - 1e-3) return segs;                                    // wall is continuous → nothing to snap
+  const inRun = (st, len) => runs.some(([s, e]) => st >= s - 1e-3 && st + len <= e + 1e-3);
+  let lastEnd = 0;
+  return segs.map((seg) => {
+    const Ls = seg.length;
+    let start = seg.start;
+    if (!inRun(start, Ls)) {
+      let best = null;
+      for (const [s, e] of runs) {
+        if (e - s < Ls - 1e-3) continue;                                       // run too short to host this segment
+        let p = Math.min(Math.max(seg.start, s), e - Ls);                      // closest spot in this run to the original
+        p = Math.max(p, lastEnd);                                             // don't overlap an earlier-placed segment
+        if (p + Ls > e + 1e-3) continue;                                       // can't fit after lastEnd within this run
+        const dist = Math.abs(p - seg.start);
+        if (!best || dist < best.dist) best = { p, dist };
+      }
+      if (best) start = best.p;                                                // no run can host it → keep engine's start
+    } else {
+      start = Math.max(start, lastEnd);                                        // already in a wall; just guard overlap
+    }
+    lastEnd = start + Ls;
+    return { ...seg, start: +start.toFixed(2) };
+  });
+}
+
 function generateStackedDesign(line1, line2, g, d) {
   const cap = Math.max(0, Math.min(line2.lengthFt, line1.lengthFt));   // 2-story-segment length bound
   const snap = Math.max(0.25, d.snap || 0.5);
@@ -4587,11 +4632,14 @@ function DesignPlan({ shape, lines, segsByLine, setSegsByLine, resultsByLine, se
                   style={{cursor:"pointer"}} onClick={()=>setSelLine(ln.id)}/>
             {/* (rev 72) GRID BUBBLE at the line's `a` end — `a` is the min-coordinate end, i.e. the TOP
                 for a vertical (N–S) line and the LEFT for a horizontal (E–W) line, so numbers land on
-                top and letters on the left exactly like a plan grid. The bubble sits just BEYOND the
-                end along −(ux,uy) with a short stem; the label is always upright (no rotation). Black
-                on white so it reads as drawing annotation, distinct from the blue/red wall callouts. */}
+                top and letters on the left exactly like a plan grid. The bubble sits BEYOND the end
+                along −(ux,uy) on an extension line; the label is always upright (no rotation). Black
+                on white so it reads as drawing annotation, distinct from the blue/red wall callouts.
+                (rev 73) the extension `stem` was lengthened ~4× (1.1→4.4·S) so the bubble sits well
+                clear of the structural footprint — for the horizontal A/B lines this lifts the bubble
+                completely off the corner wall-joints and outside the plan boundary. */}
             {(()=>{
-              const rB=2.4*S, stem=1.1*S, gap=0.25*S, near={x:ln.a.x-ux*gap,y:ln.a.y-uy*gap};
+              const rB=2.4*S, stem=4.4*S, gap=0.25*S, near={x:ln.a.x-ux*gap,y:ln.a.y-uy*gap};
               const cx=ln.a.x-ux*(stem+rB), cy=ln.a.y-uy*(stem+rB);
               return (
                 <g pointerEvents="none">
@@ -4821,7 +4869,7 @@ function DesignTab({ g, setGl, shape, lines, linesByFloor, segsByLine, setSegsBy
                                roofTrib: ln.roofTrib ?? d.roofTrib, floorTrib: ln.floorTrib ?? d.floorTrib });  // (rev 49) per-wall trib · (rev 62) per-line seismic
         label = `${fmt(ln.forceLbs/1000,1)}k/${fmt(ln.lengthFt,0)}′ line`;
       }
-      if(out){ next[id]=out.segs.map(s=>({...s})); okCount++; }
+      if(out){ const sl=l1||l2; next[id]=snapSegsToRuns(out.segs, sl.runs, sl.lengthFt).map(s=>({...s})); okCount++; }   // rev 73: default-place inside a wall, not a gap
       else { next[id]=[]; failNames.push(label); }
     });
     setSegsByLine(next);
@@ -4840,7 +4888,25 @@ function DesignTab({ g, setGl, shape, lines, linesByFloor, segsByLine, setSegsBy
     let best={start:0,room:0}, cursor=0;
     [...segs,{start:ln.lengthFt,length:0}].forEach(s=>{ const room=s.start-cursor; if(room>best.room) best={start:cursor,room}; cursor=Math.max(cursor,s.start+s.length); });
     if(best.room < d.minSegLen) return;
-    setSegsByLine(prev=>({ ...prev, [lineId]: [...(prev[lineId]||[]), {start:+(best.start+ (best.room-d.minSegLen)/2).toFixed(2), length:d.minSegLen}].sort((a,b)=>a.start-b.start) }));
+    const Ls=d.minSegLen;
+    let st=+(best.start+(best.room-Ls)/2).toFixed(2);
+    // (rev 73) snap the new segment into a SOLID wall run if the largest inter-segment gap lands in a
+    // wall opening — choosing the nearest run that can host it without overlapping an existing segment.
+    const runs=ln.runs;
+    if(Array.isArray(runs) && runs.length){
+      const inRun=(p)=>runs.some(([s,e])=> p>=s-1e-3 && p+Ls<=e+1e-3);
+      if(!inRun(st)){
+        let bp=null;
+        for(const [s,e] of runs){ if(e-s<Ls-1e-3) continue;
+          const p=Math.min(Math.max(st,s), e-Ls);
+          if(p+Ls>e+1e-3) continue;
+          if(segs.some(o=> p < o.start+o.length-1e-3 && p+Ls > o.start+1e-3)) continue;   // would overlap an existing seg
+          const dist=Math.abs(p-st); if(!bp||dist<bp.dist) bp={p,dist};
+        }
+        if(bp) st=+bp.p.toFixed(2);
+      }
+    }
+    setSegsByLine(prev=>({ ...prev, [lineId]: [...(prev[lineId]||[]), {start:st, length:Ls}].sort((a,b)=>a.start-b.start) }));
   };
 
   const sel = lines.find(l=>l.id===selLine);
