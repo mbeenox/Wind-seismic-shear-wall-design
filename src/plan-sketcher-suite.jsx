@@ -15,7 +15,7 @@ import {
 //   • APP_VERSION (here)      — human-facing build number in the UI ("Version 1.00").
 //   • CURRENT_VERSION (~below)— save-file SCHEMA version; drives .wps migrations. Do NOT couple.
 //   • handoff "rev" number    — the dev changelog in PLAN_SKETCHER_SUITE_HANDOFF.md.
-const APP_BUILD = 152;                                                                 // +1 per release
+const APP_BUILD = 153;                                                                 // +1 per release
 const APP_VERSION = `${Math.floor(APP_BUILD / 100)}.${String(APP_BUILD % 100).padStart(2, "0")}`;  // "1.00"
 
 // ── geometry space: 1 unit = 1 ft ──────────────────────────────────────────
@@ -669,7 +669,7 @@ function buildSecDataF1(section, graph, loop, isSup, propsFor, isOne){
 
 // ── styles ─────────────────────────────────────────────────────────────────
 const CSS = `
-.r{ --bg:#EFEDE6;--panel:#FFFFFF;--line:#D8D4C8;--ink:#1C2733;--muted:#67737F;--accent:#23577F;--hot:#9A6B1F;--pink:#B23A2A;
+.r{ --bg:#EFEDE6;--panel:#FFFFFF;--line:#D8D4C8;--ink:#1C2733;--muted:#586470;--accent:#23577F;--hot:#9A6B1F;--pink:#B23A2A;
   font-family:'IBM Plex Mono',ui-monospace,'SF Mono',Menlo,Consolas,monospace;color:var(--ink);
   background-color:var(--bg);
   background-image:
@@ -733,7 +733,7 @@ const CSS = `
   border-radius:4px;background:var(--panel);overflow-x:auto;
   position:sticky;top:var(--tabbar-h,42px);z-index:30;box-shadow:0 2px 10px -7px rgba(28,39,51,.35);}
 .rgroup{display:flex;flex-direction:column;gap:3px;}
-.rlabel{font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);padding-left:2px;}
+.rlabel{font-size:10.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);padding-left:2px;}
 @media print{ .r{background-image:none;background-color:#FFF;} .ribbon{box-shadow:none;} }
 .rbtns{display:flex;gap:4px;}
 .rbtn{border:1px solid var(--line);background:#FFFFFF;color:var(--ink);font-size:11.5px;font-weight:600;
@@ -743,6 +743,11 @@ const CSS = `
 .rbtn:active{box-shadow:inset 0 1px 3px rgba(28,39,51,.18);}
 .rbtn.ron{background:#E8EFF4;border-color:var(--accent);color:var(--accent);}
 .rbtn.raccent{border-color:var(--accent);color:var(--accent);}
+/* (rev 153) rprimary = the ONE elevated primary action per tab: a filled accent button so the
+   eye lands on the next step, vs. the many equal-weight outline buttons. Defined AFTER .raccent so
+   it wins on equal specificity. A stale STALE_BTN inline style still overrides it (amber > primary). */
+.rbtn.rprimary{border-color:var(--accent);background:var(--accent);color:#FFFFFF;}
+.rbtn.rprimary:hover{background:#1B466A;border-color:#1B466A;color:#FFFFFF;}
 .rbtn:disabled{opacity:.35;cursor:default;border-color:var(--line);color:var(--muted);}
 .rsel{border:1px solid var(--line);background:#FFFFFF;color:var(--ink);font-size:11.5px;font-weight:600;
   padding:5px 8px;border-radius:4px;cursor:pointer;white-space:nowrap;font-family:inherit;
@@ -3005,7 +3010,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
         <div className="rgroup">
           <div className="rlabel">Analyze</div>
           <div className="rbtns">
-            <button className="rbtn raccent"
+            <button className="rbtn rprimary"
               title={designStaleHint ? "Plan changed since you last sent it — click to update the Design tab" : "Send point-load walls to the shear-wall designer"}
               disabled={!((secH&&secH.reactions.length)||(secV&&secV.reactions.length))}
               style={(designStaleHint && ((secH&&secH.reactions.length)||(secV&&secV.reactions.length))) ? STALE_BTN : undefined}
@@ -3475,10 +3480,10 @@ const fmt = (v, d = 0) => {
   return v.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
 };
 const SW = {  // light drafting palette — matches the Calculation Sheet (LT) scheme
-  page:"#EFEDE6", sheet:"#FFFFFF", panel:"#FFFFFF", ink:"#1C2733", faint:"#67737F",
+  page:"#EFEDE6", sheet:"#FFFFFF", panel:"#FFFFFF", ink:"#1C2733", faint:"#586470",
   rule:"#D8D4C8", accent:"#23577F", accentSoft:"#E8EFF4",
   red:"#B23A2A", redSoft:"#F8E9E5", green:"#2E6B4F", greenSoft:"#E7F1EB",
-  amber:"#9A6B1F", amberSoft:"#F7EEDC", wall:"#1C2733", input:"#FDFDFB",
+  amber:"#8A5E16", amberSoft:"#F7EEDC", wall:"#1C2733", input:"#FDFDFB",
 };
 const MONO = "'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace";
 
@@ -3556,7 +3561,7 @@ const conSel = { ...selStyle, fontSize:12, padding:"2px 4px", height:CON_H, boxS
 // everything aligns, and a fixed unit gutter keeps numbers and units tidy.
 const PIN_H = 22;
 const pinCard = { border:`1px solid ${SW.rule}`, borderRadius:6, padding:"5px 9px 6px", background:SW.panel, minWidth:0 };
-const pinTitle = { fontSize:9, fontWeight:700, letterSpacing:"0.1em", textTransform:"uppercase", marginBottom:4, color:SW.ink };
+const pinTitle = { fontSize:10.5, fontWeight:700, letterSpacing:"0.1em", textTransform:"uppercase", marginBottom:4, color:SW.ink };
 const pinNumS = { width:46, height:PIN_H, boxSizing:"border-box", padding:"0 5px", border:`1px solid ${SW.rule}`, borderRadius:4,
                   fontFamily:MONO, fontSize:11, textAlign:"right", color:SW.accent, fontWeight:600, background:SW.input, outline:"none" };
 const pinSelS = { height:PIN_H, boxSizing:"border-box", padding:"0 2px", border:`1px solid ${SW.rule}`, borderRadius:4,
@@ -3591,10 +3596,12 @@ const swBtn = (primary) => ({
 /* ── STALE-PUSH INDICATOR (rev 130) ──────────────────────────────────────────
    A "push data" button (Plan→Design ⚡, Design→Calc →) goes red when the upstream
    inputs have changed since the LAST time you pushed, so re-pushing would change
-   the downstream tab. The red look masks the button text in red (+ a pale-red
-   wash and red border so the red text stays legible over any base fill). Applied
+   the downstream tab. (rev 153) Recolored RED → AMBER so "needs re-run" no longer
+   collides with the engineering-FAIL red used by capacity chips/hatching — red now
+   means failure ONLY; amber means "stale, click to refresh". Pale-amber wash + amber
+   border keep the amber text (AA 5.0 on the wash) legible over any base fill. Applied
    inline so it overrides whatever base style/class the button already carries. */
-const STALE_BTN = { color:"#C0271F", background:"#FDECEC", border:"1.5px solid #D9483B", borderColor:"#D9483B", fontWeight:700 };
+const STALE_BTN = { color:"#8A5E16", background:"#FBF0D8", border:"1.5px solid #C08A2A", borderColor:"#C08A2A", fontWeight:700 };
 
 // Signature of exactly what `applyToCalc` would push to the Calculation Sheet for a
 // given design line: the segment lengths, the line's force/height/tributary, the
@@ -3616,8 +3623,8 @@ function calcPushSig(line, segs, res, dC){
 }
 
 // rev 130b — the caution sign prefixed to a stale button's label. U+FE0E (text-presentation
-// selector) forces a MONOCHROME triangle that inherits the button's red text color (rather than the
-// yellow emoji), so it reads as part of the red "stale" styling. It sits INLINE to the left of the
+// selector) forces a MONOCHROME triangle that inherits the button's text color — now the rev-153
+// AMBER stale color (rather than the yellow emoji), so it reads as part of the "stale" styling. It sits INLINE to the left of the
 // label with a trailing space, so it never overlaps or obstructs the text (swap to "⚠️ " for the
 // classic yellow emoji if preferred).
 const WARN = "\u26A0\uFE0E ";
@@ -3662,10 +3669,10 @@ function withUtil(r, seg, grade) {
 }
 
 const LT = {
-  paper: "#EFEDE6", sheet: "#FFFFFF", ink: "#1C2733", faint: "#67737F",
+  paper: "#EFEDE6", sheet: "#FFFFFF", ink: "#1C2733", faint: "#586470",
   rule: "#D8D4C8", blue: "#23577F", blueSoft: "#E8EFF4",
   red: "#B23A2A", redSoft: "#F8E9E5", green: "#2E6B4F", greenSoft: "#E7F1EB",
-  amber: "#9A6B1F", amberSoft: "#F7EEDC", zebra: "#FAF9F5", hover: "#F1F4F6",
+  amber: "#8A5E16", amberSoft: "#F7EEDC", zebra: "#FAF9F5", hover: "#F1F4F6",
 };
 
 const LT_CSS = `
@@ -4535,7 +4542,7 @@ function CaseTag({ which }) {
   const seis = which === "S";
   return (
     <span title={seis ? "Seismic governs this element" : "Wind governs this element"}
-      style={{ display:"inline-block", marginLeft:6, verticalAlign:"middle", fontFamily:MONO, fontSize:9,
+      style={{ display:"inline-block", marginLeft:6, verticalAlign:"middle", fontFamily:MONO, fontSize:10.5,
                fontWeight:700, lineHeight:1, padding:"2px 4px", borderRadius:3,
                color: seis ? SW.amber : SW.accent,
                background: seis ? SW.amberSoft : SW.accentSoft,
@@ -4973,7 +4980,7 @@ function DesignTab({ g, setGl, shape, lines, linesByFloor, segsByLine, setSegsBy
           {/* Floor switcher — flips which floor's design is shown (synced with the plan selector). Greyed until 2-story. */}
           <div title={twoStory ? "Switch which floor's design you're viewing" : "Two-story mode only"}
                style={{ display:"flex", alignItems:"center", gap:7, flex:"none", opacity: twoStory ? 1 : 0.45 }}>
-            <span style={{ fontSize:9, fontWeight:700, letterSpacing:"0.12em", textTransform:"uppercase", color:SW.faint }}>Designing</span>
+            <span style={{ fontSize:10.5, fontWeight:700, letterSpacing:"0.12em", textTransform:"uppercase", color:SW.faint }}>Designing</span>
             <div style={{ display:"flex", border:`1.5px solid ${twoStory ? SW.accent : SW.rule}`, borderRadius:5, overflow:"hidden" }}>
               {[1,2].map(f=>(
                 <button key={f} disabled={!twoStory} onClick={()=>twoStory&&setActiveFloor(f)}
@@ -5017,7 +5024,7 @@ function DesignTab({ g, setGl, shape, lines, linesByFloor, segsByLine, setSegsBy
             <PinCard title="Plywood" cols={1}>
               <PinRow label="Sheathing" grow><select value={g.grade === "str1" ? "str1" : "rated"} onChange={(e)=>setGl("grade",e.target.value)} style={{ ...pinSelS, width:"100%", flex:"1 1 auto", minWidth:0 }}><option value="rated">1/2&Prime; rated</option><option value="str1">1/2&Prime; Structural I</option></select></PinRow>
               <PinRow label="Max SW type" grow><select value={d.maxType} onChange={(e)=>setDk("maxType",+e.target.value)} style={{ ...pinSelS, width:"100%", flex:"1 1 auto", minWidth:0 }}><option value={1}>1</option><option value={2}>2</option><option value={3}>3</option></select></PinRow>
-              <div style={{ gridColumn:"1 / -1", marginTop:1, fontSize:9, color:SW.faint, lineHeight:1.55 }}>
+              <div style={{ gridColumn:"1 / -1", marginTop:1, fontSize:10.5, color:SW.faint, lineHeight:1.55 }}>
                 <div style={{ display:"flex", justifyContent:"space-between" }}><span>Allow. W (plf)</span><span style={{ fontFamily:MONO, color:SW.ink, fontWeight:600 }}>{schedFor(g.grade).slice(0,3).map((t)=>t.wind).join("/")}</span></div>
                 <div style={{ display:"flex", justifyContent:"space-between" }}><span>Allow. S (plf)</span><span style={{ fontFamily:MONO, color:SW.ink, fontWeight:600 }}>{schedFor(g.grade).slice(0,3).map((t)=>t.seismic).join("/")}</span></div>
               </div>
@@ -5209,8 +5216,8 @@ const APP_CSS = `
 /* (rev 69) persistent file toolbar — sits above the tab bar inside the sticky header; reachable on every tab */
 .apphdr{ box-shadow:0 2px 10px -7px rgba(28,39,51,.35); }
 .filebar{ display:flex; align-items:center; gap:6px; padding:5px 16px; background:#ECEAE2; border-bottom:1px solid #D8D4C8; }
-.filebar .fblabel{ font-family:'IBM Plex Mono',ui-monospace,monospace; font-size:9px; letter-spacing:.22em;
-  color:#67737F; font-weight:600; text-transform:uppercase; margin-right:8px; }
+.filebar .fblabel{ font-family:'IBM Plex Mono',ui-monospace,monospace; font-size:10.5px; letter-spacing:.22em;
+  color:#586470; font-weight:600; text-transform:uppercase; margin-right:8px; }
 .filebtn{ border:1px solid #D8D4C8; background:#FFFFFF; color:#1C2733; font-family:'IBM Plex Sans','Helvetica Neue',Arial,sans-serif;
   font-size:11.5px; font-weight:600; padding:4px 12px; border-radius:4px; cursor:pointer;
   transition:border-color .14s ease, color .14s ease, background .14s ease; }
@@ -5221,17 +5228,17 @@ const APP_CSS = `
   font-size:11.5px; font-weight:600; padding:4px 9px; border-radius:4px; width:170px; margin-right:4px;
   transition:border-color .14s ease, box-shadow .14s ease; }
 .fbname:focus{ outline:none; border-color:#23577F; box-shadow:0 0 0 2px rgba(35,87,127,.15); }
-.fbname::placeholder{ color:#9AA3AC; font-weight:500; }
+.fbname::placeholder{ color:#6B7480; font-weight:500; }
 .fbsep{ width:1px; align-self:stretch; margin:2px 6px; background:#D8D4C8; }
 .fbstatus{ margin-left:auto; font-family:'IBM Plex Mono',ui-monospace,monospace; font-size:10.5px; font-weight:600;
-  letter-spacing:.04em; color:#67737F; white-space:nowrap; }
+  letter-spacing:.04em; color:#586470; white-space:nowrap; }
 @media print{ .filebar{ display:none; } }
 .tbrand{ border-right:1px solid #DAD6CA; align-self:stretch; display:flex; flex-direction:column; justify-content:center; }
-.tbrand small{ font-family:'IBM Plex Mono',ui-monospace,monospace; font-size:8.5px; letter-spacing:.22em; color:#67737F; font-weight:500; }
+.tbrand small{ font-family:'IBM Plex Mono',ui-monospace,monospace; font-size:10.5px; letter-spacing:.22em; color:#586470; font-weight:500; }
 .ttab{ position:relative; transition:color .14s ease, background .14s ease; }
 .ttab:hover{ color:#23577F !important; background:#F1F5F8 !important; }
-.ttab .teye{ font-family:'IBM Plex Mono',ui-monospace,monospace; font-size:8.5px; letter-spacing:.18em; font-weight:500;
-  color:inherit; opacity:.55; display:block; text-align:left; margin-bottom:1px; }
+.ttab .teye{ font-family:'IBM Plex Mono',ui-monospace,monospace; font-size:10.5px; letter-spacing:.18em; font-weight:500;
+  color:inherit; opacity:.65; display:block; text-align:left; margin-bottom:1px; }
 /* Quality floor: visible keyboard focus, calm motion, honest print */
 button:focus-visible, select:focus-visible, input:focus-visible{ outline:2px solid #23577F; outline-offset:1.5px; border-radius:4px; }
 .sw-root button, .lt-root button{ transition:filter .14s ease, border-color .14s ease, box-shadow .14s ease; }
@@ -5801,7 +5808,7 @@ export default function App() {
                 style={{ width:60, padding:"4px 8px", border:`1px solid ${LT.rule}`, borderRadius:4, fontFamily:MONO, fontSize:18, fontWeight:700, textAlign:"center", color:LT.blue, background:"#FDFDFB", outline:"none" }} />
             </div>
             <button className="no-print" onClick={()=>window.print()}
-              style={{ alignSelf:"flex-start", padding:"5px 12px", fontSize:11, fontWeight:700, letterSpacing:"0.06em", border:`1.5px solid ${LT.rule}`, background:"#FFF", color:LT.ink, cursor:"pointer", borderRadius:4 }}>
+              style={{ alignSelf:"flex-start", padding:"5px 12px", fontSize:11, fontWeight:700, letterSpacing:"0.06em", border:`1.5px solid ${LT.blue}`, background:LT.blue, color:"#FFFFFF", cursor:"pointer", borderRadius:4 }}>
               ⎙ Print report
             </button>
           </div>
