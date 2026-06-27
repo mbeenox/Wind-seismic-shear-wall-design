@@ -15,7 +15,7 @@ import {
 //   • APP_VERSION (here)      — human-facing build number in the UI ("Version 1.00").
 //   • CURRENT_VERSION (~below)— save-file SCHEMA version; drives .wps migrations. Do NOT couple.
 //   • handoff "rev" number    — the dev changelog in PLAN_SKETCHER_SUITE_HANDOFF.md.
-const APP_BUILD = 149;                                                                 // +1 per release
+const APP_BUILD = 150;                                                                 // +1 per release
 const APP_VERSION = `${Math.floor(APP_BUILD / 100)}.${String(APP_BUILD % 100).padStart(2, "0")}`;  // "1.00"
 
 // ── geometry space: 1 unit = 1 ft ──────────────────────────────────────────
@@ -173,6 +173,38 @@ const projToSeg = (p, a, b) => {
   const t=((p.x-a.x)*dx+(p.y-a.y)*dy)/L2;
   const fx=a.x+t*dx, fy=a.y+t*dy;
   return { pt:{x:fx,y:fy}, t, dist:Math.hypot(p.x-fx,p.y-fy) };
+};
+
+// (rev 71) Point a fixed distance `len` from `anchor` along direction `dir` ({dx,dy}). Used by the
+// Tab/dynamic-length draw input (AutoCAD-style: type a length, the next node lands exactly that far
+// along the current rubber-band heading). Degenerate dir → returns the anchor unchanged.
+const pointAtLength = (anchor, dir, len) => {
+  const L=Math.hypot(dir.dx,dir.dy);
+  if(!(L>1e-9)) return { x:anchor.x, y:anchor.y };
+  return { x:anchor.x+(dir.dx/L)*len, y:anchor.y+(dir.dy/L)*len };
+};
+
+// (rev 71) Clamp a world point into the visible viewBox (minus a margin) so a label anchored to it
+// can never sit off-screen. Used to keep the rubber-band length label at the edge of the view when
+// the segment's midpoint scrolls out of frame (AutoCAD keeps the dynamic dimension on-screen).
+const clampPtToView = (pt, view, margin=0) => ({
+  x: clamp(pt.x, view.x+margin, view.x+view.w-margin),
+  y: clamp(pt.y, view.y+margin, view.y+view.h-margin),
+});
+
+// (rev 71) Two-finger pinch/zoom-pan transform. Given the viewBox at gesture start (view0), the SVG
+// client rect, the WORLD point under the start midpoint (midWorld), the CURRENT screen midpoint of
+// the two touches, and the start/current finger spreads (d0,d), returns the new viewBox. Spreading
+// the fingers (d>d0) zooms IN (smaller viewBox); the midpoint translation gives two-finger pan in
+// the same gesture. Aspect is preserved; the span is clamped to [vmin,vmax]. Pure → unit-testable.
+const pinchTransform = (view0, rect, midWorld, curMid, d0, d, vmin, vmax) => {
+  const f = (d0>0 && d>0) ? d0/d : 1;
+  const aspect = view0.h/view0.w;
+  const w = clamp(view0.w*f, vmin, vmax);
+  const h = w*aspect;
+  const fx = rect.width  ? (curMid.x-rect.left)/rect.width  : 0.5;
+  const fy = rect.height ? (curMid.y-rect.top )/rect.height : 0.5;
+  return { x: midWorld.x - fx*w, y: midWorld.y - fy*h, w, h };
 };
 
 // outermost two walls a cut line crosses → {front,back} each {edge,pt} (front = lower t)
@@ -1876,12 +1908,22 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
   const [drawMode, setDrawMode] = useState(false);
   const [drawAnchor, setDrawAnchor] = useState(null);   // node id the next wall starts from
   const [drawPrev, setDrawPrev] = useState(null);       // rubber-band preview point
+  const [drawLenEdit, setDrawLenEdit] = useState(null); // (rev 71) Tab dynamic-length input {px,py,dir,val}
   const [cursorFt, setCursorFt] = useState(null);       // status-bar coordinates (ft)
   const [healNote, setHealNote] = useState(null);       // (rev 68) #stray edges repaired on the last load (toast), else null
   useEffect(()=>{ if(healNote==null) return; const t=setTimeout(()=>setHealNote(null), 7000); return ()=>clearTimeout(t); },[healNote]);
   const cursorRef = useRef(null);
   const drawModeRef = useRef(drawMode);   useEffect(()=>{drawModeRef.current=drawMode;},[drawMode]);
   const drawAnchorRef = useRef(drawAnchor); useEffect(()=>{drawAnchorRef.current=drawAnchor;},[drawAnchor]);
+  const drawPrevRef = useRef(drawPrev);   useEffect(()=>{drawPrevRef.current=drawPrev;},[drawPrev]);          // (rev 71) Tab reads the live rubber-band heading off a ref (keydown closure stays stable)
+  const drawLenEditRef = useRef(drawLenEdit); useEffect(()=>{drawLenEditRef.current=drawLenEdit;},[drawLenEdit]);
+  // (rev 71) TOUCH / PINCH bookkeeping — all of this is gated on pointerType==="touch", so the mouse
+  // path is byte-unchanged. touchPts tracks live touch points (id→client xy); pinchRef holds the
+  // gesture frame once a 2nd finger lands; pendingTapRef defers draw-placement to lift (so a 2nd
+  // finger can promote a tap into a pinch instead of dropping a stray node).
+  const touchPts = useRef(new Map());
+  const pinchRef = useRef(null);
+  const pendingTapRef = useRef(null);
 
   // resolve a pointer event to a draw target, in priority order:
   //   1. an existing node within the pick radius → snap to it (closes loops exactly, beats ortho);
@@ -1973,6 +2015,33 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
 
   const endDrawChain = useCallback(()=>setDrawAnchor(null),[]);
 
+  // (rev 71) DYNAMIC LENGTH (AutoCAD-style): while drawing, Tab opens a length box; Enter commits the
+  // next node EXACTLY `len` ft from the anchor along the captured rubber-band heading (a typed length
+  // overrides osnap, like AutoCAD). Mirrors placeDrawPoint's non-split chaining branch, but the
+  // endpoint is computed from anchor+dir·len instead of the cursor, and it never auto-splits a wall.
+  const commitDrawLength = useCallback((len)=>{
+    const le = drawLenEditRef.current;
+    const anchorId = drawAnchorRef.current;
+    if(!le || anchorId==null || !(len>0)){ setDrawLenEdit(null); return; }
+    const g = graphRef.current;
+    const anchor = g.nodes.find(n=>n.id===anchorId);
+    if(!anchor){ setDrawLenEdit(null); return; }
+    const p = pointAtLength(anchor, le.dir, len);
+    const nx = clamp(p.x,-WORLD,WORLD), ny = clamp(p.y,-WORLD,WORLD);
+    growUserViewTo(nx,ny);             // keep the new node in frame (grow only)
+    snapshot();
+    const newId = idc.current++;
+    setGraph(gg=>{
+      const nodes=[...gg.nodes,{id:newId,x:nx,y:ny}];
+      let edges=gg.edges;
+      const ne=norm(anchorId,newId);
+      if(!edges.some(ed=>same(ed,ne))) edges=[...edges,ne];
+      return { nodes, edges };
+    });
+    setDrawAnchor(newId);              // chain continues from the new node
+    setDrawLenEdit(null);
+  },[snapshot,growUserViewTo]);
+
   // ── PROJECT SERIALIZATION — the shell saves/loads the whole suite; we expose our slice ──
   useEffect(()=>{
     if(!registerProject) return;
@@ -1997,6 +2066,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
         idc.current = s.nextId || (Math.max(0,...s.graph.nodes.map(n=>n.id))+1);
         // transient editors never auto-reopen (modal wind window + inline dim editor)
         setActiveWall(null); setDimEdit(null); setMenu(null); setDrawPrev(null); setDrawAnchor(null); setDlEdit(null);
+        setDrawLenEdit(null); pendingTapRef.current=null; pinchRef.current=null; touchPts.current.clear();   // (rev 71) drop any transient draw/touch state on load
         // v2 restores the saved camera + toggles + selection; v1/New (no view) reverts to auto-fit + defaults
         setUserView(s.view || null); setFrozenView(null);
         setSelected("selected" in s ? s.selected : null);
@@ -2172,12 +2242,34 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
   useEffect(()=>{
     const h=e=>{
       if(e.key==="Escape"){
+        if(drawLenEditRef.current){ setDrawLenEdit(null); return; }   // (rev 71) Esc closes the length box first (chain stays)
         if(drawModeRef.current){
           if(drawAnchorRef.current!==null) setDrawAnchor(null);
           else { setDrawMode(false); setDrawPrev(null); }
           return;
         }
         setSelected(null);setMenu(null);setDimEdit(null);setActiveWall(null);setPanMode(false);setDlEdit(null);
+      }
+      // (rev 71) Tab while drawing → open the dynamic-length box, seeded with the live rubber-band
+      // length + heading. Requires an active chain (anchor placed) and a preview point. preventDefault
+      // stops Tab from moving focus. Guarded so Tab inside the open box doesn't reopen it.
+      else if(e.key==="Tab" && drawModeRef.current && drawAnchorRef.current!==null
+              && drawPrevRef.current && !drawLenEditRef.current){
+        e.preventDefault();
+        const g=graphRef.current;
+        const anchor=g.nodes.find(n=>n.id===drawAnchorRef.current);
+        const pv=drawPrevRef.current;
+        if(!anchor||!pv) return;
+        const dir={dx:pv.x-anchor.x, dy:pv.y-anchor.y};
+        const L=Math.hypot(dir.dx,dir.dy);
+        if(!(L>1e-6)) return;                                // no heading yet (cursor on the anchor)
+        let px=0, py=0;
+        try{
+          const m=svgRef.current.getScreenCTM(), r=stageRef.current.getBoundingClientRect();
+          const sx=m.a*pv.x+m.c*pv.y+m.e, sy=m.b*pv.x+m.d*pv.y+m.f;
+          px=sx-r.left; py=sy-r.top-22;
+        }catch(_){}
+        setDrawLenEdit({ px, py, dir, val:String(fmtHalf(L)) });
       }
       else if((e.key==="Delete"||e.key==="Backspace")&&selRef.current!==null){ e.preventDefault(); deleteNode(selRef.current); }
       else if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==="z"&&e.shiftKey){e.preventDefault();redo();}
@@ -2198,11 +2290,38 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
     panRef.current={ sx:e.clientX, sy:e.clientY, view:viewRef.current };
     setPanCursor(true);
   },[]);
+  // (rev 71) TOUCH: record a touch pointer; when a 2nd finger lands, promote to a pinch (abort any
+  // in-flight single-finger gesture + pending tap, freeze the gesture frame). Returns true when the
+  // event was consumed by entering pinch — every touch-capable down handler bails on true. Mouse/pen
+  // events (pointerType!=="touch") return false instantly, so the desktop path is byte-unchanged.
+  const touchTrack = useCallback(e=>{
+    if(e.pointerType!=="touch") return false;
+    touchPts.current.set(e.pointerId,{x:e.clientX,y:e.clientY});
+    if(touchPts.current.size===2){
+      nodeDrag.current=null; wallDrag.current=null; secDraw.current=null; setDraft(null);
+      pendingTapRef.current=null;
+      if(draggingRef.current) thawView();
+      const pts=[...touchPts.current.values()];
+      const mid={clientX:(pts[0].x+pts[1].x)/2, clientY:(pts[0].y+pts[1].y)/2};
+      pinchRef.current={ view0:viewRef.current, d0:Math.hypot(pts[1].x-pts[0].x,pts[1].y-pts[0].y), midWorld:toUser(mid) };
+      setPanCursor(false);
+      return true;
+    }
+    return false;
+  },[toUser,thawView]);
+  // (rev 71) Draw-mode placement entry: a mouse click places immediately (unchanged); a touch TAP is
+  // deferred to lift (pendingTapRef) with a live preview, so a quickly-following 2nd finger becomes a
+  // pinch instead of dropping a stray node. Commit happens in onUp on a clean single-finger lift.
+  const drawDown = useCallback(e=>{
+    if(e.pointerType==="touch"){ pendingTapRef.current={x:e.clientX,y:e.clientY}; setDrawPrev(resolveDrawPoint(e)); }
+    else placeDrawPoint(e);
+  },[placeDrawPoint,resolveDrawPoint]);
   const onNodeLDown = useCallback((id,e)=>{
     if(e.button!==0) return;
     e.stopPropagation(); closeMenu();
+    if(touchTrack(e)) return;                                // (rev 71) 2nd finger → pinch
     if(panModeRef.current){ beginPan(e); return; }          // pan tool: drag anywhere pans the view
-    if(drawModeRef.current){ placeDrawPoint(e); return; }   // node snap: connect to this node
+    if(drawModeRef.current){ drawDown(e); return; }         // node snap: connect to this node (touch defers to lift)
     svgRef.current.setPointerCapture(e.pointerId);
     const me=graphRef.current.nodes.find(n=>n.id===id);
     const meta=ortho
@@ -2213,20 +2332,21 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
       : [];
     nodeDrag.current={id, moved:false, sx:e.clientX, sy:e.clientY, meta};
     freezeView();
-  },[closeMenu,ortho,freezeView,placeDrawPoint,beginPan]);
+  },[closeMenu,ortho,freezeView,placeDrawPoint,beginPan,touchTrack,drawDown]);
 
   const onWallLDown = useCallback((edge,e)=>{
     if(e.button!==0) return;
     e.stopPropagation(); closeMenu();
+    if(touchTrack(e)) return;                                // (rev 71) 2nd finger → pinch
     if(panModeRef.current){ beginPan(e); return; }          // pan tool: drag anywhere pans the view
-    if(drawModeRef.current){ placeDrawPoint(e); return; }   // place a point even over a wall
+    if(drawModeRef.current){ drawDown(e); return; }         // place a point even over a wall (touch defers to lift)
     svgRef.current.setPointerCapture(e.pointerId);
     const g=graphRef.current;
     const a=g.nodes.find(n=>n.id===edge.a), b=g.nodes.find(n=>n.id===edge.b);
     const u=toUser(e);
     wallDrag.current={aId:edge.a,bId:edge.b,ax:a.x,ay:a.y,bx:b.x,by:b.y, axis:edgeAxis(a,b), sux:u.x,suy:u.y, moved:false};
     freezeView();
-  },[closeMenu,toUser,freezeView,placeDrawPoint,beginPan]);
+  },[closeMenu,toUser,freezeView,placeDrawPoint,beginPan,touchTrack,drawDown]);
 
   // background drag = draw a section cut; middle-button drag (or pan tool) = pan (CAD-style)
   const onBgLDown = useCallback(e=>{
@@ -2239,12 +2359,13 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
     }
     if(e.button!==0) return;
     closeMenu();
+    if(touchTrack(e)) return;                                // (rev 71) 2nd finger → pinch
     if(panModeRef.current){ beginPan(e); return; }          // pan tool: left-drag pans the view
-    if(drawModeRef.current){ placeDrawPoint(e); return; }   // draw mode: click places a node
+    if(drawModeRef.current){ drawDown(e); return; }         // draw mode: click places a node (touch defers to lift)
     svgRef.current.setPointerCapture(e.pointerId);
     secDraw.current={ su:toUser(e), sx:e.clientX, sy:e.clientY, moved:false };
     freezeView();
-  },[closeMenu,toUser,freezeView,placeDrawPoint,beginPan]);
+  },[closeMenu,toUser,freezeView,placeDrawPoint,beginPan,touchTrack,drawDown]);
 
   const onBgContextMenu = useCallback(e=>{
     e.preventDefault();
@@ -2261,6 +2382,21 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
   },[endDrawChain,openMenu]);
 
   const onMove = useCallback(e=>{
+    // (rev 71) TWO-FINGER PINCH/ZOOM-PAN — runs before every other gesture. Keeps the touch point
+    // map fresh and, while a pinch is active, drives the view from the live finger spread + midpoint
+    // (zoom) and the midpoint translation (pan), then bails so no single-finger logic runs.
+    if(e.pointerType==="touch" && touchPts.current.has(e.pointerId)){
+      touchPts.current.set(e.pointerId,{x:e.clientX,y:e.clientY});
+    }
+    if(pinchRef.current && touchPts.current.size>=2){
+      const svg=svgRef.current; if(!svg) return;
+      const pts=[...touchPts.current.values()];
+      const d=Math.hypot(pts[1].x-pts[0].x, pts[1].y-pts[0].y);
+      const cur={x:(pts[0].x+pts[1].x)/2, y:(pts[0].y+pts[1].y)/2};
+      const p=pinchRef.current;
+      setUserView(pinchTransform(p.view0, svg.getBoundingClientRect(), p.midWorld, cur, p.d0, d, VMIN, VMAX));
+      return;
+    }
     if(panRef.current){                                   // middle-button pan: translate the view
       const p=panRef.current, svg=svgRef.current; if(!svg) return;
       const r=svg.getBoundingClientRect();
@@ -2313,6 +2449,19 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
   },[snapshot,toUser,snap,ortho,snapOn,expandViewTo,resolveDrawPoint]);
 
   const onUp = useCallback(e=>{
+    // (rev 71) TOUCH lift: drop the point; if a pinch was active, end it once <2 fingers remain (don't
+    // resume a drag from the surviving finger). Otherwise, a deferred draw tap commits on a clean
+    // single-finger lift (small movement). All touch-only — mouse falls straight through.
+    if(e.pointerType==="touch"){
+      touchPts.current.delete(e.pointerId);
+      svgRef.current?.releasePointerCapture?.(e.pointerId);
+      if(pinchRef.current){ if(touchPts.current.size<2) pinchRef.current=null; return; }
+      if(pendingTapRef.current){
+        const t=pendingTapRef.current; pendingTapRef.current=null;
+        if(drawModeRef.current && Math.hypot(e.clientX-t.x, e.clientY-t.y) < 12) placeDrawPoint(e);
+        return;
+      }
+    }
     svgRef.current?.releasePointerCapture?.(e.pointerId);
     if(panRef.current){ panRef.current=null; setPanCursor(false); return; }    // end pan (no thaw — pan doesn't freeze)
     thawView();
@@ -2350,14 +2499,15 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
         }
       }
     }
-  },[toUser,thawView,bindNodeToWall]);
+  },[toUser,thawView,bindNodeToWall,placeDrawPoint]);
 
   const onLeave = useCallback(e=>{ onUp(e); },[onUp]);
 
   const onDimClick = useCallback((edge,e)=>{
     e.stopPropagation();
     if(panModeRef.current) return;                          // pan tool active → don't open dim editor
-    if(drawModeRef.current){ placeDrawPoint(e); return; }
+    if(touchTrack(e)) return;                               // (rev 71) 2nd finger → pinch
+    if(drawModeRef.current){ drawDown(e); return; }         // draw mode: a tap over a dim label places a node (touch defers to lift)
     const g=graphRef.current;
     const a=g.nodes.find(n=>n.id===edge.a), b=g.nodes.find(n=>n.id===edge.b);
     if(!a||!b) return;
@@ -2378,7 +2528,7 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
     const sx=m.a*mx+m.c*my+m.e, sy=m.b*mx+m.d*my+m.f;
     setDimEdit({edge, moveEnd, px:sx-r.left, py:sy-r.top-18, val:String(fmtHalf(dist(a,b)))});
     setMenu(null);
-  },[toUser,placeDrawPoint]);
+  },[toUser,placeDrawPoint,touchTrack,drawDown]);
 
   // ── DERIVED ──
   const loop = useMemo(()=>loopInfo(graph.nodes,graph.edges),[graph]);
@@ -2905,21 +3055,36 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
               );
             })}
 
-            {/* draw-mode rubber band: anchor → preview, ghost node, node-snap ring */}
+            {/* draw-mode rubber band: anchor → preview, edge-pinned length, ghost node, distinct snap cue */}
             {drawMode && drawPrev && (()=>{
               const anchor = drawAnchor!==null ? graph.nodes.find(n=>n.id===drawAnchor) : null;
+              const r = 1.4*S;
               return (
                 <g pointerEvents="none">
                   {anchor && <line x1={anchor.x} y1={anchor.y} x2={drawPrev.x} y2={drawPrev.y}
                                    stroke={C_WALL} strokeWidth={0.45*S} strokeDasharray={`${1.6*S} ${1.2*S}`} opacity="0.85"/>}
+                  {/* (rev 71) length label is CLAMPED into the visible view (minus a margin) so a long
+                      line's midpoint can't scroll the dimension off-screen — it slides to the edge. */}
                   {anchor && (()=>{ const L=dist(anchor,drawPrev); if(L<0.5) return null;
                     const mx=(anchor.x+drawPrev.x)/2, my=(anchor.y+drawPrev.y)/2;
                     const vert=Math.abs(drawPrev.y-anchor.y)>Math.abs(drawPrev.x-anchor.x);
-                    return <text x={mx} y={my-1.6*S} textAnchor="middle" fontSize={1.35*S*markScale} fontWeight="700"
+                    const lp=clampPtToView({x:mx, y:my-1.6*S}, view, Math.max(view.w,view.h)*0.05);
+                    return <text x={lp.x} y={lp.y} textAnchor="middle" fontSize={1.35*S*markScale} fontWeight="700"
                                  fill={C_NODE} fontFamily="ui-monospace,Menlo,monospace"
-                                 transform={vert?`rotate(-90,${mx},${my-1.6*S})`:undefined}>{fmt1(L)}′</text>; })()}
-                  {drawPrev.snapped
-                    ? <circle cx={drawPrev.x} cy={drawPrev.y} r={1.5*S} fill="none" stroke={C_LOAD} strokeWidth={0.3*S}/>
+                                 transform={vert?`rotate(-90,${lp.x},${lp.y})`:undefined}>{fmt1(L)}′</text>; })()}
+                  {/* (rev 71) DISTINCT SNAP CUE — node-snap = blue square (endpoint), wall-snap = gold X
+                      (point on a wall body, will auto-split), free point = the ghost node it'll place. */}
+                  {drawPrev.node
+                    ? <g>
+                        <rect x={drawPrev.x-r} y={drawPrev.y-r} width={2*r} height={2*r} fill="none" stroke={C_NODE} strokeWidth={0.34*S}/>
+                        <circle cx={drawPrev.x} cy={drawPrev.y} r={0.4*S} fill={C_NODE}/>
+                      </g>
+                    : drawPrev.splitEdge
+                    ? <g stroke={C_DRAFT} strokeWidth={0.34*S} strokeLinecap="round">
+                        <circle cx={drawPrev.x} cy={drawPrev.y} r={r} fill="none" strokeWidth={0.26*S}/>
+                        <line x1={drawPrev.x-r*0.7} y1={drawPrev.y-r*0.7} x2={drawPrev.x+r*0.7} y2={drawPrev.y+r*0.7}/>
+                        <line x1={drawPrev.x-r*0.7} y1={drawPrev.y+r*0.7} x2={drawPrev.x+r*0.7} y2={drawPrev.y-r*0.7}/>
+                      </g>
                     : <circle cx={drawPrev.x} cy={drawPrev.y} r={0.8*S*markScale} fill={C_NODE} opacity="0.55"/>}{/* rev 32: ghost preview matches the (scaled) placed node */}
                 </g>
               );
@@ -3039,6 +3204,20 @@ function PlanSketcher({ onDesignShearWalls, fileOps, registerProject, twoStory, 
               <input className="dim-inp" type="number" min="0.5" step="0.5" value={dimEdit.val} autoFocus
                      onChange={e=>setDimEdit(d=>({...d,val:e.target.value}))}
                      onKeyDown={e=>{ if(e.key==="Enter"){applyWallLength(dimEdit.edge,parseFloat(dimEdit.val),dimEdit.moveEnd);} if(e.key==="Escape"){setDimEdit(null);} }}/>
+              <span className="dim-unit">ft</span>
+            </div>
+          )}
+          {/* (rev 71) Tab dynamic-length editor: type the next segment's length; Enter commits it
+              exactly along the captured rubber-band heading. Same chrome as the LENGTHEN editor. */}
+          {drawLenEdit&&(
+            <div className="dim-input-wrap" style={{left:drawLenEdit.px,top:drawLenEdit.py}}>
+              <input className="dim-inp" type="number" min="0.5" step="0.5" value={drawLenEdit.val} autoFocus
+                     onChange={e=>setDrawLenEdit(d=>({...d,val:e.target.value}))}
+                     onKeyDown={e=>{
+                       if(e.key==="Enter"){ const v=parseFloat(drawLenEdit.val); if(v>0) commitDrawLength(v); else setDrawLenEdit(null); }
+                       else if(e.key==="Escape"){ setDrawLenEdit(null); }
+                       else if(e.key==="Tab"){ e.preventDefault(); }   // keep focus in the box
+                     }}/>
               <span className="dim-unit">ft</span>
             </div>
           )}
