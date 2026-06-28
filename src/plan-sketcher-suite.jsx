@@ -29,7 +29,7 @@ import {
 //   • APP_VERSION (here)      — human-facing build number in the UI ("Version 1.00").
 //   • CURRENT_VERSION (~below)— save-file SCHEMA version; drives .wps migrations. Do NOT couple.
 //   • handoff "rev" number    — the dev changelog in PLAN_SKETCHER_SUITE_HANDOFF.md.
-const APP_BUILD = 155;                                                                 // +1 per release
+const APP_BUILD = 156;                                                                 // +1 per release
 const APP_VERSION = `${Math.floor(APP_BUILD / 100)}.${String(APP_BUILD % 100).padStart(2, "0")}`;  // "1.00"
 
 
@@ -3526,39 +3526,9 @@ function LtElevation({ segments, results, marks }) {
   );
 }
 
-// ---------- Wall elevation diagram (calc tab) — unchanged logic ----------
-function Elevation({ segments, results }) {
-  const active = segments.map((s, i) => ({ ...s, r: results[i], i })).filter((s) => s.length > 0);
-  if (!active.length) return null;
-  const totalL = active.reduce((a, s) => a + s.length, 0);
-  const maxH = Math.max(...active.map((s) => s.height));
-  const W = 700, H = 130, gap = 8;
-  const scaleX = (W - gap * (active.length - 1)) / totalL;
-  const scaleY = 100 / maxH;
-  let x = 0;
-  return (
-    <svg viewBox={`0 0 ${W} ${H}`} style={{ width:"100%", maxWidth:760, display:"block" }}>
-      <line x1="0" y1={H-18} x2={W} y2={H-18} stroke={SW.faint} strokeWidth="2" />
-      {active.map((s) => {
-        const w = s.length * scaleX, h = s.height * scaleY;
-        const failed = s.r.status === "FAILED!!!" || s.r.aspectNG;
-        const stroke = failed ? SW.red : SW.accent;
-        const el = (
-          <g key={s.i} transform={`translate(${x},0)`}>
-            <rect x="0" y={H-18-h} width={w} height={h} fill={failed ? SW.redSoft : SW.accentSoft} stroke={stroke} strokeWidth="1.5" />
-            <line x1="0" y1={H-18-h} x2={w} y2={H-18} stroke={stroke} strokeWidth="0.75" opacity="0.5" />
-            <line x1={w} y1={H-18-h} x2="0" y2={H-18} stroke={stroke} strokeWidth="0.75" opacity="0.5" />
-            <text x={w/2} y={H-18-h/2-4} textAnchor="middle" fontSize="11" fontWeight="700" fill={stroke} fontFamily={MONO}>SW-{s.i+1}</text>
-            <text x={w/2} y={H-18-h/2+9} textAnchor="middle" fontSize="9" fill={SW.faint} fontFamily={MONO}>{s.length}′ × {s.height}′</text>
-            <text x={w/2} y={H-5} textAnchor="middle" fontSize="9" fill={SW.faint} fontFamily={MONO}>{failed ? "✕" : "✓"} type {s.selType}</text>
-          </g>
-        );
-        x += w + gap;
-        return el;
-      })}
-    </svg>
-  );
-}
+// (rev 77) Removed the dead dark `Elevation` component — it was never rendered (the calc tab
+// uses the light `LtElevation`). Deletion only; no behavior change. Git history retains it if a
+// future dark-elevation view is wanted.
 
 // ---------- CALCULATION SHEET TAB — logic & structure unchanged; dark restyle ----------
 function CalcSheet({ g, setGl, segments, setSegments, results, totalL, marks }) {

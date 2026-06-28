@@ -182,11 +182,22 @@ const C_BG="#FFFFFF", C_GRID="#E9E7DE", C_WALL="#1C2733", C_NODE="#23577F",
       C_LOAD="#23577F", C_REACT="#B23A2A", C_DIMBOX="#23577F", C_REACTBOX="#B23A2A", C_DRAFT="#9A6B1F";
 const C_ONESTORY="#2E6B4F";   // (2-story mode) wall tagged as 1-story only — drawn green to stand out
 
+// (rev 77) Shared raw color tokens — single source of truth so each hex is defined ONCE.
+// SW (dark-tab drafting view) and LT (calc-sheet view) below are thin ALIAS maps over C; they
+// keep their existing key vocabularies (SW.accent / LT.blue, SW.page / LT.paper …) so NO call
+// site changes and the resolved values stay byte-identical to the prior literal palettes. To
+// retune a color suite-wide, edit it once in C.
+const C = {
+  ink:"#1C2733", paper:"#EFEDE6", white:"#FFFFFF", faint:"#586470", rule:"#D8D4C8",
+  blue:"#23577F", blueSoft:"#E8EFF4", red:"#B23A2A", redSoft:"#F8E9E5",
+  green:"#2E6B4F", greenSoft:"#E7F1EB", amber:"#8A5E16", amberSoft:"#F7EEDC",
+  zebra:"#FAF9F5", hover:"#F1F4F6", input:"#FDFDFB",
+};
 const SW = {  // light drafting palette — matches the Calculation Sheet (LT) scheme
-  page:"#EFEDE6", sheet:"#FFFFFF", panel:"#FFFFFF", ink:"#1C2733", faint:"#586470",
-  rule:"#D8D4C8", accent:"#23577F", accentSoft:"#E8EFF4",
-  red:"#B23A2A", redSoft:"#F8E9E5", green:"#2E6B4F", greenSoft:"#E7F1EB",
-  amber:"#8A5E16", amberSoft:"#F7EEDC", wall:"#1C2733", input:"#FDFDFB",
+  page:C.paper, sheet:C.white, panel:C.white, ink:C.ink, faint:C.faint,
+  rule:C.rule, accent:C.blue, accentSoft:C.blueSoft,
+  red:C.red, redSoft:C.redSoft, green:C.green, greenSoft:C.greenSoft,
+  amber:C.amber, amberSoft:C.amberSoft, wall:C.ink, input:C.input,
 };
 const MONO = "'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace";
 
@@ -208,10 +219,10 @@ const STALE_BTN = { color:"#8A5E16", background:"#FBF0D8", border:"1.5px solid #
 const WARN = "\u26A0\uFE0E ";
 
 const LT = {
-  paper: "#EFEDE6", sheet: "#FFFFFF", ink: "#1C2733", faint: "#586470",
-  rule: "#D8D4C8", blue: "#23577F", blueSoft: "#E8EFF4",
-  red: "#B23A2A", redSoft: "#F8E9E5", green: "#2E6B4F", greenSoft: "#E7F1EB",
-  amber: "#8A5E16", amberSoft: "#F7EEDC", zebra: "#FAF9F5", hover: "#F1F4F6",
+  paper: C.paper, sheet: C.white, ink: C.ink, faint: C.faint,
+  rule: C.rule, blue: C.blue, blueSoft: C.blueSoft,
+  red: C.red, redSoft: C.redSoft, green: C.green, greenSoft: C.greenSoft,
+  amber: C.amber, amberSoft: C.amberSoft, zebra: C.zebra, hover: C.hover,
 };
 
 const LT_CSS = `
