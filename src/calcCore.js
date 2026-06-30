@@ -244,9 +244,12 @@ function evaluateCandidate(Ls, totalL, g, d) {
 function generateDesign(g, d) {
   const snap = Math.max(0.25, d.snap || 0.5);
   const maxN = Math.max(1, Math.min(6, Math.floor(d.maxSegments)));
-  // The "Max SW type" constraint caps the SINGLE-SIDED nailing the optimizer may use (1–3). Double-
-  // sided marks (4–6) are NOT a user ceiling — they are an automatic LAST RESORT (below).
-  const singleCap = Math.max(1, Math.min(3, Math.floor(d.maxType)));
+  // (rev 84, SANCTIONED) "Max SW type" is now a HARD CEILING over ALL six marks: the optimizer may use
+  // marks 1..cap and nothing heavier. `singleCap` is its single-sided portion (1–3); `cap` ≥ 4 also
+  // admits double-sided marks 4..cap as the last-resort fallback below. A cap of 1/2/3 therefore forbids
+  // double-sided entirely (the rescue is gated on `cap >= 4`). The new-project default is 6 (full range).
+  const cap = Math.max(1, Math.min(6, Math.floor(d.maxType)));
+  const singleCap = Math.min(3, cap);
   // One sweep over a contiguous mark band [Tlo,Thi]; minMark gates out lower marks so the double-sided
   // pass can't re-admit a single-sided solution the cap excluded. minMark=1 ⇒ inner gate is exactly the
   // original `ev.type<=T`, so the single-sided sweep is byte-identical to the prior optimizer.
@@ -266,12 +269,13 @@ function generateDesign(g, d) {
     }
     return sols;
   };
-  // LAST RESORT: only fall to double-sided (4–6) when NO single-sided (1–singleCap) solution exists at
-  // all. The fallback accepts ONLY genuine double-sided requirements (mark ≥ 4) — a line that fails
-  // single-sided merely because of the user's cap is NOT silently upgraded. For any line a single-sided
-  // design can satisfy, this is byte-identical to the prior optimizer (the double sweep is never entered).
+  // LAST RESORT: fall to double-sided ONLY when (a) no single-sided (1–singleCap) solution exists AND
+  // (b) the user's ceiling admits double-sided (cap ≥ 4). The fallback sweeps marks 4..cap and accepts
+  // ONLY genuine double-sided requirements (mark ≥ 4) — a line that fails single-sided merely because of
+  // the cap is NOT silently upgraded. With cap = 6 (the default) this matches the prior auto-rescue; a
+  // cap of 1/2/3 now strictly forbids double-sided, so such a line returns null (FAILED) instead.
   let solutions = sweep(1, singleCap, 1);
-  if (!solutions.length) solutions = sweep(4, 6, 4);
+  if (!solutions.length && cap >= 4) solutions = sweep(4, cap, 4);
   if (!solutions.length) return null;
   solutions.sort((a, b) => d.objective === "nailing"
     ? a.T - b.T || a.total - b.total || a.N - b.N
