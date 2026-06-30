@@ -229,7 +229,7 @@ function DesignPlan({ shape, lines, segsByLine, setSegsByLine, resultsByLine, se
   // bubbles align on `leftDatum`. The margins that hold them scale with S, so the bubbles never clip
   // (and never reach the top caption) when the plan scales up — that was the old top-overlap bug.
   const rB = 1.2*S;                        // grid-bubble radius (rev 82: halved from 2.4·S)
-  const gridOff = 7*S;                     // footprint edge → bubble center
+  const gridOff = 7*S + 2*rB;              // footprint edge → bubble center (rev 83: +1 bubble Ø outward to clear wall callouts)
   const topDatum  = fp.y0 - gridOff;       // shared y for every N–S number bubble
   const leftDatum = fp.x0 - gridOff;       // shared x for every E–W letter bubble
   const mSide = gridOff + rB + 2.5*S;      // top + left headroom (bubble band)
