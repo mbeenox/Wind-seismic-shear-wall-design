@@ -228,7 +228,7 @@ function DesignPlan({ shape, lines, segsByLine, setSegsByLine, resultsByLine, se
   // structural plan grid. N–S (vertical) number bubbles align on `topDatum`; E–W (horizontal) letter
   // bubbles align on `leftDatum`. The margins that hold them scale with S, so the bubbles never clip
   // (and never reach the top caption) when the plan scales up — that was the old top-overlap bug.
-  const rB = 2.4*S;                        // grid-bubble radius
+  const rB = 1.2*S;                        // grid-bubble radius (rev 82: halved from 2.4·S)
   const gridOff = 7*S;                     // footprint edge → bubble center
   const topDatum  = fp.y0 - gridOff;       // shared y for every N–S number bubble
   const leftDatum = fp.x0 - gridOff;       // shared x for every E–W letter bubble
@@ -327,9 +327,9 @@ function DesignPlan({ shape, lines, segsByLine, setSegsByLine, resultsByLine, se
                 <g pointerEvents="none">
                   <line x1={ln.a.x} y1={ln.a.y} x2={near.x} y2={near.y}
                         stroke={SW.faint} strokeWidth={0.16*S} strokeDasharray={`${1.4*S} ${1.0*S}`} opacity="0.28"/>
-                  <circle cx={cx} cy={cy} r={rB} fill={C_BG} stroke={SW.ink} strokeWidth={0.22*S}/>
+                  <circle cx={cx} cy={cy} r={rB} fill={C_BG} stroke={SW.ink} strokeWidth={0.18*S}/>
                   <text x={cx} y={cy} textAnchor="middle" dominantBaseline="central"
-                        fontSize={2.0*S} fontWeight="800" fill={SW.ink} fontFamily={MONO}>{lineNames[ln.id]}</text>
+                        fontSize={1.1*S} fontWeight="800" fill={SW.ink} fontFamily={MONO}>{lineNames[ln.id]}</text>
                 </g>
               );
             })()}
