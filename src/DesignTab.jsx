@@ -213,14 +213,29 @@ function CaseTag({ which }) {
 function DesignPlan({ shape, lines, segsByLine, setSegsByLine, resultsByLine, selLine, setSelLine, snap, maxSegLen, onCtx, marks, showTags, lineNames }) {
   const svgRef = useRef(null);
   const dragRef = useRef(null);
-  // fit viewBox to footprint
-  const vb = useMemo(() => {
+  // footprint bounding box (raw, no margin)
+  const fp = useMemo(() => {
     let x0=Infinity,y0=Infinity,x1=-Infinity,y1=-Infinity;
     (shape&&shape.nodes||[]).forEach(p=>{ x0=Math.min(x0,p.x);y0=Math.min(y0,p.y);x1=Math.max(x1,p.x);y1=Math.max(y1,p.y); });
     if(!(x1>x0)) { x0=0;y0=0;x1=100;y1=60; }
-    const m=14; return { x:x0-m, y:y0-m, w:(x1-x0)+2*m, h:(y1-y0)+2*m };
+    return { x0, y0, x1, y1, w:x1-x0, h:y1-y0 };
   }, [shape]);
-  const S = Math.max(vb.w, vb.h) / 110;   // graphic scale (matches sketcher's S idiom)
+  // graphic scale — value-identical to the old `max(vb.w,vb.h)/110` idiom (old vb added a fixed 14-margin
+  // each side, so max(vb.w,vb.h) === max(fp.w,fp.h)+28). Tying S to the FOOTPRINT (not the margined vb)
+  // keeps every wall symbol the same size while the margins below grow with the plan.
+  const S = (Math.max(fp.w, fp.h) + 28) / 110;
+  // (rev 81) GRID DATUMS — all bubbles sit on ONE row / ONE column OUTSIDE the footprint, like a real
+  // structural plan grid. N–S (vertical) number bubbles align on `topDatum`; E–W (horizontal) letter
+  // bubbles align on `leftDatum`. The margins that hold them scale with S, so the bubbles never clip
+  // (and never reach the top caption) when the plan scales up — that was the old top-overlap bug.
+  const rB = 2.4*S;                        // grid-bubble radius
+  const gridOff = 7*S;                     // footprint edge → bubble center
+  const topDatum  = fp.y0 - gridOff;       // shared y for every N–S number bubble
+  const leftDatum = fp.x0 - gridOff;       // shared x for every E–W letter bubble
+  const mSide = gridOff + rB + 2.5*S;      // top + left headroom (bubble band)
+  const mFar  = 4*S;                       // right margin
+  const mBot  = 6*S;                       // bottom margin — holds the instruction caption, clear of bubbles
+  const vb = { x: fp.x0 - mSide, y: fp.y0 - mSide, w: fp.w + mSide + mFar, h: fp.h + mSide + mBot };
   const band = 1.2*S;                      // shear-wall band half-width (rev 13: halved — thin-band drafting symbol)
   // (rev 54/55) when a line is SELECTED in the Design tab, only its dashed CENTERLINE turns yellow as
   // an immediate "this is the selected wall" indicator. The shear-wall band keeps its pass/fail blue/red
@@ -296,20 +311,22 @@ function DesignPlan({ shape, lines, segsByLine, setSegsByLine, resultsByLine, se
                   stroke={isSel ? SEL_STROKE : SW.faint} strokeWidth={(isSel?0.5:0.3)*S}
                   strokeDasharray={`${1.6*S} ${1.2*S}`} opacity={isSel?0.9:0.45}
                   style={{cursor:"pointer"}} onClick={()=>setSelLine(ln.id)}/>
-            {/* (rev 72) GRID BUBBLE at the line's `a` end — `a` is the min-coordinate end, i.e. the TOP
-                for a vertical (N–S) line and the LEFT for a horizontal (E–W) line, so numbers land on
-                top and letters on the left exactly like a plan grid. The bubble sits BEYOND the end
-                along −(ux,uy) on an extension line; the label is always upright (no rotation). Black
-                on white so it reads as drawing annotation, distinct from the blue/red wall callouts.
-                (rev 73) the extension `stem` was lengthened ~4× (1.1→4.4·S) so the bubble sits well
-                clear of the structural footprint — for the horizontal A/B lines this lifts the bubble
-                completely off the corner wall-joints and outside the plan boundary. */}
+            {/* (rev 81) GRID BUBBLE on the GLOBAL datum, fully OUTSIDE the footprint. N–S (vertical)
+                lines get a NUMBER bubble on the shared `topDatum` row; E–W (horizontal) lines get a
+                LETTER bubble on the shared `leftDatum` column — so every bubble lines up on one
+                horizontal / one vertical axis regardless of where its wall actually ends (previously the
+                bubble hung off each line's own end, dropping interior numbers inside the plan).
+                The lead from the wall end out to the bubble is thin, DASHED, low-opacity grey so the
+                portion crossing the building never reads as a wall. Label always upright; black on white
+                so it reads as drawing annotation, distinct from the blue/red wall callouts. */}
             {(()=>{
-              const rB=2.4*S, stem=4.4*S, gap=0.25*S, near={x:ln.a.x-ux*gap,y:ln.a.y-uy*gap};
-              const cx=ln.a.x-ux*(stem+rB), cy=ln.a.y-uy*(stem+rB);
+              const cx   = vert ? ln.a.x   : leftDatum;            // numbers ride the line's x; letters snap to the left column
+              const cy   = vert ? topDatum : ln.a.y;              // numbers snap to the top row; letters ride the line's y
+              const near = vert ? { x: ln.a.x, y: cy + rB } : { x: cx + rB, y: ln.a.y };  // bubble edge facing the wall
               return (
                 <g pointerEvents="none">
-                  <line x1={near.x} y1={near.y} x2={cx+ux*rB} y2={cy+uy*rB} stroke={SW.ink} strokeWidth={0.16*S}/>
+                  <line x1={ln.a.x} y1={ln.a.y} x2={near.x} y2={near.y}
+                        stroke={SW.faint} strokeWidth={0.16*S} strokeDasharray={`${1.4*S} ${1.0*S}`} opacity="0.28"/>
                   <circle cx={cx} cy={cy} r={rB} fill={C_BG} stroke={SW.ink} strokeWidth={0.22*S}/>
                   <text x={cx} y={cy} textAnchor="middle" dominantBaseline="central"
                         fontSize={2.0*S} fontWeight="800" fill={SW.ink} fontFamily={MONO}>{lineNames[ln.id]}</text>
@@ -399,7 +416,8 @@ function DesignPlan({ shape, lines, segsByLine, setSegsByLine, resultsByLine, se
           </g>
         );
       })}
-      <text x={vb.x+2*S} y={vb.y+3*S} fontSize={1.4*S} fill={SW.faint} fontFamily={MONO}>
+      {/* (rev 81) caption moved to the BOTTOM margin so the top grid-bubble row never collides with it */}
+      <text x={vb.x+2*S} y={vb.y+vb.h-2*S} fontSize={1.4*S} fill={SW.faint} fontFamily={MONO}>
         PLAN — drag wall to slide · drag ▭ handles to stretch · right-click to edit · click a line to select
       </text>
     </svg>
