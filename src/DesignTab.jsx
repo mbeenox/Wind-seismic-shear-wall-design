@@ -233,7 +233,7 @@ function DesignPlan({ shape, lines, segsByLine, setSegsByLine, resultsByLine, se
   const topDatum  = fp.y0 - gridOff;       // shared y for every N–S number bubble
   const leftDatum = fp.x0 - gridOff;       // shared x for every E–W letter bubble
   const mSide = gridOff + rB + 2.5*S;      // top + left headroom (bubble band)
-  const mFar  = 4*S;                       // right margin
+  const mFar  = 8*S;                       // right margin (rev 86: 4·S→8·S so the right-most vertical line's type-triangle + rotated length callout, which reaches ~6.8·S past the wall on the fixed right side, no longer clips the viewBox edge)
   const mBot  = 6*S;                       // bottom margin — holds the instruction caption, clear of bubbles
   const vb = { x: fp.x0 - mSide, y: fp.y0 - mSide, w: fp.w + mSide + mFar, h: fp.h + mSide + mBot };
   const band = 1.2*S;                      // shear-wall band half-width (rev 13: halved — thin-band drafting symbol)
