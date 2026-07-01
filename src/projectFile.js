@@ -18,7 +18,7 @@
 // "rated"). To revert the default, set grade:"rated" here.
 const DEFAULT_G   = { code:4, species:1, line:"1", vSeismic:5, sds:1, R:6.5, wWind:26000, roofDL:20, floorDL:0, wallDL:15, Cs:0.05, grade:"str1" };
 const DEFAULT_D   = { thickness:5.5, anchor:"Concrete", roofTrib:2, floorTrib:0, hdDist:5,
-                      minSegLen:4, maxSegLen:12, maxSegments:4, maxType:3, snap:0.5,
+                      minSegLen:4, maxSegLen:12, maxSegments:4, maxType:6, snap:0.5,   // rev 84: maxType is now a hard ceiling 1–6; default 6 = full single+double range
                       objective:"length", ftgWidth:1.33, ftgThick:12, height:15, lineLength:40 };
 const SEG_DEFAULTS= { length:0, height:15, roofTrib:10, floorTrib:0, hdDist:5, thickness:5.5, anchor:"Concrete", selType:1, ftgWidth:1.33, ftgThick:12 };
 // Design-tab collections (rev 24). A design LINE is { id, key, windAxis, o, a, b, lengthFt, heightFt,
@@ -31,7 +31,7 @@ const DEFAULT_PLACED = { start:0, length:0 };
 
 // Save-file schema version. WRITTEN by onSave and now READ by the loader (it used to be
 // decorative). Bump this on every schema change and add the matching MIGRATIONS step.
-const CURRENT_VERSION = 3;
+const CURRENT_VERSION = 4;
 // Step migrations: MIGRATIONS[k] takes a project AT version k and returns it AT version k+1.
 // 1→2 is purely ADDITIVE — v2 only adds optional ui/camera/selection fields the loader already
 // feature-detects — so there is no data transform, we only stamp the version. This ladder exists
@@ -65,6 +65,17 @@ const MIGRATIONS = {
       return { ...p, calc: { ...p.calc, g: { ...g, vSeismic: g.vSeismic / R } }, version:3 };
     }
     return { ...p, version:3 };
+  },
+  // 3→4 (rev 84): SEMANTICS change to design.d.maxType. It used to cap SINGLE-SIDED marks only (1–3)
+  // while double-sided 4–6 was an automatic last-resort rescue regardless of the cap; now it's a HARD
+  // CEILING over all six marks, so a stored cap of 1/2/3 would newly FORBID the double-sided rescue.
+  // To preserve every old file's effective behavior (double-sided was always available), widen any
+  // stored maxType to 6 — the new allowed set {1..6} is a superset of the old {1..cap}∪{4,5,6}, so no
+  // line that previously passed can now fail. (No live .wps files predate this; pre-emptive insurance.)
+  3: (p) => {
+    const d = p && p.design && p.design.d;
+    if (d) return { ...p, design: { ...p.design, d: { ...d, maxType: 6 } }, version:4 };
+    return { ...p, version:4 };
   },
 };
 // Walk a loaded project up to `target` one step at a time. `migrations`/`target` are injectable so a
@@ -127,6 +138,9 @@ function loadProject(raw){
       marks:   (t && Array.isArray(t.marks)) ? t.marks : null,
       segments: seg6(t && t.segments),
       wWind:   (t && Number.isFinite(t.wWind)) ? t.wWind : gW,
+      // (rev 85) per-tab shear-line label. Additive/optional: an OLD file's tab has no `line`, so
+      // fall back to the legacy shared g.line (default "1"). Auto tabs re-derive it on the next send.
+      line:    (t && typeof t.line === "string") ? t.line : ((calc.g && typeof calc.g.line === "string") ? calc.g.line : DEFAULT_G.line),
     }));
     activeCalcId = calcTabs.find((t) => t.id === calc.activeCalcId) ? calc.activeCalcId : calcTabs[0].id;
   } else if (Array.isArray(calc.segments)) {

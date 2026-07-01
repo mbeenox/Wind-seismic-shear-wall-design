@@ -778,7 +778,7 @@ function DesignTab({ g, setGl, shape, lines, linesByFloor, segsByLine, setSegsBy
                 <button style={swBtn(false)} onClick={()=>addSeg(sel.id)} disabled={selSegs.length>=6}>+ Add wall</button>
                 <button style={calcStaleHint ? {...swBtn(false), ...STALE_BTN} : swBtn(false)}
                   title={calcStaleHint ? "This line changed since you last sent it — click to update the Calculation Sheet" : undefined}
-                  onClick={()=>applyToCalc(sel, selSegs, selRes, d, lineLabel(sel), selSegs.map((_,i)=>wallMarks[sel.id+"|"+i]))}>{calcStaleHint && WARN}Send line to calculation sheet →</button>
+                  onClick={()=>applyToCalc(sel, selSegs, selRes, d, lineLabel(sel), selSegs.map((_,i)=>wallMarks[sel.id+"|"+i]), lineNames[sel.id])}>{calcStaleHint && WARN}Send line to calculation sheet →</button>
               </div>
             }>
             Selected line — {lineNames[sel.id]} · {sel.windAxis==="h"?"E–W":"N–S"} · wind {fmt(sel.forceLbs/1000,2)}k · seismic {fmt((sel.forceLbsSeismic||0)/1000,2)}k · {fmt(sel.lengthFt,1)} ft · H {fmt(sel.heightFt,1)} ft

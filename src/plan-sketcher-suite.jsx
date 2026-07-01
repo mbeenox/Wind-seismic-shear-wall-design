@@ -49,7 +49,7 @@ import {
 //   • APP_VERSION (here)      — human-facing build number in the UI ("Version 1.00").
 //   • CURRENT_VERSION (~below)— save-file SCHEMA version; drives .wps migrations. Do NOT couple.
 //   • handoff "rev" number    — the dev changelog in PLAN_SKETCHER_SUITE_HANDOFF.md.
-const APP_BUILD = 162;                                                                 // +1 per release
+const APP_BUILD = 164;                                                                 // +1 per release
 const APP_VERSION = `${Math.floor(APP_BUILD / 100)}.${String(APP_BUILD % 100).padStart(2, "0")}`;  // "1.00"
 
 export default function App() {
@@ -62,9 +62,11 @@ export default function App() {
   // ── CALCULATION-SHEET SUB-TABS (rev 132) ──
   // The Calculation Sheet is now a Chrome-style tabbed surface: each sub-tab is one shear-wall LINE
   // (its own 6-segment layout + its own wind force `wWind`). A tab carries:
-  //   { id, name, lineId, marks, segments, wWind }
+  //   { id, name, lineId, marks, segments, wWind, line }
   // `lineId` ties an auto sub-tab to the Design line it came from (re-pushing that line UPDATES the
-  // same tab instead of duplicating). `lineId:null` = a MANUAL tab added with the "+" button, run
+  // same tab instead of duplicating). `line` (rev 85) is the shear-line label shown in the title
+  // block: for an auto tab it is the Design line's grid name (passed through `applyToCalc`, READ-ONLY
+  // on the sheet); for a manual tab it stays user-editable. `lineId:null` = a MANUAL tab added with the "+" button, run
   // independently of the Design tab's Optimize. `marks` mirrors the Design tab's wall marks so the
   // per-segment "SW-A / SW-B" labels match across tabs. Building-wide config (code/species/grade/
   // seismic/dead loads) stays in the shared `g`; only `wWind` is per-tab (each wall a different force).
@@ -72,7 +74,7 @@ export default function App() {
   const calcSeq = useRef(2);                                  // next manual id counter ("calc-2", …)
   const newCalcId = () => "calc-" + (calcSeq.current++);
   const [calcTabs, setCalcTabs] = useState(() => [
-    { id:"calc-1", name:"Wall-1 (default)", lineId:null, marks:null, segments:mkCalcSegs(), wWind:DEFAULT_G.wWind },
+    { id:"calc-1", name:"Wall-1 (default)", lineId:null, marks:null, segments:mkCalcSegs(), wWind:DEFAULT_G.wWind, line:"1" },
   ]);
   const [activeCalcId, setActiveCalcId] = useState("calc-1");
   const activeCalc = calcTabs.find((t) => t.id === activeCalcId) || calcTabs[0] || null;
@@ -83,6 +85,9 @@ export default function App() {
   // CalcSheet edits a segment in the ACTIVE tab; supports both function- and value-style updates.
   const setSegments = (updater) => setCalcTabs((prev) => prev.map((t) => t.id === activeCalcId
     ? { ...t, segments: typeof updater === "function" ? updater(t.segments) : updater } : t));
+  // (rev 85) Edit the ACTIVE tab's shear-line label (manual tabs only; auto tabs are read-only,
+  // fed from the Design line's grid name via applyToCalc).
+  const setCalcTabLine = (val) => setCalcTabs((prev) => prev.map((t) => t.id === activeCalcId ? { ...t, line: val } : t));
   // CalcSheet's globals editor: `wWind` is per-tab, everything else is the shared building config.
   const setGlCalc = (key, val) => {
     if (key === "wWind") setCalcTabs((prev) => prev.map((t) => t.id === activeCalcId ? { ...t, wWind: val } : t));
@@ -113,7 +118,7 @@ export default function App() {
   const addCalcTab = () => {
     const id = newCalcId();
     const n = calcTabs.filter((t) => !t.lineId).length + 1;
-    setCalcTabs((prev) => [...prev, { id, name:`Custom ${n}`, lineId:null, marks:null, segments:mkCalcSegs(), wWind:DEFAULT_G.wWind }]);
+    setCalcTabs((prev) => [...prev, { id, name:`Custom ${n}`, lineId:null, marks:null, segments:mkCalcSegs(), wWind:DEFAULT_G.wWind, line:"1" }]);
     selectCalcTab(id);
     setTab("calc");
   };
@@ -271,7 +276,7 @@ export default function App() {
   // already has (matched by `line.id`) UPDATES that tab in place (current optimized design + force +
   // name + marks); a new line opens a new tab. `name`/`marks` come from the Design tab so the sub-tab
   // title and the per-segment SW-marks read identically across both tabs. (rev 132)
-  const applyToCalc = (line, segs, res, dC, name, marks) => {
+  const applyToCalc = (line, segs, res, dC, name, marks, lineName) => {
     const next = Array.from({ length: 6 }, (_, i) => ({
       length: segs[i] ? segs[i].length : 0,
       // (rev 49) send THIS line's per-wall/per-floor DL trib to the calc sheet (was the global dC.*);
@@ -283,15 +288,19 @@ export default function App() {
     }));
     const wWind = Math.round(line.forceLbs);
     const tabName = name || `${line.windAxis === "h" ? "E–W" : "N–S"} · ${fmt(line.forceLbs/1000,2)}k · ${fmt(line.lengthFt,0)}′`;
+    // (rev 85) the shear-line label is the Design line's grid name (e.g. "1"/"A"), sent from the
+    // Design tab so the Calc-sheet title shows the line automatically (read-only there).
+    const lineLbl = (lineName != null && String(lineName) !== "") ? String(lineName)
+                  : (line.windAxis === "h" ? "E–W" : "N–S");
     const marksArr = Array.isArray(marks) ? marks : null;
     const existing = calcTabs.find((t) => t.lineId === line.id);
     if (existing) {
       setCalcTabs((prev) => prev.map((t) => t.id === existing.id
-        ? { ...t, name:tabName, marks:marksArr, segments:next, wWind } : t));
+        ? { ...t, name:tabName, marks:marksArr, segments:next, wWind, line:lineLbl } : t));
       selectCalcTab(existing.id);
     } else {
       const id = newCalcId();
-      setCalcTabs((prev) => [...prev, { id, name:tabName, lineId:line.id, marks:marksArr, segments:next, wWind }]);
+      setCalcTabs((prev) => [...prev, { id, name:tabName, lineId:line.id, marks:marksArr, segments:next, wWind, line:lineLbl }]);
       selectCalcTab(id);
     }
     setCalcPush({ lineId: line.id, sig: calcPushSig(line, segs, res, dC) });   // rev 130: remember what this push produced
@@ -340,7 +349,7 @@ export default function App() {
             </h1>
             <div style={{ fontSize:11, fontFamily:MONO, color:SW.accent }}>{CODES[g.code]} · Basic Load Combinations</div>
           </div>
-          <div style={{ flex:"1 1 160px", padding:"16px 20px", borderRight:`1px solid ${SW.rule}` }}>
+          <div style={{ flex:"1 1 160px", padding:"16px 20px" }}>
             <label style={{ fontSize:10, letterSpacing:"0.12em", textTransform:"uppercase", color:SW.faint, display:"block", marginBottom:4 }}>Building code</label>
             <select value={g.code} onChange={(e)=>setGl("code",+e.target.value)} style={{ ...selStyle, width:"100%" }}>
               <option value={1}>2006 IBC</option><option value={2}>2009 IBC</option>
@@ -351,12 +360,9 @@ export default function App() {
               <option value={1}>Southern Pine</option><option value={2}>Douglas-Fir</option>
             </select>
           </div>
-          <div style={{ flex:"0 1 120px", padding:"16px 20px" }}>
-            <label style={{ fontSize:10, letterSpacing:"0.12em", textTransform:"uppercase", color:SW.faint, display:"block", marginBottom:4 }}>Shear line</label>
-            <input value={g.line} onChange={(e)=>setGl("line",e.target.value)}
-              style={{ width:60, padding:"4px 8px", border:`1px solid ${SW.rule}`, borderRadius:4, fontFamily:MONO, fontSize:18,
-                       fontWeight:700, textAlign:"center", color:SW.accent, background:SW.input, outline:"none" }} />
-          </div>
+          {/* (rev 85) the manual "Shear line" box was removed here: the Design tab covers ALL lines
+              at once, so a single line label was meaningless. The Calc sheet now derives the shear
+              line per sub-tab from the line's grid name. */}
         </div>
         <div style={{ padding:"8px 20px 28px" }}>
           <DesignTab g={g} shape={designShape} lines={designLines} linesByFloor={designLinesByFloor}
@@ -458,8 +464,17 @@ export default function App() {
           <div style={{ flex:"0 1 150px", padding:"16px 20px", display:"flex", flexDirection:"column", gap:8 }}>
             <div>
               <label style={{ fontSize:10, letterSpacing:"0.12em", textTransform:"uppercase", color:LT.faint, display:"block", marginBottom:4 }}>Shear line</label>
-              <input value={g.line} onChange={(e)=>setGl("line",e.target.value)}
-                style={{ width:60, padding:"4px 8px", border:`1px solid ${LT.rule}`, borderRadius:4, fontFamily:MONO, fontSize:18, fontWeight:700, textAlign:"center", color:LT.blue, background:"#FDFDFB", outline:"none" }} />
+              {/* (rev 85) auto tabs (sent from a Design line) show that line's grid name READ-ONLY —
+                  it's passed straight from the Design tab; manual tabs stay editable. */}
+              {activeCalc && activeCalc.lineId ? (
+                <div title="Passed from the Design tab — this is the line's grid name"
+                  style={{ width:60, padding:"4px 8px", border:`1px solid ${LT.rule}`, borderRadius:4, fontFamily:MONO, fontSize:18, fontWeight:700, textAlign:"center", color:LT.blue, background:LT.zebra, boxSizing:"border-box" }}>
+                  {activeCalc.line || "—"}
+                </div>
+              ) : (
+                <input value={(activeCalc && activeCalc.line) || ""} onChange={(e)=>setCalcTabLine(e.target.value)}
+                  style={{ width:60, padding:"4px 8px", border:`1px solid ${LT.rule}`, borderRadius:4, fontFamily:MONO, fontSize:18, fontWeight:700, textAlign:"center", color:LT.blue, background:"#FDFDFB", outline:"none" }} />
+              )}
             </div>
             <button className="no-print" onClick={()=>window.print()}
               style={{ alignSelf:"flex-start", padding:"5px 12px", fontSize:11, fontWeight:700, letterSpacing:"0.06em", border:`1.5px solid ${LT.blue}`, background:LT.blue, color:"#FFFFFF", cursor:"pointer", borderRadius:4 }}>
