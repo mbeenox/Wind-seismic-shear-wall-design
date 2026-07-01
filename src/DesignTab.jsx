@@ -504,12 +504,22 @@ function DesignTab({ g, setGl, shape, lines, linesByFloor, segsByLine, setSegsBy
   },[lines, linesByFloor, segsByLine, g, d, twoStory, activeFloor]);
   const stacking = !!(twoStory && activeFloor===1 && linesByFloor && linesByFloor[2]);  // drives the 1st-floor overturning note
 
-  // unique wall marks (SW-A, SW-B, …) in line order then segment order
+  // unique wall marks (SW-A, SW-B, …). (rev 87) STABLE ACROSS FLOORS: assigned over the UNION of both
+  // floors' lines in a FIXED geometric grid order (N–S by x then y, then E–W by y then x), keyed by
+  // line id + segment index. Because the ordering + the shared segments are floor-independent, the
+  // same physical wall keeps its mark whether you're viewing level 1 or level 2 ("1 on top of 1").
+  // Previously marks followed the ACTIVE floor's raw array order, so switching level re-lettered walls.
+  // A wall that lives on only one floor still holds its slot, so the other floor may skip that letter.
   const wallMarks = useMemo(()=>{
+    const byId={};
+    const floors = (linesByFloor && Object.keys(linesByFloor).length) ? Object.values(linesByFloor) : [lines];
+    floors.forEach(arr => (arr||[]).forEach(ln => { if(ln && !byId[ln.id]) byId[ln.id]=ln; }));
+    const gkey = (l)=> l.windAxis==="v" ? [0, l.a.x, l.a.y] : [1, l.a.y, l.a.x];
+    const all = Object.values(byId).sort((p,q)=>{ const P=gkey(p), Q=gkey(q); return P[0]-Q[0] || P[1]-Q[1] || P[2]-Q[2]; });
     const m={}; let k=0;
-    lines.forEach(ln=>{ (segsByLine[ln.id]||[]).forEach((s,i)=>{ m[ln.id+"|"+i]=letterOf(k); k++; }); });
+    all.forEach(ln=>{ (segsByLine[ln.id]||[]).forEach((s,i)=>{ m[ln.id+"|"+i]=letterOf(k); k++; }); });
     return m;
-  },[lines, segsByLine]);
+  },[linesByFloor, lines, segsByLine]);
 
   // (rev 72) Per-line display name follows the standard structural GRID convention — no direction
   // prefix. N–S (vertical, windAxis "v") lines are NUMBERED 1,2,3… ordered left→right by x; E–W
@@ -596,10 +606,16 @@ function DesignTab({ g, setGl, shape, lines, linesByFloor, segsByLine, setSegsBy
   const sel = lines.find(l=>l.id===selLine);
   const selSegs = sel ? (segsByLine[sel.id]||[]) : [];
   const selRes  = sel ? (resultsByLine[sel.id]||[]) : [];
+  // (rev 87) the shear-line's LEVEL in 2-story mode → a superscript on the label sent to the Calc
+  // sheet (¹ = level 1, ² = level 2). Single-story sends no superscript. The sub-tab is keyed by
+  // line id + this floor, so level 1 and level 2 of one line are separate calc tabs.
+  const sendFloor = twoStory ? activeFloor : null;
+  const lvlSup = twoStory ? (activeFloor === 2 ? "²" : "¹") : "";
   // rev 130: the "Send line to calculation sheet" button goes red when the line CURRENTLY in the
   // sheet (calcPush.lineId) is the one selected AND its pushable data has changed since it was sent.
   // Selecting a DIFFERENT line is not "stale" — that's a fresh push, so the button stays normal.
-  const calcStaleHint = !!(calcPush && sel && calcPush.lineId === sel.id && calcPush.sig !== calcPushSig(sel, selSegs, selRes, d));
+  // (rev 87) also gated on the floor, since a line now has a separate tab per level.
+  const calcStaleHint = !!(calcPush && sel && calcPush.lineId === sel.id && (calcPush.floor ?? null) === sendFloor && calcPush.sig !== calcPushSig(sel, selSegs, selRes, d));
   // rev 130b: the ⚡ Optimize design button produces the tab's design output; it goes red when an input
   // it consumes (any line's force/height/length/trib across both floors, or g / d) has changed since the
   // last Optimize. optimizePush is null until the first Optimize (so it's only red AFTER you've optimized).
@@ -778,7 +794,10 @@ function DesignTab({ g, setGl, shape, lines, linesByFloor, segsByLine, setSegsBy
                 <button style={swBtn(false)} onClick={()=>addSeg(sel.id)} disabled={selSegs.length>=6}>+ Add wall</button>
                 <button style={calcStaleHint ? {...swBtn(false), ...STALE_BTN} : swBtn(false)}
                   title={calcStaleHint ? "This line changed since you last sent it — click to update the Calculation Sheet" : undefined}
-                  onClick={()=>applyToCalc(sel, selSegs, selRes, d, lineLabel(sel), selSegs.map((_,i)=>wallMarks[sel.id+"|"+i]), lineNames[sel.id])}>{calcStaleHint && WARN}Send line to calculation sheet →</button>
+                  onClick={()=>{ const nm=(lineNames[sel.id]||"")+lvlSup;
+                    applyToCalc(sel, selSegs, selRes, d,
+                      `${nm} · ${fmt(sel.forceLbs/1000,2)}k · ${fmt(sel.lengthFt,0)}′`,
+                      selSegs.map((_,i)=>wallMarks[sel.id+"|"+i]), nm, sendFloor); }}>{calcStaleHint && WARN}Send line to calculation sheet →</button>
               </div>
             }>
             Selected line — {lineNames[sel.id]} · {sel.windAxis==="h"?"E–W":"N–S"} · wind {fmt(sel.forceLbs/1000,2)}k · seismic {fmt((sel.forceLbsSeismic||0)/1000,2)}k · {fmt(sel.lengthFt,1)} ft · H {fmt(sel.heightFt,1)} ft

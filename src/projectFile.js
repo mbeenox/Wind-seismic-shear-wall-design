@@ -135,6 +135,8 @@ function loadProject(raw){
       id:      (t && t.id) || ("calc-" + (i + 1)),
       name:    (t && typeof t.name === "string" && t.name) || ("Wall " + (i + 1)),
       lineId:  (t && t.lineId != null) ? t.lineId : null,
+      // (rev 87) per-level sub-tab key: 1/2 in 2-story, else null. Additive — old files → null.
+      floor:   (t && (t.floor === 1 || t.floor === 2)) ? t.floor : null,
       marks:   (t && Array.isArray(t.marks)) ? t.marks : null,
       segments: seg6(t && t.segments),
       wWind:   (t && Number.isFinite(t.wWind)) ? t.wWind : gW,

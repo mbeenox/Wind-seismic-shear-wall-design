@@ -49,7 +49,7 @@ import {
 //   • APP_VERSION (here)      — human-facing build number in the UI ("Version 1.00").
 //   • CURRENT_VERSION (~below)— save-file SCHEMA version; drives .wps migrations. Do NOT couple.
 //   • handoff "rev" number    — the dev changelog in PLAN_SKETCHER_SUITE_HANDOFF.md.
-const APP_BUILD = 164;                                                                 // +1 per release
+const APP_BUILD = 166;                                                                 // +1 per release
 const APP_VERSION = `${Math.floor(APP_BUILD / 100)}.${String(APP_BUILD % 100).padStart(2, "0")}`;  // "1.00"
 
 export default function App() {
@@ -62,9 +62,11 @@ export default function App() {
   // ── CALCULATION-SHEET SUB-TABS (rev 132) ──
   // The Calculation Sheet is now a Chrome-style tabbed surface: each sub-tab is one shear-wall LINE
   // (its own 6-segment layout + its own wind force `wWind`). A tab carries:
-  //   { id, name, lineId, marks, segments, wWind, line }
-  // `lineId` ties an auto sub-tab to the Design line it came from (re-pushing that line UPDATES the
-  // same tab instead of duplicating). `line` (rev 85) is the shear-line label shown in the title
+  //   { id, name, lineId, floor, marks, segments, wWind, line }
+  // `lineId` ties an auto sub-tab to the Design line it came from; (rev 87) in 2-story mode the tab is
+  // keyed by `lineId` + `floor` (1/2) so each level of a line is its OWN tab (single-story: floor null).
+  // Re-pushing the same line+floor UPDATES that tab instead of duplicating. `line` (rev 85) is the
+  // shear-line label shown in the title
   // block: for an auto tab it is the Design line's grid name (passed through `applyToCalc`, READ-ONLY
   // on the sheet); for a manual tab it stays user-editable. `lineId:null` = a MANUAL tab added with the "+" button, run
   // independently of the Design tab's Optimize. `marks` mirrors the Design tab's wall marks so the
@@ -74,7 +76,7 @@ export default function App() {
   const calcSeq = useRef(2);                                  // next manual id counter ("calc-2", …)
   const newCalcId = () => "calc-" + (calcSeq.current++);
   const [calcTabs, setCalcTabs] = useState(() => [
-    { id:"calc-1", name:"Wall-1 (default)", lineId:null, marks:null, segments:mkCalcSegs(), wWind:DEFAULT_G.wWind, line:"1" },
+    { id:"calc-1", name:"Wall-1 (default)", lineId:null, floor:null, marks:null, segments:mkCalcSegs(), wWind:DEFAULT_G.wWind, line:"1" },
   ]);
   const [activeCalcId, setActiveCalcId] = useState("calc-1");
   const activeCalc = calcTabs.find((t) => t.id === activeCalcId) || calcTabs[0] || null;
@@ -118,7 +120,7 @@ export default function App() {
   const addCalcTab = () => {
     const id = newCalcId();
     const n = calcTabs.filter((t) => !t.lineId).length + 1;
-    setCalcTabs((prev) => [...prev, { id, name:`Custom ${n}`, lineId:null, marks:null, segments:mkCalcSegs(), wWind:DEFAULT_G.wWind, line:"1" }]);
+    setCalcTabs((prev) => [...prev, { id, name:`Custom ${n}`, lineId:null, floor:null, marks:null, segments:mkCalcSegs(), wWind:DEFAULT_G.wWind, line:"1" }]);
     selectCalcTab(id);
     setTab("calc");
   };
@@ -276,7 +278,7 @@ export default function App() {
   // already has (matched by `line.id`) UPDATES that tab in place (current optimized design + force +
   // name + marks); a new line opens a new tab. `name`/`marks` come from the Design tab so the sub-tab
   // title and the per-segment SW-marks read identically across both tabs. (rev 132)
-  const applyToCalc = (line, segs, res, dC, name, marks, lineName) => {
+  const applyToCalc = (line, segs, res, dC, name, marks, lineName, floor) => {
     const next = Array.from({ length: 6 }, (_, i) => ({
       length: segs[i] ? segs[i].length : 0,
       // (rev 49) send THIS line's per-wall/per-floor DL trib to the calc sheet (was the global dC.*);
@@ -292,18 +294,21 @@ export default function App() {
     // Design tab so the Calc-sheet title shows the line automatically (read-only there).
     const lineLbl = (lineName != null && String(lineName) !== "") ? String(lineName)
                   : (line.windAxis === "h" ? "E–W" : "N–S");
+    // (rev 87) 2-story: a line has a SEPARATE sub-tab per level, so the tab is keyed by line id +
+    // floor (1/2). Single-story passes floor=null → one tab per line, as before (back-compat).
+    const flr = (floor === 1 || floor === 2) ? floor : null;
     const marksArr = Array.isArray(marks) ? marks : null;
-    const existing = calcTabs.find((t) => t.lineId === line.id);
+    const existing = calcTabs.find((t) => t.lineId === line.id && (t.floor ?? null) === flr);
     if (existing) {
       setCalcTabs((prev) => prev.map((t) => t.id === existing.id
-        ? { ...t, name:tabName, marks:marksArr, segments:next, wWind, line:lineLbl } : t));
+        ? { ...t, name:tabName, marks:marksArr, segments:next, wWind, line:lineLbl, floor:flr } : t));
       selectCalcTab(existing.id);
     } else {
       const id = newCalcId();
-      setCalcTabs((prev) => [...prev, { id, name:tabName, lineId:line.id, marks:marksArr, segments:next, wWind, line:lineLbl }]);
+      setCalcTabs((prev) => [...prev, { id, name:tabName, lineId:line.id, floor:flr, marks:marksArr, segments:next, wWind, line:lineLbl }]);
       selectCalcTab(id);
     }
-    setCalcPush({ lineId: line.id, sig: calcPushSig(line, segs, res, dC) });   // rev 130: remember what this push produced
+    setCalcPush({ lineId: line.id, floor: flr, sig: calcPushSig(line, segs, res, dC) });   // rev 130/87: remember what this push produced (+ floor)
     setTab("calc");
   };
 
